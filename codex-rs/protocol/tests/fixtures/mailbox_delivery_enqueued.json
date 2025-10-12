@@ -1,0 +1,65 @@
+{
+  "message": {
+    "message_id": "018f202c-6e1c-7741-8ca0-6f5d9f678abc",
+    "priority": "high",
+    "posted_at": "2025-10-12T15:00:00Z",
+    "expires_at": "2025-10-12T15:30:00Z",
+    "sender": {
+      "id": "orchestrator.test",
+      "role": "orchestrator",
+      "display_name": "Mailbox QA",
+      "contact": "mailto:codex-qa@example.com",
+      "runbook": "https://runbooks.example.com/codex/mailbox"
+    },
+    "audience": {
+      "conversation_id": "00000000-0000-0000-0000-000000000123",
+      "worker_id": "worker.mailbox",
+      "scopes": ["workspace"],
+      "allow_broadcast": true
+    },
+    "body": {
+      "subject": "Idle dispatch probe",
+      "content": "Test mailbox event serialization",
+      "content_type": "text/plain"
+    },
+    "ack_policy": {
+      "mode": "passive",
+      "deadline": "2025-10-12T15:10:00Z",
+      "auto_ack_seconds": 600,
+      "escalation_ticket": "CHG-1234"
+    },
+    "audit": {
+      "request_id": "REQ-12345",
+      "change_ticket": "CHG-1234",
+      "created_by": "ops.test",
+      "justification": "Load-test mailbox OOB pipeline"
+    },
+    "attachments": [
+      {
+        "attachment_id": "attachment-1",
+        "description": "Deployment diff",
+        "content_type": "text/plain",
+        "digest": {
+          "algorithm": "sha256",
+          "value": "d0c7a5b8761f4a0deb8f97c72a78de94847a1d2e5d8cbbd0c60de399a7af1b42"
+        },
+        "uri": "https://example.com/attachment-1.txt"
+      }
+    ],
+    "tags": {
+      "env": "prod",
+      "team": "codex"
+    },
+    "metadata": {
+      "ticket_severity": "p2"
+    },
+    "rate_limit": {
+      "scope": "conversation",
+      "capacity": 5,
+      "interval_seconds": 300
+    }
+  },
+  "state": "enqueued",
+  "queue_depth": 2,
+  "observed_at": "2025-10-12T15:01:42Z"
+}

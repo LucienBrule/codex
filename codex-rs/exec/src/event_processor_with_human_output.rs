@@ -517,6 +517,8 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             EventMsg::AgentMessageDelta(_) => {}
             EventMsg::AgentReasoningDelta(_) => {}
             EventMsg::AgentReasoningRawContentDelta(_) => {}
+            EventMsg::MailboxDelivery(_) => {}
+            EventMsg::Heartbeat(_) => {}
         }
         CodexStatus::Running
     }

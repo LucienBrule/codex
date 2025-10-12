@@ -1338,6 +1338,7 @@ dependencies = [
  "anyhow",
  "clap",
  "codex-app-server-protocol",
+ "codex-protocol",
  "ts-rs",
 ]
 

@@ -1211,6 +1211,7 @@ pub struct BackgroundEventEvent {
     pub message: String,
 }
 
+/// Structured mailbox delivery payload that downstream clients can consume.
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct MailboxDeliveryEvent {
     pub message: MailboxMessage,

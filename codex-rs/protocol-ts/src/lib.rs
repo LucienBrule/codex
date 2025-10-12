@@ -7,6 +7,7 @@ use codex_app_server_protocol::ServerNotification;
 use codex_app_server_protocol::ServerRequest;
 use codex_app_server_protocol::export_client_responses;
 use codex_app_server_protocol::export_server_responses;
+use codex_protocol::protocol::MailboxDeliveryEvent;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::Read;
@@ -30,6 +31,9 @@ pub fn generate_ts(out_dir: &Path, prettier: Option<&Path>) -> Result<()> {
     ServerRequest::export_all_to(out_dir)?;
     export_server_responses(out_dir)?;
     ServerNotification::export_all_to(out_dir)?;
+
+    // Export additional protocol-only types that the app-server layer does not re-export.
+    MailboxDeliveryEvent::export_all_to(out_dir)?;
 
     // Generate index.ts that re-exports all types.
     generate_index_ts(out_dir)?;
