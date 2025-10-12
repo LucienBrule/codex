@@ -13,6 +13,7 @@ mod grep_files;
 mod json_result;
 mod list_dir;
 mod live_cli;
+mod mailbox;
 mod model_overrides;
 mod model_tools;
 mod otel;

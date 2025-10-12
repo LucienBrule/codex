@@ -14,6 +14,7 @@ use crate::ConversationId;
 use crate::config_types::ReasoningEffort as ReasoningEffortConfig;
 use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use crate::custom_prompts::CustomPrompt;
+use crate::mailbox::MailboxMessage;
 use crate::message_history::HistoryEntry;
 use crate::models::ContentItem;
 use crate::models::ResponseItem;
@@ -27,6 +28,7 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_with::serde_as;
 use strum_macros::Display;
+use time::OffsetDateTime;
 use ts_rs::TS;
 
 /// Open/close tags for special user-input blocks. Used across crates to avoid
@@ -91,6 +93,11 @@ pub enum Op {
         // The JSON schema to use for the final assistant message
         final_output_json_schema: Option<Value>,
     },
+
+    /// Enqueue an out-of-band mailbox envelope for delivery while the session
+    /// is idle or processing another turn. Experimental and guarded by the
+    /// `CODEX_MAILBOX_OOB` feature flag.
+    MailboxEnvelope { envelope: MailboxMessage },
 
     /// Override parts of the persistent turn context for subsequent turns.
     ///
@@ -486,6 +493,9 @@ pub enum EventMsg {
 
     BackgroundEvent(BackgroundEventEvent),
 
+    /// Delivery lifecycle update for an out-of-band mailbox message.
+    MailboxDelivery(MailboxDeliveryEvent),
+
     /// Notification that a model stream experienced an error or disconnect
     /// and the system is handling it (e.g., retrying with backoff).
     StreamError(StreamErrorEvent),
@@ -514,6 +524,9 @@ pub enum EventMsg {
 
     /// Notification that the agent is shutting down.
     ShutdownComplete,
+
+    /// Transport heartbeat emitted while streaming model output.
+    Heartbeat(HeartbeatEvent),
 
     ConversationPath(ConversationPathResponseEvent),
 
@@ -1199,6 +1212,27 @@ pub struct BackgroundEventEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct MailboxDeliveryEvent {
+    pub message: MailboxMessage,
+    pub state: MailboxDeliveryState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub queue_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(with = "time::serde::rfc3339::option")]
+    #[ts(type = "string | null")]
+    pub observed_at: Option<OffsetDateTime>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum MailboxDeliveryState {
+    Enqueued,
+    Delivered,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct StreamErrorEvent {
     pub message: String,
 }
@@ -1206,6 +1240,13 @@ pub struct StreamErrorEvent {
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct StreamInfoEvent {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct HeartbeatEvent {
+    #[serde(with = "time::serde::rfc3339")]
+    #[ts(type = "string")]
+    pub observed_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]

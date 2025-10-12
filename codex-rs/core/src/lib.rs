@@ -78,6 +78,7 @@ pub use rollout::list::ConversationItem;
 pub use rollout::list::ConversationsPage;
 pub use rollout::list::Cursor;
 mod function_tool;
+mod mailbox;
 mod state;
 mod tasks;
 mod user_notification;

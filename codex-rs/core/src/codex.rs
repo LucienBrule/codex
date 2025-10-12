@@ -17,6 +17,9 @@ use codex_apply_patch::ApplyPatchAction;
 use codex_protocol::ConversationId;
 use codex_protocol::protocol::ConversationPathResponseEvent;
 use codex_protocol::protocol::ExitedReviewModeEvent;
+use codex_protocol::protocol::HeartbeatEvent;
+use codex_protocol::protocol::MailboxDeliveryEvent;
+use codex_protocol::protocol::MailboxDeliveryState;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
@@ -57,6 +60,13 @@ use crate::exec_command::WriteStdinParams;
 use crate::executor::Executor;
 use crate::executor::ExecutorConfig;
 use crate::executor::normalize_exec_result;
+use crate::mailbox::MAILBOX_QUEUE_CAPACITY;
+use crate::mailbox::MailboxEnvelope;
+use crate::mailbox::MailboxReceiver;
+use crate::mailbox::MailboxSender;
+use crate::mailbox::TryEnqueueError;
+use crate::mailbox::mailbox_channel;
+use crate::mailbox::mailbox_feature_enabled;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_family::find_family_for_model;
@@ -120,6 +130,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
+use time::OffsetDateTime;
 
 pub mod compact;
 use self::compact::build_compacted_history;
@@ -154,6 +165,7 @@ impl Codex {
     ) -> CodexResult<CodexSpawnOk> {
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
+        let (mailbox_tx, mailbox_rx) = mailbox_channel(MAILBOX_QUEUE_CAPACITY);
 
         let user_instructions = get_user_instructions(&config).await;
 
@@ -189,7 +201,14 @@ impl Codex {
         let conversation_id = session.conversation_id;
 
         // This task will run until Op::Shutdown is received.
-        tokio::spawn(submission_loop(session, turn_context, config, rx_sub));
+        tokio::spawn(submission_loop(
+            session,
+            turn_context,
+            config,
+            rx_sub,
+            mailbox_tx.clone(),
+            mailbox_rx,
+        ));
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
@@ -1127,11 +1146,41 @@ async fn submission_loop(
     turn_context: TurnContext,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
+    mailbox_tx: MailboxSender,
+    mailbox_rx: MailboxReceiver,
 ) {
     // Wrap once to avoid cloning TurnContext for each task.
     let mut turn_context = Arc::new(turn_context);
     // To break out of this loop, send Op::Shutdown.
-    while let Ok(sub) = rx_sub.recv().await {
+    let submission_rx = rx_sub;
+    'outer: while let Some((sub, mailbox_enabled)) = {
+        let mailbox_enabled = mailbox_feature_enabled();
+        #[allow(clippy::let_unit_value)]
+        let next = tokio::select! {
+            biased;
+            envelope = mailbox_rx.recv(), if mailbox_enabled => {
+                match envelope {
+                    Ok(envelope) => {
+                        handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+                        continue 'outer;
+                    }
+                    Err(_) => {
+                        if submission_rx.is_closed() {
+                            break 'outer;
+                        }
+                        continue 'outer;
+                    }
+                }
+            }
+            sub = submission_rx.recv() => {
+                match sub {
+                    Ok(sub) => (sub, mailbox_enabled),
+                    Err(_) => break 'outer,
+                }
+            }
+        };
+        Some(next)
+    } {
         debug!(?sub, "Submission");
         match sub.op {
             Op::Interrupt => {
@@ -1420,6 +1469,59 @@ async fn submission_loop(
                 };
                 sess.send_event(event).await;
             }
+            Op::MailboxEnvelope { envelope } => {
+                if !mailbox_enabled {
+                    let event = Event {
+                        id: sub.id.clone(),
+                        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+                            message:
+                                "Mailbox dispatcher disabled (set CODEX_MAILBOX_OOB=1 to enable)"
+                                    .to_string(),
+                        }),
+                    };
+                    sess.send_event(event).await;
+                    continue;
+                }
+
+                let pending = MailboxEnvelope::new(sub.id.clone(), envelope.clone());
+                match mailbox_tx.try_enqueue(pending.clone()) {
+                    Ok(queue_depth) => {
+                        let event = Event {
+                            id: sub.id.clone(),
+                            msg: EventMsg::MailboxDelivery(MailboxDeliveryEvent {
+                                message: envelope,
+                                state: MailboxDeliveryState::Enqueued,
+                                queue_depth: Some(queue_depth),
+                                observed_at: Some(OffsetDateTime::now_utc()),
+                            }),
+                        };
+                        sess.send_event(event).await;
+                    }
+                    Err(TryEnqueueError::Full { envelope, capacity }) => {
+                        let message_id = envelope.message.message_id;
+                        let error_msg = format!(
+                            "Mailbox queue is full (capacity = {capacity}); dropping message {message_id}"
+                        );
+                        warn!(message_id = %message_id, capacity, "mailbox queue full");
+                        let event = Event {
+                            id: sub.id.clone(),
+                            msg: EventMsg::Error(ErrorEvent { message: error_msg }),
+                        };
+                        sess.send_event(event).await;
+                    }
+                    Err(TryEnqueueError::Closed(envelope)) => {
+                        let message_id = envelope.message.message_id;
+                        warn!(message_id = %message_id, "mailbox channel closed");
+                        let event = Event {
+                            id: sub.id.clone(),
+                            msg: EventMsg::Error(ErrorEvent {
+                                message: "Mailbox dispatcher unavailable".to_string(),
+                            }),
+                        };
+                        sess.send_event(event).await;
+                    }
+                }
+            }
             Op::ListCustomPrompts => {
                 let sub_id = sub.id.clone();
 
@@ -1523,6 +1625,24 @@ async fn submission_loop(
         }
     }
     debug!("Agent loop exited");
+}
+
+async fn handle_mailbox_delivery(
+    sess: &Arc<Session>,
+    mailbox_tx: &MailboxSender,
+    envelope: MailboxEnvelope,
+) {
+    let remaining = mailbox_tx.len();
+    let event = Event {
+        id: envelope.submission_id.clone(),
+        msg: EventMsg::MailboxDelivery(MailboxDeliveryEvent {
+            message: envelope.message.clone(),
+            state: MailboxDeliveryState::Delivered,
+            queue_depth: Some(remaining),
+            observed_at: Some(OffsetDateTime::now_utc()),
+        }),
+    };
+    sess.send_event(event).await;
 }
 
 /// Spawn a review thread using the given prompt.
@@ -2278,7 +2398,17 @@ async fn try_run_turn(
                 };
                 sess.send_event(event).await;
             }
-            ResponseEvent::Heartbeat => {}
+            ResponseEvent::Heartbeat => {
+                if mailbox_feature_enabled() {
+                    let event = Event {
+                        id: sub_id.to_string(),
+                        msg: EventMsg::Heartbeat(HeartbeatEvent {
+                            observed_at: OffsetDateTime::now_utc(),
+                        }),
+                    };
+                    sess.send_event(event).await;
+                }
+            }
             ResponseEvent::ReasoningContentDelta(delta) => {
                 if sess.show_raw_agent_reasoning() {
                     let event = Event {
