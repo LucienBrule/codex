@@ -7,7 +7,11 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use codex_core::config::Config;
+use codex_core::protocol::Event;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::MailboxDeliveryEvent;
 use codex_core::protocol::Op;
+use codex_protocol::mailbox::MailboxAckMode;
 use serde::Serialize;
 use serde_json::json;
 
@@ -126,6 +130,9 @@ pub(crate) fn log_inbound_app_event(event: &AppEvent) {
 
     match event {
         AppEvent::CodexEvent(ev) => {
+            if let EventMsg::MailboxDelivery(delivery) = &ev.msg {
+                log_mailbox_delivery(ev, delivery);
+            }
             write_record("to_tui", "codex_event", ev);
         }
         AppEvent::NewSession => {
@@ -205,6 +212,44 @@ where
         "dir": dir,
         "kind": kind,
         "payload": obj,
+    });
+    LOGGER.write_json_line(value);
+}
+
+fn log_mailbox_delivery(event: &Event, delivery: &MailboxDeliveryEvent) {
+    let subject = delivery
+        .message
+        .body
+        .subject
+        .clone()
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let sender = delivery
+        .message
+        .sender
+        .display_name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| delivery.message.sender.id.clone());
+    let ack_hint = format!(
+        "Press Ctrl+M then 'a' to acknowledge {}",
+        delivery.message.message_id
+    );
+    let value = json!({
+        "ts": now_ts(),
+        "dir": "to_tui",
+        "kind": "mailbox",
+        "submission_id": event.id,
+        "message_id": delivery.message.message_id,
+        "state": format!("{:?}", delivery.state).to_lowercase(),
+        "queue_depth": delivery.queue_depth,
+        "observed_at": delivery.observed_at.map(|t| t.to_string()),
+        "subject": subject,
+        "sender": sender,
+        "priority": format!("{:?}", delivery.message.priority).to_lowercase(),
+        "ack_mode": format!("{:?}", delivery.message.ack_policy.mode).to_lowercase(),
+        "ack_required": delivery.message.ack_policy.mode == MailboxAckMode::Required,
+        "request_id": delivery.message.audit.request_id.clone(),
+        "ack_hint": ack_hint,
     });
     LOGGER.write_json_line(value);
 }

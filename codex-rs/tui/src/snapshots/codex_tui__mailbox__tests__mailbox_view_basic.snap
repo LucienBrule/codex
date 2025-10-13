@@ -1,0 +1,15 @@
+---
+source: tui/src/mailbox.rs
+assertion_line: 651
+expression: terminal.backend()
+---
+"↑/↓ to move  enter/a to acknowledge  d to dismiss  esc to close                 "
+"1. [ACK] Security advisory  ·  Mailbox Control  ·  normal                       "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"Mailbox Detail                                                                  "
+"Subject: Security advisory                                                      "
+"From: Mailbox Control                                                           "

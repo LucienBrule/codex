@@ -41,6 +41,7 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use tempfile::NamedTempFile;
 use toml::Value as TomlValue;
@@ -60,6 +61,11 @@ pub const GPT_5_CODEX_MEDIUM_MODEL: &str = "gpt-5-codex";
 /// files are *silently truncated* to this size so we do not take up too much of
 /// the context window.
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
+
+const DEFAULT_MAILBOX_LIVENESS_IDLE_AFTER: Duration = Duration::from_secs(3);
+const DEFAULT_MAILBOX_LIVENESS_STALLED_AFTER: Duration = Duration::from_secs(12);
+const DEFAULT_MAILBOX_LIVENESS_EMIT_INTERVAL: Duration = Duration::from_secs(5);
+const MIN_MAILBOX_LIVENESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) const CONFIG_TOML_FILE: &str = "config.toml";
 
@@ -231,6 +237,69 @@ pub struct Config {
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: crate::config_types::OtelConfig,
+
+    /// Settings controlling how mailbox heartbeats are promoted to liveness telemetry.
+    pub mailbox_liveness: MailboxLivenessSettings,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MailboxLivenessSettings {
+    pub enabled: bool,
+    pub idle_after: Duration,
+    pub stalled_after: Duration,
+    pub emit_interval: Duration,
+}
+
+impl Default for MailboxLivenessSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_after: DEFAULT_MAILBOX_LIVENESS_IDLE_AFTER,
+            stalled_after: DEFAULT_MAILBOX_LIVENESS_STALLED_AFTER,
+            emit_interval: DEFAULT_MAILBOX_LIVENESS_EMIT_INTERVAL,
+        }
+    }
+}
+
+impl MailboxLivenessSettings {
+    pub fn from_toml(toml: Option<MailboxLivenessToml>) -> Self {
+        let raw = toml.unwrap_or_default();
+        let mut settings = Self::default();
+        if let Some(enabled) = raw.enabled {
+            settings.enabled = enabled;
+        }
+        if let Some(idle_after) = raw.idle_after_seconds {
+            if let Ok(duration) = Duration::try_from_secs_f64(idle_after) {
+                settings.idle_after = duration;
+            }
+        }
+        if let Some(stalled_after) = raw.stalled_after_seconds {
+            if let Ok(duration) = Duration::try_from_secs_f64(stalled_after) {
+                settings.stalled_after = duration;
+            }
+        }
+        if let Some(emit_interval) = raw.emit_interval_seconds {
+            if let Ok(duration) = Duration::try_from_secs_f64(emit_interval) {
+                settings.emit_interval = duration;
+            }
+        }
+        settings.normalize();
+        settings
+    }
+
+    pub fn normalize(&mut self) {
+        if self.idle_after.is_zero() {
+            self.idle_after = DEFAULT_MAILBOX_LIVENESS_IDLE_AFTER;
+        }
+
+        if self.stalled_after <= self.idle_after {
+            self.stalled_after = self.idle_after + Duration::from_secs(1);
+        }
+
+        if self.emit_interval < MIN_MAILBOX_LIVENESS_EMIT_INTERVAL {
+            self.emit_interval = MIN_MAILBOX_LIVENESS_EMIT_INTERVAL;
+        }
+    }
 }
 
 impl Config {
@@ -772,6 +841,9 @@ pub struct ConfigToml {
     /// Collection of settings that are specific to the TUI.
     pub tui: Option<Tui>,
 
+    #[serde(default)]
+    pub mailbox_liveness: Option<MailboxLivenessToml>,
+
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
     pub hide_agent_reasoning: Option<bool>,
@@ -864,6 +936,18 @@ impl From<ToolsToml> for Tools {
             view_image: tools_toml.view_image,
         }
     }
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct MailboxLivenessToml {
+    pub enabled: Option<bool>,
+    #[serde(rename = "idle_after_seconds")]
+    pub idle_after_seconds: Option<f64>,
+    #[serde(rename = "stalled_after_seconds")]
+    pub stalled_after_seconds: Option<f64>,
+    #[serde(rename = "emit_interval_seconds")]
+    pub emit_interval_seconds: Option<f64>,
 }
 
 impl ConfigToml {
@@ -1104,6 +1188,8 @@ impl Config {
             .or(cfg.review_model)
             .unwrap_or_else(default_review_model);
 
+        let mailbox_liveness = MailboxLivenessSettings::from_toml(cfg.mailbox_liveness.clone());
+
         let config = Self {
             model,
             review_model,
@@ -1198,6 +1284,7 @@ impl Config {
                     exporter,
                 }
             },
+            mailbox_liveness,
         };
         Ok(config)
     }
@@ -2112,6 +2199,7 @@ model_verbosity = "high"
                 history: History::default(),
                 file_opener: UriBasedFileOpener::VsCode,
                 codex_linux_sandbox_exe: None,
+                mailbox_liveness: MailboxLivenessSettings::default(),
                 hide_agent_reasoning: false,
                 show_raw_agent_reasoning: false,
                 model_reasoning_effort: Some(ReasoningEffort::High),
@@ -2175,6 +2263,7 @@ model_verbosity = "high"
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
+            mailbox_liveness: MailboxLivenessSettings::default(),
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: None,
@@ -2253,6 +2342,7 @@ model_verbosity = "high"
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
+            mailbox_liveness: MailboxLivenessSettings::default(),
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: None,
@@ -2317,6 +2407,7 @@ model_verbosity = "high"
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
+            mailbox_liveness: MailboxLivenessSettings::default(),
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: Some(ReasoningEffort::High),

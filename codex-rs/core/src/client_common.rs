@@ -18,6 +18,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::task::Context;
 use std::task::Poll;
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// Review thread system prompt. Edit `core/src/review_prompt.md` to customize.
@@ -206,7 +207,12 @@ pub enum ResponseEvent {
     RateLimits(RateLimitSnapshot),
     /// Synthetic heartbeat emitted when the streaming transport stays idle but the
     /// connection is still considered healthy.
-    Heartbeat,
+    Heartbeat(HeartbeatLiveness),
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct HeartbeatLiveness {
+    pub transport_lag: Duration,
 }
 
 #[derive(Debug, Serialize)]

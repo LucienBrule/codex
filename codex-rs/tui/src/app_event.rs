@@ -7,6 +7,7 @@ use codex_file_search::FileMatch;
 
 use crate::bottom_pane::ApprovalRequest;
 use crate::history_cell::HistoryCell;
+use crate::mailbox::MailboxActionOutcome;
 
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::SandboxPolicy;
@@ -87,4 +88,7 @@ pub(crate) enum AppEvent {
 
     /// Open the approval popup.
     FullScreenApprovalRequest(ApprovalRequest),
+
+    /// Mailbox entry acknowledged or dismissed from the UI.
+    MailboxAction(MailboxActionOutcome),
 }

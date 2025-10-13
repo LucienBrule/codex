@@ -61,5 +61,7 @@
   },
   "state": "enqueued",
   "queue_depth": 2,
-  "observed_at": "2025-10-12T15:01:42Z"
+  "observed_at": "2025-10-12T15:01:42Z",
+  "correlation_id": "sub-1/mailbox",
+  "ingress": "cli"
 }

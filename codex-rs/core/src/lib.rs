@@ -65,6 +65,7 @@ pub(crate) mod safety;
 pub mod seatbelt;
 pub mod shell;
 pub mod spawn;
+pub mod telemetry;
 pub mod terminal;
 mod tools;
 pub mod turn_diff_tracker;
@@ -86,6 +87,10 @@ pub mod util;
 
 pub use apply_patch::CODEX_APPLY_PATCH_ARG1;
 pub use command_safety::is_safe_command;
+pub use mailbox::DEFAULT_CRITICAL_MAILBOX_CAPACITY;
+pub use mailbox::DEFAULT_CRITICAL_MAILBOX_INTERVAL_SECONDS;
+pub use mailbox::apply_mailbox_defaults;
+pub use mailbox::validate_mailbox_message;
 pub use safety::get_platform_sandbox;
 // Re-export the protocol types from the standalone `codex-protocol` crate so existing
 // `codex_core::protocol::...` references continue to work across the workspace.

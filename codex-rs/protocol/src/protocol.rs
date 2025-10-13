@@ -1223,6 +1223,15 @@ pub struct MailboxDeliveryEvent {
     #[serde(with = "time::serde::rfc3339::option")]
     #[ts(type = "string | null")]
     pub observed_at: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | null")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub ingress: Option<MailboxDeliveryIngress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub delivery_latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
@@ -1231,6 +1240,18 @@ pub struct MailboxDeliveryEvent {
 pub enum MailboxDeliveryState {
     Enqueued,
     Delivered,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum MailboxDeliveryIngress {
+    Cli,
+    Script,
+    Mcp,
+    Vscode,
+    Api,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -1244,10 +1265,29 @@ pub struct StreamInfoEvent {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[ts(export)]
 pub struct HeartbeatEvent {
     #[serde(with = "time::serde::rfc3339")]
     #[ts(type = "string")]
     pub observed_at: OffsetDateTime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub transport_lag_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub queue_depth: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub liveness: Option<MailboxLivenessState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, TS)]
+#[ts(export)]
+#[ts(rename_all = "snake_case")]
+pub enum MailboxLivenessState {
+    Active,
+    Idle,
+    Stalled,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -1464,5 +1504,14 @@ mod tests {
         let deserialized: ExecCommandOutputDeltaEvent = serde_json::from_str(&serialized)?;
         assert_eq!(deserialized, event);
         Ok(())
+    }
+
+    #[test]
+    fn heartbeat_event_ts_decl_includes_liveness() {
+        use ts_rs::TS;
+        let decl = HeartbeatEvent::decl();
+        assert!(decl.contains("transport_lag_ms"), "{decl}");
+        assert!(decl.contains("queue_depth"), "{decl}");
+        assert!(decl.contains("liveness"), "{decl}");
     }
 }

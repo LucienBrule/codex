@@ -27,6 +27,7 @@ use tracing::warn;
 
 use crate::chat_completions::AggregateStreamExt;
 use crate::chat_completions::stream_chat_completions;
+use crate::client_common::HeartbeatLiveness;
 use crate::client_common::Prompt;
 use crate::client_common::ResponseEvent;
 use crate::client_common::ResponseStream;
@@ -769,7 +770,14 @@ async fn process_sse<S>(
                 if treat_elapsed_as_heartbeat {
                     metrics::record_heartbeat("responses_sse", "emit", Some(wait_duration_ms));
                     otel_event_manager.sse_event_heartbeat(wait_duration);
-                    if tx_event.send(Ok(ResponseEvent::Heartbeat)).await.is_err() {
+                    let heartbeat = HeartbeatLiveness {
+                        transport_lag: last_data_at.elapsed(),
+                    };
+                    if tx_event
+                        .send(Ok(ResponseEvent::Heartbeat(heartbeat)))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     continue;

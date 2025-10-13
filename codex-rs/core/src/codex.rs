@@ -1,8 +1,10 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::{Duration, Instant};
 
 use crate::AuthManager;
 use crate::client_common::REVIEW_PROMPT;
@@ -15,6 +17,7 @@ use async_channel::Receiver;
 use async_channel::Sender;
 use codex_apply_patch::ApplyPatchAction;
 use codex_protocol::ConversationId;
+use codex_protocol::mailbox::MailboxMessage;
 use codex_protocol::protocol::ConversationPathResponseEvent;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::HeartbeatEvent;
@@ -32,6 +35,8 @@ use futures::stream::FuturesOrdered;
 use mcp_types::CallToolResult;
 use serde_json;
 use serde_json::Value;
+use thiserror::Error;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
 use tracing::debug;
@@ -39,6 +44,7 @@ use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::ModelProviderInfo;
 use crate::apply_patch::convert_apply_patch_to_protocol;
@@ -112,6 +118,10 @@ use crate::state::SessionServices;
 use crate::tasks::CompactTask;
 use crate::tasks::RegularTask;
 use crate::tasks::ReviewTask;
+use crate::telemetry::MailboxDeliveryTelemetry;
+use crate::telemetry::MailboxLivenessSnapshot;
+use crate::telemetry::MailboxLivenessTelemetry;
+use crate::telemetry::MailboxTelemetryLabels;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::format_exec_output_str;
@@ -130,6 +140,7 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::MailboxDeliveryIngress;
 use time::OffsetDateTime;
 
 pub mod compact;
@@ -185,6 +196,7 @@ impl Codex {
         };
 
         // Generate a unique ID for the lifetime of this Codex session.
+        let session_mailbox_tx = mailbox_tx.clone();
         let (session, turn_context) = Session::new(
             configure_session,
             config.clone(),
@@ -192,6 +204,7 @@ impl Codex {
             tx_event.clone(),
             conversation_history,
             session_source,
+            session_mailbox_tx,
         )
         .await
         .map_err(|e| {
@@ -264,6 +277,21 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
+    mailbox_tx: MailboxSender,
+    mailbox_waiters: Mutex<HashMap<Uuid, Vec<oneshot::Sender<MailboxDeliveryEvent>>>>,
+    session_source: SessionSource,
+    mailbox_metrics: Mutex<MailboxDeliveryTelemetry>,
+    mailbox_liveness: Option<Mutex<MailboxLivenessTelemetry>>,
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum MailboxEnqueueError {
+    #[error("mailbox dispatcher disabled (set CODEX_MAILBOX_OOB=1 to enable)")]
+    Disabled,
+    #[error("mailbox queue is full (capacity = {capacity})")]
+    Full { capacity: usize },
+    #[error("mailbox dispatcher unavailable")]
+    Closed,
 }
 
 /// The context needed for a single turn of the conversation.
@@ -334,6 +362,7 @@ impl Session {
         tx_event: Sender<Event>,
         initial_history: InitialHistory,
         session_source: SessionSource,
+        mailbox_tx: MailboxSender,
     ) -> anyhow::Result<(Arc<Self>, TurnContext)> {
         let ConfigureSession {
             provider,
@@ -496,6 +525,14 @@ impl Session {
             )),
         };
 
+        let mailbox_liveness = if config.mailbox_liveness.enabled {
+            Some(Mutex::new(MailboxLivenessTelemetry::new(
+                config.mailbox_liveness.clone(),
+            )))
+        } else {
+            None
+        };
+
         let sess = Arc::new(Session {
             conversation_id,
             tx_event: tx_event.clone(),
@@ -503,6 +540,11 @@ impl Session {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            mailbox_tx,
+            mailbox_waiters: Mutex::new(HashMap::new()),
+            session_source,
+            mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
+            mailbox_liveness,
         });
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
@@ -579,6 +621,163 @@ impl Session {
         self.persist_rollout_items(&rollout_items).await;
         if let Err(e) = self.tx_event.send(event).await {
             error!("failed to send tool call event: {e}");
+        }
+    }
+
+    pub(crate) async fn enqueue_mailbox_envelope(
+        &self,
+        submission_id: String,
+        message: MailboxMessage,
+        mailbox_enabled: bool,
+    ) -> Result<MailboxDeliveryEvent, MailboxEnqueueError> {
+        if !mailbox_enabled {
+            let event = Event {
+                id: submission_id,
+                msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+                    message: "Mailbox dispatcher disabled (set CODEX_MAILBOX_OOB=1 to enable)"
+                        .to_string(),
+                }),
+            };
+            self.send_event(event).await;
+            return Err(MailboxEnqueueError::Disabled);
+        }
+
+        let observed_at = OffsetDateTime::now_utc();
+        let pending = MailboxEnvelope::new(submission_id.clone(), message.clone());
+        match self.mailbox_tx.try_enqueue(pending.clone()) {
+            Ok(queue_depth) => {
+                let expires_at = pending
+                    .message
+                    .expires_at
+                    .map(|ts| ts.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()));
+                let ack_deadline = pending
+                    .message
+                    .ack_policy
+                    .deadline
+                    .map(|ts| ts.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()));
+                let rate_scope = pending
+                    .message
+                    .rate_limit
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.scope).to_lowercase());
+                let rate_capacity = pending.message.rate_limit.as_ref().and_then(|r| r.capacity);
+                let rate_interval = pending
+                    .message
+                    .rate_limit
+                    .as_ref()
+                    .and_then(|r| r.interval_seconds);
+
+                info!(
+                    target: "codex::mailbox",
+                    event = "enqueued",
+                    submission_id = %pending.submission_id,
+                    conversation_id = %self.conversation_id,
+                    message_id = %pending.message.message_id,
+                    sender_id = %pending.message.sender.id,
+                    sender_role = ?pending.message.sender.role,
+                    priority = ?pending.message.priority,
+                    request_id = pending.message.audit.request_id.as_deref().unwrap_or(""),
+                    ack_mode = ?pending.message.ack_policy.mode,
+                    ack_deadline = ack_deadline.as_deref(),
+                    expires_at = expires_at.as_deref(),
+                    rate_scope = rate_scope.as_deref(),
+                    rate_capacity,
+                    rate_interval,
+                    queue_depth,
+                );
+
+                let ingress = self.mailbox_ingress(&pending.message);
+                let enqueued_event = MailboxDeliveryEvent {
+                    message,
+                    state: MailboxDeliveryState::Enqueued,
+                    queue_depth: Some(queue_depth),
+                    observed_at: Some(observed_at),
+                    correlation_id: Some(submission_id.clone()),
+                    ingress: Some(ingress.clone()),
+                    delivery_latency_ms: None,
+                };
+
+                {
+                    let labels = MailboxTelemetryLabels::new(ingress, &enqueued_event.message);
+                    let mut telemetry = self.mailbox_metrics.lock().await;
+                    telemetry.record_enqueued(&enqueued_event, &labels);
+                }
+
+                let event = Event {
+                    id: submission_id,
+                    msg: EventMsg::MailboxDelivery(enqueued_event.clone()),
+                };
+                self.send_event(event).await;
+                Ok(enqueued_event)
+            }
+            Err(TryEnqueueError::Full { capacity, .. }) => {
+                let error_msg = format!(
+                    "Mailbox queue is full (capacity = {capacity}); dropping message {}",
+                    pending.message.message_id
+                );
+                warn!(
+                    target: "codex::mailbox",
+                    event = "dropped_full",
+                    message_id = %pending.message.message_id,
+                    submission_id = %pending.submission_id,
+                    conversation_id = %self.conversation_id,
+                    sender_id = %pending.message.sender.id,
+                    priority = ?pending.message.priority,
+                    request_id = pending.message.audit.request_id.as_deref().unwrap_or(""),
+                    capacity
+                );
+                let event = Event {
+                    id: submission_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: error_msg.clone(),
+                    }),
+                };
+                self.send_event(event).await;
+                Err(MailboxEnqueueError::Full { capacity })
+            }
+            Err(TryEnqueueError::Closed(_)) => {
+                warn!(
+                    target: "codex::mailbox",
+                    event = "dispatcher_closed",
+                    submission_id = %pending.submission_id,
+                    conversation_id = %self.conversation_id,
+                    message_id = %pending.message.message_id,
+                    sender_id = %pending.message.sender.id,
+                    request_id = pending.message.audit.request_id.as_deref().unwrap_or("")
+                );
+                let event = Event {
+                    id: submission_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "Mailbox dispatcher unavailable".to_string(),
+                    }),
+                };
+                self.send_event(event).await;
+                Err(MailboxEnqueueError::Closed)
+            }
+        }
+    }
+
+    pub(crate) async fn register_mailbox_delivery_listener(
+        &self,
+        message_id: Uuid,
+    ) -> oneshot::Receiver<MailboxDeliveryEvent> {
+        let (tx, rx) = oneshot::channel();
+        let mut waiters = self.mailbox_waiters.lock().await;
+        waiters.entry(message_id).or_default().push(tx);
+        rx
+    }
+
+    pub(crate) async fn cancel_mailbox_delivery_listener(&self, message_id: Uuid) {
+        let mut waiters = self.mailbox_waiters.lock().await;
+        waiters.remove(&message_id);
+    }
+
+    async fn notify_mailbox_delivery_listeners(&self, delivery: &MailboxDeliveryEvent) {
+        let mut waiters = self.mailbox_waiters.lock().await;
+        if let Some(listeners) = waiters.remove(&delivery.message.message_id) {
+            for tx in listeners {
+                let _ = tx.send(delivery.clone());
+            }
         }
     }
 
@@ -1133,6 +1332,48 @@ impl Session {
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
     }
+
+    fn mailbox_ingress(&self, message: &MailboxMessage) -> MailboxDeliveryIngress {
+        if let Some(value) = message
+            .metadata
+            .get("ingress")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+        {
+            match value.as_str() {
+                "script" => return MailboxDeliveryIngress::Script,
+                "cli" => return MailboxDeliveryIngress::Cli,
+                "mcp" => return MailboxDeliveryIngress::Mcp,
+                "vscode" => return MailboxDeliveryIngress::Vscode,
+                "api" => return MailboxDeliveryIngress::Api,
+                _ => {}
+            }
+        }
+
+        match self.session_source {
+            SessionSource::Cli | SessionSource::Exec => MailboxDeliveryIngress::Cli,
+            SessionSource::VSCode => MailboxDeliveryIngress::Vscode,
+            SessionSource::Mcp => MailboxDeliveryIngress::Mcp,
+            SessionSource::Unknown => MailboxDeliveryIngress::Unknown,
+        }
+    }
+
+    async fn record_mailbox_liveness(
+        &self,
+        transport_lag: Duration,
+    ) -> Option<MailboxLivenessSnapshot> {
+        let telemetry = self.mailbox_liveness.as_ref()?;
+
+        if !mailbox_feature_enabled() {
+            return None;
+        }
+
+        let queue_depth = self.mailbox_tx.len();
+        let now = Instant::now();
+        let observed_at = OffsetDateTime::now_utc();
+        let mut guard = telemetry.lock().await;
+        guard.record(now, observed_at, transport_lag, queue_depth)
+    }
 }
 
 impl Drop for Session {
@@ -1470,57 +1711,9 @@ async fn submission_loop(
                 sess.send_event(event).await;
             }
             Op::MailboxEnvelope { envelope } => {
-                if !mailbox_enabled {
-                    let event = Event {
-                        id: sub.id.clone(),
-                        msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
-                            message:
-                                "Mailbox dispatcher disabled (set CODEX_MAILBOX_OOB=1 to enable)"
-                                    .to_string(),
-                        }),
-                    };
-                    sess.send_event(event).await;
-                    continue;
-                }
-
-                let pending = MailboxEnvelope::new(sub.id.clone(), envelope.clone());
-                match mailbox_tx.try_enqueue(pending.clone()) {
-                    Ok(queue_depth) => {
-                        let event = Event {
-                            id: sub.id.clone(),
-                            msg: EventMsg::MailboxDelivery(MailboxDeliveryEvent {
-                                message: envelope,
-                                state: MailboxDeliveryState::Enqueued,
-                                queue_depth: Some(queue_depth),
-                                observed_at: Some(OffsetDateTime::now_utc()),
-                            }),
-                        };
-                        sess.send_event(event).await;
-                    }
-                    Err(TryEnqueueError::Full { envelope, capacity }) => {
-                        let message_id = envelope.message.message_id;
-                        let error_msg = format!(
-                            "Mailbox queue is full (capacity = {capacity}); dropping message {message_id}"
-                        );
-                        warn!(message_id = %message_id, capacity, "mailbox queue full");
-                        let event = Event {
-                            id: sub.id.clone(),
-                            msg: EventMsg::Error(ErrorEvent { message: error_msg }),
-                        };
-                        sess.send_event(event).await;
-                    }
-                    Err(TryEnqueueError::Closed(envelope)) => {
-                        let message_id = envelope.message.message_id;
-                        warn!(message_id = %message_id, "mailbox channel closed");
-                        let event = Event {
-                            id: sub.id.clone(),
-                            msg: EventMsg::Error(ErrorEvent {
-                                message: "Mailbox dispatcher unavailable".to_string(),
-                            }),
-                        };
-                        sess.send_event(event).await;
-                    }
-                }
+                let _ = sess
+                    .enqueue_mailbox_envelope(sub.id.clone(), envelope.clone(), mailbox_enabled)
+                    .await;
             }
             Op::ListCustomPrompts => {
                 let sub_id = sub.id.clone();
@@ -1633,16 +1826,75 @@ async fn handle_mailbox_delivery(
     envelope: MailboxEnvelope,
 ) {
     let remaining = mailbox_tx.len();
+    let observed_at = OffsetDateTime::now_utc();
+    let expires_at = envelope
+        .message
+        .expires_at
+        .map(|ts| ts.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()));
+    let ack_deadline = envelope
+        .message
+        .ack_policy
+        .deadline
+        .map(|ts| ts.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()));
+    let rate_scope = envelope
+        .message
+        .rate_limit
+        .as_ref()
+        .map(|r| format!("{:?}", r.scope).to_lowercase());
+    let rate_capacity = envelope
+        .message
+        .rate_limit
+        .as_ref()
+        .and_then(|r| r.capacity);
+    let rate_interval = envelope
+        .message
+        .rate_limit
+        .as_ref()
+        .and_then(|r| r.interval_seconds);
+
+    info!(
+        target: "codex::mailbox",
+        event = "delivered",
+        submission_id = %envelope.submission_id,
+        conversation_id = %sess.conversation_id,
+        message_id = %envelope.message.message_id,
+        sender_id = %envelope.message.sender.id,
+        sender_role = ?envelope.message.sender.role,
+        priority = ?envelope.message.priority,
+        request_id = envelope.message.audit.request_id.as_deref().unwrap_or(""),
+        ack_mode = ?envelope.message.ack_policy.mode,
+        ack_deadline = ack_deadline.as_deref(),
+        expires_at = expires_at.as_deref(),
+        rate_scope = rate_scope.as_deref(),
+        rate_capacity,
+        rate_interval,
+        queue_depth = remaining,
+    );
+
+    let ingress = sess.mailbox_ingress(&envelope.message);
+    let mut delivery_event = MailboxDeliveryEvent {
+        message: envelope.message.clone(),
+        state: MailboxDeliveryState::Delivered,
+        queue_depth: Some(remaining),
+        observed_at: Some(observed_at),
+        correlation_id: Some(envelope.submission_id.clone()),
+        ingress: Some(ingress.clone()),
+        delivery_latency_ms: None,
+    };
+
+    {
+        let labels = MailboxTelemetryLabels::new(ingress, &delivery_event.message);
+        let mut telemetry = sess.mailbox_metrics.lock().await;
+        telemetry.record_delivered(&mut delivery_event, &labels);
+    }
+
     let event = Event {
         id: envelope.submission_id.clone(),
-        msg: EventMsg::MailboxDelivery(MailboxDeliveryEvent {
-            message: envelope.message.clone(),
-            state: MailboxDeliveryState::Delivered,
-            queue_depth: Some(remaining),
-            observed_at: Some(OffsetDateTime::now_utc()),
-        }),
+        msg: EventMsg::MailboxDelivery(delivery_event.clone()),
     };
     sess.send_event(event).await;
+    sess.notify_mailbox_delivery_listeners(&delivery_event)
+        .await;
 }
 
 /// Spawn a review thread using the given prompt.
@@ -2398,12 +2650,19 @@ async fn try_run_turn(
                 };
                 sess.send_event(event).await;
             }
-            ResponseEvent::Heartbeat => {
-                if mailbox_feature_enabled() {
+            ResponseEvent::Heartbeat(liveness) => {
+                if let Some(snapshot) = sess.record_mailbox_liveness(liveness.transport_lag).await {
+                    let transport_lag_ms =
+                        snapshot.transport_lag.as_millis().min(u128::from(u64::MAX)) as u64;
+                    let queue_depth = snapshot.queue_depth.min(u32::MAX as usize) as u32;
+
                     let event = Event {
                         id: sub_id.to_string(),
                         msg: EventMsg::Heartbeat(HeartbeatEvent {
-                            observed_at: OffsetDateTime::now_utc(),
+                            observed_at: snapshot.observed_at,
+                            transport_lag_ms: Some(transport_lag_ms),
+                            queue_depth: Some(queue_depth),
+                            liveness: Some(snapshot.state),
                         }),
                     };
                     sess.send_event(event).await;
@@ -2577,7 +2836,7 @@ use crate::tools::context::ExecCommandContext;
 pub(crate) use tests::make_session_and_context;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::ConfigOverrides;
     use crate::config::ConfigToml;
@@ -2599,11 +2858,130 @@ mod tests {
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
 
+    use anyhow::Context as _;
     use mcp_types::ContentBlock;
     use mcp_types::TextContent;
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
+    use tokio::task::JoinHandle;
+
+    pub(crate) struct MailboxTestGuard {
+        _env_guard: MailboxEnvGuard,
+        _home: tempfile::TempDir,
+        _cwd: tempfile::TempDir,
+    }
+
+    struct MailboxEnvGuard {
+        key: &'static str,
+    }
+
+    impl MailboxEnvGuard {
+        fn new() -> Self {
+            // SAFETY: test harness serializes access to this env var.
+            unsafe { std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1") };
+            Self {
+                key: "CODEX_MAILBOX_OOB_FORCE",
+            }
+        }
+    }
+
+    impl Drop for MailboxEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: test harness serializes access to this env var.
+            unsafe { std::env::remove_var(self.key) };
+        }
+    }
+
+    pub(crate) async fn spawn_test_mailbox_session() -> anyhow::Result<(
+        MailboxTestGuard,
+        Arc<Session>,
+        Arc<TurnContext>,
+        JoinHandle<()>,
+    )> {
+        let env_guard = MailboxEnvGuard::new();
+        let home = tempfile::tempdir().context("create codex home")?;
+        let cwd = tempfile::tempdir().context("create cwd")?;
+
+        let mut config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            home.path().to_path_buf(),
+        )
+        .context("load default config")?;
+        config.cwd = cwd.path().to_path_buf();
+
+        let config_arc = Arc::new(config.clone());
+        let auth_manager = AuthManager::shared(config.codex_home.clone(), true);
+        let (tx_event, _rx_event) = async_channel::unbounded();
+        let (mailbox_tx, mailbox_rx) = mailbox_channel(MAILBOX_QUEUE_CAPACITY);
+
+        let configure_session = ConfigureSession {
+            provider: config.model_provider.clone(),
+            model: config.model.clone(),
+            model_reasoning_effort: config.model_reasoning_effort,
+            model_reasoning_summary: config.model_reasoning_summary,
+            user_instructions: config.user_instructions.clone(),
+            base_instructions: config.base_instructions.clone(),
+            approval_policy: config.approval_policy,
+            sandbox_policy: config.sandbox_policy.clone(),
+            notify: UserNotifier::default(),
+            cwd: config.cwd.clone(),
+        };
+
+        let (session, turn_context) = Session::new(
+            configure_session,
+            Arc::clone(&config_arc),
+            auth_manager,
+            tx_event,
+            InitialHistory::New,
+            SessionSource::Exec,
+            mailbox_tx.clone(),
+        )
+        .await
+        .context("failed to initialize session")?;
+
+        let handler_turn_context = Arc::new(TurnContext {
+            client: turn_context.client.clone(),
+            cwd: turn_context.cwd.clone(),
+            base_instructions: turn_context.base_instructions.clone(),
+            user_instructions: turn_context.user_instructions.clone(),
+            approval_policy: turn_context.approval_policy,
+            sandbox_policy: turn_context.sandbox_policy.clone(),
+            shell_environment_policy: turn_context.shell_environment_policy.clone(),
+            tools_config: ToolsConfig::new(&ToolsConfigParams {
+                model_family: &config_arc.model_family,
+                include_plan_tool: config_arc.include_plan_tool,
+                include_apply_patch_tool: config_arc.include_apply_patch_tool,
+                include_web_search_request: config_arc.tools_web_search_request,
+                use_streamable_shell_tool: config_arc.use_experimental_streamable_shell_tool,
+                include_view_image_tool: config_arc.include_view_image_tool,
+                experimental_unified_exec_tool: config_arc.use_experimental_unified_exec_tool,
+            }),
+            is_review_mode: false,
+            final_output_json_schema: None,
+        });
+
+        let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+        drop(tx_sub);
+
+        let submission_task = tokio::spawn(submission_loop(
+            Arc::clone(&session),
+            turn_context,
+            Arc::clone(&config_arc),
+            rx_sub,
+            mailbox_tx,
+            mailbox_rx,
+        ));
+
+        let guard = MailboxTestGuard {
+            _env_guard: env_guard,
+            _home: home,
+            _cwd: cwd,
+        };
+
+        Ok((guard, session, handler_turn_context, submission_task))
+    }
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
@@ -2912,6 +3290,7 @@ mod tests {
                 None,
             )),
         };
+        let (mailbox_tx, _) = mailbox_channel(1);
         let session = Session {
             conversation_id,
             tx_event,
@@ -2919,6 +3298,11 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            mailbox_tx,
+            mailbox_waiters: Mutex::new(HashMap::new()),
+            session_source: SessionSource::Cli,
+            mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
+            mailbox_liveness: None,
         };
         (session, turn_context)
     }
@@ -2985,6 +3369,7 @@ mod tests {
                 None,
             )),
         };
+        let (mailbox_tx, _) = mailbox_channel(1);
         let session = Arc::new(Session {
             conversation_id,
             tx_event,
@@ -2992,6 +3377,11 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            mailbox_tx,
+            mailbox_waiters: Mutex::new(HashMap::new()),
+            session_source: SessionSource::Cli,
+            mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
+            mailbox_liveness: None,
         });
         (session, turn_context, rx_event)
     }

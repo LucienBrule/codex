@@ -13,6 +13,7 @@ use codex_cli::login::run_login_with_api_key;
 use codex_cli::login::run_login_with_chatgpt;
 use codex_cli::login::run_login_with_device_code;
 use codex_cli::login::run_logout;
+use codex_cli::mail::MailCli;
 use codex_cloud_tasks::Cli as CloudTasksCli;
 use codex_common::CliConfigOverrides;
 use codex_exec::Cli as ExecCli;
@@ -83,6 +84,9 @@ enum Subcommand {
     /// Apply the latest diff produced by Codex agent as a `git apply` to your local working tree.
     #[clap(visible_alias = "a")]
     Apply(ApplyCommand),
+
+    /// Send mailbox messages to the Codex runtime.
+    Mail(MailCli),
 
     /// Resume a previous interactive session (picker by default; use --last to continue the most recent).
     Resume(ResumeCommand),
@@ -373,6 +377,13 @@ async fn cli_main(codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()
                 root_config_overrides.clone(),
             );
             run_apply_command(apply_cli, None).await?;
+        }
+        Some(Subcommand::Mail(mut mail_cli)) => {
+            prepend_config_flags(
+                &mut mail_cli.config_overrides,
+                root_config_overrides.clone(),
+            );
+            mail_cli.run(codex_linux_sandbox_exe).await?;
         }
         Some(Subcommand::ResponsesApiProxy(args)) => {
             tokio::task::spawn_blocking(move || codex_responses_api_proxy::run_main(args))

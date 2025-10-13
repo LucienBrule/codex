@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use crate::app_event_sender::AppEventSender;
 use crate::tui::FrameRequester;
-use bottom_pane_view::BottomPaneView;
 use codex_file_search::FileMatch;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -18,6 +17,7 @@ mod approval_overlay;
 pub(crate) use approval_overlay::ApprovalOverlay;
 pub(crate) use approval_overlay::ApprovalRequest;
 mod bottom_pane_view;
+pub(crate) use bottom_pane_view::BottomPaneView;
 mod chat_composer;
 mod chat_composer_history;
 mod command_popup;
@@ -43,7 +43,8 @@ pub(crate) use chat_composer::ChatComposer;
 pub(crate) use chat_composer::InputResult;
 use codex_protocol::custom_prompts::CustomPrompt;
 
-use crate::status_indicator_widget::StatusIndicatorWidget;
+use crate::mailbox::MailboxBadgeState;
+use crate::status_indicator_widget::{LivenessBadge, StatusIndicatorWidget};
 pub(crate) use list_selection_view::SelectionAction;
 pub(crate) use list_selection_view::SelectionItem;
 
@@ -69,6 +70,7 @@ pub(crate) struct BottomPane {
     /// Queued user messages to show under the status indicator.
     queued_user_messages: Vec<String>,
     context_window_percent: Option<u8>,
+    mailbox_badge: Option<MailboxBadgeState>,
 }
 
 pub(crate) struct BottomPaneParams {
@@ -102,6 +104,7 @@ impl BottomPane {
             queued_user_messages: Vec::new(),
             esc_backtrack_hint: false,
             context_window_percent: None,
+            mailbox_badge: None,
         }
     }
 
@@ -343,6 +346,13 @@ impl BottomPane {
         }
     }
 
+    pub(crate) fn update_liveness_indicator(&mut self, badge: Option<LivenessBadge>) {
+        if let Some(status) = self.status.as_mut() {
+            status.set_liveness(badge);
+            self.request_redraw();
+        }
+    }
+
     /// Hide the status indicator while leaving task-running state untouched.
     pub(crate) fn hide_status_indicator(&mut self) {
         if self.status.take().is_some() {
@@ -372,6 +382,15 @@ impl BottomPane {
         if let Some(status) = self.status.as_mut() {
             status.set_queued_messages(queued);
         }
+        self.request_redraw();
+    }
+
+    pub(crate) fn set_mailbox_badge(&mut self, badge: Option<MailboxBadgeState>) {
+        if self.mailbox_badge == badge {
+            return;
+        }
+        self.mailbox_badge = badge;
+        self.composer.set_mailbox_badge(badge);
         self.request_redraw();
     }
 

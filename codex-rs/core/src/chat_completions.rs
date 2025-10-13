@@ -836,7 +836,7 @@ where
                 Poll::Ready(Some(Ok(ResponseEvent::ReasoningSummaryPartAdded))) => {
                     continue;
                 }
-                Poll::Ready(Some(Ok(ResponseEvent::Heartbeat))) => {
+                Poll::Ready(Some(Ok(ResponseEvent::Heartbeat(_)))) => {
                     continue;
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::WebSearchCallBegin { call_id }))) => {

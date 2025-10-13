@@ -1,5 +1,6 @@
 ---
 source: tui/src/bottom_pane/chat_composer.rs
+assertion_line: 1718
 expression: terminal.backend()
 ---
 "                                                                                                    "
@@ -14,3 +15,4 @@ expression: terminal.backend()
 "  @ for file paths                          ctrl + v to paste images                                "
 "  esc again to edit previous message        ctrl + c to exit                                        "
 "                                            ctrl + t to view transcript                             "
+"  ctrl + m to open mailbox                                                                          "

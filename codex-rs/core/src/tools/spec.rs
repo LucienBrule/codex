@@ -258,6 +258,46 @@ fn create_view_image_tool() -> ToolSpec {
     })
 }
 
+fn create_mailbox_send_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "message".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(true.into()),
+        },
+    );
+    properties.insert(
+        "timeout_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Seconds to wait for mailbox delivery acknowledgement (default 30).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "wait_for_delivery".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When false, return immediately after enqueueing without waiting for delivery."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "codex.mailbox.send".to_string(),
+        description: "Enqueue a mailbox message for the active Codex session.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["message".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_test_sync_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -723,6 +763,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ExecStreamHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
+    use crate::tools::handlers::MailboxSendHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
@@ -741,6 +782,7 @@ pub(crate) fn build_specs(
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
+    let mailbox_send_handler = Arc::new(MailboxSendHandler);
 
     if config.experimental_unified_exec_tool {
         builder.push_spec(create_unified_exec_tool());
@@ -775,6 +817,9 @@ pub(crate) fn build_specs(
         builder.push_spec(PLAN_TOOL.clone());
         builder.register_handler("update_plan", plan_handler);
     }
+
+    builder.push_spec(create_mailbox_send_tool());
+    builder.register_handler("codex.mailbox.send", mailbox_send_handler);
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {

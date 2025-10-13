@@ -4,12 +4,14 @@
 use std::time::Duration;
 use std::time::Instant;
 
+use codex_core::protocol::MailboxLivenessState;
 use codex_core::protocol::Op;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Stylize;
 use ratatui::text::Line;
+use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::WidgetRef;
 
@@ -25,12 +27,21 @@ pub(crate) struct StatusIndicatorWidget {
     header: String,
     /// Queued user messages to display under the status line.
     queued_messages: Vec<String>,
+    /// Latest mailbox liveness snapshot rendered alongside the status header.
+    liveness: Option<LivenessBadge>,
 
     elapsed_running: Duration,
     last_resume_at: Instant,
     is_paused: bool,
     app_event_tx: AppEventSender,
     frame_requester: FrameRequester,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct LivenessBadge {
+    pub state: MailboxLivenessState,
+    pub transport_lag: Option<Duration>,
+    pub queue_depth: Option<u32>,
 }
 
 // Format elapsed seconds into a compact human-friendly form used by the status line.
@@ -55,6 +66,7 @@ impl StatusIndicatorWidget {
         Self {
             header: String::from("Working"),
             queued_messages: Vec::new(),
+            liveness: None,
             elapsed_running: Duration::ZERO,
             last_resume_at: Instant::now(),
             is_paused: false,
@@ -112,6 +124,14 @@ impl StatusIndicatorWidget {
     pub(crate) fn set_queued_messages(&mut self, queued: Vec<String>) {
         self.queued_messages = queued;
         // Ensure a redraw so changes are visible.
+        self.frame_requester.schedule_frame();
+    }
+
+    pub(crate) fn set_liveness(&mut self, liveness: Option<LivenessBadge>) {
+        if self.liveness == liveness {
+            return;
+        }
+        self.liveness = liveness;
         self.frame_requester.schedule_frame();
     }
 
@@ -175,6 +195,20 @@ impl WidgetRef for StatusIndicatorWidget {
         spans.push(spinner(Some(self.last_resume_at)));
         spans.push(" ".into());
         spans.extend(shimmer_spans(&self.header));
+        if let Some(badge) = self.liveness.as_ref() {
+            spans.push(" ".into());
+            spans.push("[".dim());
+            spans.push(render_state_span(badge.state));
+            if let Some(lag) = badge.transport_lag {
+                spans.push(" ".into());
+                spans.push(format!("lag {}", format_transport_lag(lag)).dim());
+            }
+            if let Some(queue_depth) = badge.queue_depth {
+                spans.push(" ".into());
+                spans.push(format!("queue {queue_depth}").dim());
+            }
+            spans.push("]".dim());
+        }
         spans.extend(vec![
             " ".into(),
             format!("({pretty_elapsed} • ").dim(),
@@ -214,6 +248,22 @@ impl WidgetRef for StatusIndicatorWidget {
 
         let paragraph = Paragraph::new(lines);
         paragraph.render_ref(area, buf);
+    }
+}
+
+fn render_state_span(state: MailboxLivenessState) -> Span<'static> {
+    match state {
+        MailboxLivenessState::Active => "active".green().into(),
+        MailboxLivenessState::Idle => "idle".yellow().into(),
+        MailboxLivenessState::Stalled => "stalled".red().bold().into(),
+    }
+}
+
+fn format_transport_lag(duration: Duration) -> String {
+    if duration >= Duration::from_secs(1) {
+        format!("{:.1}s", duration.as_secs_f64())
+    } else {
+        format!("{}ms", duration.as_millis())
     }
 }
 
@@ -266,6 +316,42 @@ mod tests {
 
         // Render into a fixed-size test terminal and snapshot the backend.
         let mut terminal = Terminal::new(TestBackend::new(20, 2)).expect("terminal");
+        terminal
+            .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
+            .expect("draw");
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn renders_with_idle_liveness_badge() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
+        w.set_liveness(Some(LivenessBadge {
+            state: MailboxLivenessState::Idle,
+            transport_lag: Some(Duration::from_millis(4200)),
+            queue_depth: Some(3),
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).expect("terminal");
+        terminal
+            .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
+            .expect("draw");
+        insta::assert_snapshot!(terminal.backend());
+    }
+
+    #[test]
+    fn renders_with_stalled_liveness_badge() {
+        let (tx_raw, _rx) = unbounded_channel::<AppEvent>();
+        let tx = AppEventSender::new(tx_raw);
+        let mut w = StatusIndicatorWidget::new(tx, crate::tui::FrameRequester::test_dummy());
+        w.set_liveness(Some(LivenessBadge {
+            state: MailboxLivenessState::Stalled,
+            transport_lag: Some(Duration::from_secs(15)),
+            queue_depth: Some(0),
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 2)).expect("terminal");
         terminal
             .draw(|f| w.render_ref(f.area(), f.buffer_mut()))
             .expect("draw");

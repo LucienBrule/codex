@@ -960,13 +960,16 @@ dependencies = [
  "codex-rmcp-client",
  "codex-tui",
  "ctor 0.5.0",
+ "humantime",
  "owo-colors",
  "predicates",
  "pretty_assertions",
  "serde_json",
  "supports-color",
  "tempfile",
+ "time",
  "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1434,6 +1437,7 @@ dependencies = [
  "supports-color",
  "tempfile",
  "textwrap 0.16.2",
+ "time",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -1444,6 +1448,7 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width 0.2.1",
  "url",
+ "uuid",
  "vt100",
 ]
 
@@ -2739,6 +2744,12 @@ checksum = "6cb51c9a029ddc91b07a787f1d86b53ccfa49b0e86688c946ebe8d3555685dd7"
 dependencies = [
  "libm",
 ]
+
+[[package]]
+name = "humantime"
+version = "2.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
 
 [[package]]
 name = "hyper"

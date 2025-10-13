@@ -1,11 +1,12 @@
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::mailbox::MailboxBadgeState;
 use crate::render::line_utils::prefix_lines;
 use crate::ui_consts::FOOTER_INDENT_COLS;
 use crossterm::event::KeyCode;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Stylize;
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
@@ -18,6 +19,7 @@ pub(crate) struct FooterProps {
     pub(crate) use_shift_enter_hint: bool,
     pub(crate) is_task_running: bool,
     pub(crate) context_window_percent: Option<u8>,
+    pub(crate) mailbox_badge: Option<MailboxBadgeState>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,9 +79,13 @@ fn footer_lines(props: FooterProps) -> Vec<Line<'static>> {
     // the shortcut hint is hidden). Hide it only for the multi-line
     // ShortcutOverlay.
     match props.mode {
-        FooterMode::CtrlCReminder => vec![ctrl_c_reminder_line(CtrlCReminderState {
-            is_task_running: props.is_task_running,
-        })],
+        FooterMode::CtrlCReminder => {
+            let mut line = ctrl_c_reminder_line(CtrlCReminderState {
+                is_task_running: props.is_task_running,
+            });
+            append_mailbox_indicator(&mut line, props.mailbox_badge);
+            vec![line]
+        }
         FooterMode::ShortcutSummary => {
             let mut line = context_window_line(props.context_window_percent);
             line.push_span(" · ".dim());
@@ -87,15 +93,53 @@ fn footer_lines(props: FooterProps) -> Vec<Line<'static>> {
                 key_hint::plain(KeyCode::Char('?')).into(),
                 " for shortcuts".dim(),
             ]);
+            append_mailbox_indicator(&mut line, props.mailbox_badge);
             vec![line]
         }
         FooterMode::ShortcutOverlay => shortcut_overlay_lines(ShortcutsState {
             use_shift_enter_hint: props.use_shift_enter_hint,
             esc_backtrack_hint: props.esc_backtrack_hint,
         }),
-        FooterMode::EscHint => vec![esc_hint_line(props.esc_backtrack_hint)],
-        FooterMode::ContextOnly => vec![context_window_line(props.context_window_percent)],
+        FooterMode::EscHint => {
+            let mut line = esc_hint_line(props.esc_backtrack_hint);
+            append_mailbox_indicator(&mut line, props.mailbox_badge);
+            vec![line]
+        }
+        FooterMode::ContextOnly => {
+            let mut line = context_window_line(props.context_window_percent);
+            append_mailbox_indicator(&mut line, props.mailbox_badge);
+            vec![line]
+        }
     }
+}
+
+fn append_mailbox_indicator(line: &mut Line<'static>, badge: Option<MailboxBadgeState>) {
+    if let Some(spans) = mailbox_indicator_spans(badge) {
+        line.push_span(" · ".dim());
+        for span in spans {
+            line.push_span(span);
+        }
+    }
+}
+
+fn mailbox_indicator_spans(badge: Option<MailboxBadgeState>) -> Option<Vec<Span<'static>>> {
+    let badge = badge?;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(key_hint::ctrl(KeyCode::Char('m')).into());
+    spans.push(" mailbox ".into());
+    spans.push(Span::styled(
+        badge.pending_total.to_string(),
+        Style::default().bold(),
+    ));
+    if badge.pending_required > 0 {
+        spans.push(" (".into());
+        spans.push(Span::styled(
+            format!("{} ack", badge.pending_required),
+            Style::default().fg(Color::Red).bold(),
+        ));
+        spans.push(")".into());
+    }
+    Some(spans)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +189,7 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
     let mut edit_previous = Line::from("");
     let mut quit = Line::from("");
     let mut show_transcript = Line::from("");
+    let mut mailbox = Line::from("");
 
     for descriptor in SHORTCUTS {
         if let Some(text) = descriptor.overlay_entry(state) {
@@ -156,6 +201,7 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
                 ShortcutId::EditPrevious => edit_previous = text,
                 ShortcutId::Quit => quit = text,
                 ShortcutId::ShowTranscript => show_transcript = text,
+                ShortcutId::Mailbox => mailbox = text,
             }
         }
     }
@@ -169,6 +215,7 @@ fn shortcut_overlay_lines(state: ShortcutsState) -> Vec<Line<'static>> {
         quit,
         Line::from(""),
         show_transcript,
+        mailbox,
     ];
 
     build_columns(ordered)
@@ -235,6 +282,7 @@ enum ShortcutId {
     EditPrevious,
     Quit,
     ShowTranscript,
+    Mailbox,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -369,6 +417,15 @@ const SHORTCUTS: &[ShortcutDescriptor] = &[
         prefix: "",
         label: " to view transcript",
     },
+    ShortcutDescriptor {
+        id: ShortcutId::Mailbox,
+        bindings: &[ShortcutBinding {
+            key: key_hint::ctrl(KeyCode::Char('m')),
+            condition: DisplayCondition::Always,
+        }],
+        prefix: "",
+        label: " to open mailbox",
+    },
 ];
 
 #[cfg(test)]
@@ -400,6 +457,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                mailbox_badge: None,
             },
         );
 
@@ -411,6 +469,7 @@ mod tests {
                 use_shift_enter_hint: true,
                 is_task_running: false,
                 context_window_percent: None,
+                mailbox_badge: None,
             },
         );
 
@@ -422,6 +481,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                mailbox_badge: None,
             },
         );
 
@@ -433,6 +493,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: true,
                 context_window_percent: None,
+                mailbox_badge: None,
             },
         );
 
@@ -444,6 +505,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                mailbox_badge: None,
             },
         );
 
@@ -455,6 +517,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: false,
                 context_window_percent: None,
+                mailbox_badge: None,
             },
         );
 
@@ -466,6 +529,7 @@ mod tests {
                 use_shift_enter_hint: false,
                 is_task_running: true,
                 context_window_percent: Some(72),
+                mailbox_badge: None,
             },
         );
     }

@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use codex_core::config::Config;
 use codex_core::config_types::Notifications;
@@ -22,9 +23,13 @@ use codex_core::protocol::ExecApprovalRequestEvent;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::ExitedReviewModeEvent;
+use codex_core::protocol::HeartbeatEvent;
 use codex_core::protocol::InputItem;
 use codex_core::protocol::InputMessageKind;
 use codex_core::protocol::ListCustomPromptsResponseEvent;
+use codex_core::protocol::MailboxDeliveryEvent;
+use codex_core::protocol::MailboxDeliveryState;
+use codex_core::protocol::MailboxLivenessState;
 use codex_core::protocol::McpListToolsResponseEvent;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
@@ -43,6 +48,7 @@ use codex_core::protocol::ViewImageToolCallEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
 use codex_protocol::ConversationId;
+use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::parse_command::ParsedCommand;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -80,9 +86,13 @@ use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
+use crate::mailbox::{
+    MailboxActionKind, MailboxActionOutcome, MailboxStore, MailboxView, SharedMailboxStore,
+};
 use crate::markdown::append_markdown;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
+use crate::status_indicator_widget::LivenessBadge;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod interrupts;
@@ -264,6 +274,8 @@ pub(crate) struct ChatWidget {
     needs_final_message_separator: bool,
 
     last_rendered_width: std::cell::Cell<Option<usize>>,
+    current_liveness_badge: Option<LivenessBadge>,
+    mailbox: SharedMailboxStore,
 }
 
 struct UserMessage {
@@ -313,6 +325,63 @@ impl ChatWidget {
         }
         self.current_status_header = header.clone();
         self.bottom_pane.update_status_header(header);
+    }
+
+    fn refresh_mailbox_badge(&mut self) {
+        let badge = self.mailbox.lock().ok().and_then(|store| store.badge());
+        self.bottom_pane.set_mailbox_badge(badge);
+    }
+
+    fn on_mailbox_delivery(&mut self, event: MailboxDeliveryEvent) {
+        if let Ok(mut store) = self.mailbox.lock() {
+            store.upsert_delivery(event.clone());
+        }
+        self.refresh_mailbox_badge();
+
+        if event.state == MailboxDeliveryState::Delivered {
+            let ack_hint = format!(
+                "Press Ctrl+M, then A to acknowledge {}",
+                event.message.message_id
+            );
+            self.add_to_history(history_cell::new_mailbox_event(
+                &self.config,
+                &event,
+                ack_hint,
+            ));
+            self.notify(Notification::Mailbox {
+                subject: event.message.body.subject.clone(),
+                ack_required: event.message.ack_policy.mode == MailboxAckMode::Required,
+            });
+            self.request_redraw();
+        }
+    }
+
+    fn open_mailbox_view(&mut self) {
+        let pending = self
+            .mailbox
+            .lock()
+            .map(|store| store.pending_snapshots().len())
+            .unwrap_or(0);
+        if pending == 0 {
+            self.add_info_message("Mailbox inbox is clear.".to_string(), None);
+            return;
+        }
+        let view = MailboxView::new(self.mailbox.clone(), self.app_event_tx.clone());
+        self.bottom_pane.show_view(Box::new(view));
+        self.request_redraw();
+    }
+
+    pub(crate) fn handle_mailbox_action(&mut self, outcome: MailboxActionOutcome) {
+        match outcome.action {
+            MailboxActionKind::Acked => {
+                self.add_to_history(history_cell::new_mailbox_ack(&outcome));
+            }
+            MailboxActionKind::Dismissed => {
+                self.add_to_history(history_cell::new_mailbox_dismiss(&outcome));
+            }
+        }
+        self.refresh_mailbox_badge();
+        self.request_redraw();
     }
 
     // --- Small event handlers ---
@@ -393,11 +462,34 @@ impl ChatWidget {
         self.reasoning_buffer.clear();
     }
 
+    fn on_heartbeat(&mut self, event: HeartbeatEvent) {
+        if let Some(state) = event.liveness {
+            let badge = LivenessBadge {
+                state,
+                transport_lag: event.transport_lag_ms.map(Duration::from_millis),
+                queue_depth: event.queue_depth,
+            };
+            let should_display = state != MailboxLivenessState::Active;
+            let next_badge = if should_display {
+                Some(badge.clone())
+            } else {
+                None
+            };
+            self.current_liveness_badge = next_badge.clone();
+            self.bottom_pane.update_liveness_indicator(next_badge);
+        } else {
+            self.current_liveness_badge = None;
+            self.bottom_pane.update_liveness_indicator(None);
+        }
+    }
+
     // Raw reasoning uses the same flow as summarized reasoning
 
     fn on_task_started(&mut self) {
         self.bottom_pane.clear_ctrl_c_quit_hint();
         self.bottom_pane.set_task_running(true);
+        self.current_liveness_badge = None;
+        self.bottom_pane.update_liveness_indicator(None);
         self.retry_status_header = None;
         self.set_status_header(String::from("Working"));
         self.full_reasoning_buffer.clear();
@@ -409,6 +501,8 @@ impl ChatWidget {
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
         // Mark task stopped and request redraw now that all content is in history.
+        self.current_liveness_badge = None;
+        self.bottom_pane.update_liveness_indicator(None);
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
         self.request_redraw();
@@ -913,6 +1007,7 @@ impl ChatWidget {
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), conversation_manager);
+        let mailbox = Arc::new(Mutex::new(MailboxStore::new()));
 
         Self {
             app_event_tx: app_event_tx.clone(),
@@ -955,6 +1050,8 @@ impl ChatWidget {
             ghost_snapshots_disabled: true,
             needs_final_message_separator: false,
             last_rendered_width: std::cell::Cell::new(None),
+            current_liveness_badge: None,
+            mailbox,
         }
     }
 
@@ -978,6 +1075,7 @@ impl ChatWidget {
 
         let codex_op_tx =
             spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
+        let mailbox = Arc::new(Mutex::new(MailboxStore::new()));
 
         Self {
             app_event_tx: app_event_tx.clone(),
@@ -1020,6 +1118,8 @@ impl ChatWidget {
             ghost_snapshots_disabled: true,
             needs_final_message_separator: false,
             last_rendered_width: std::cell::Cell::new(None),
+            current_liveness_badge: None,
+            mailbox,
         }
     }
 
@@ -1051,6 +1151,15 @@ impl ChatWidget {
                 if let Ok((path, info)) = paste_image_to_temp_png() {
                     self.attach_image(path, info.width, info.height, info.encoded_format.label());
                 }
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'m') => {
+                self.open_mailbox_view();
                 return;
             }
             other if other.kind == KeyEventKind::Press => {
@@ -1142,6 +1251,9 @@ impl ChatWidget {
             }
             SlashCommand::Approvals => {
                 self.open_approvals_popup();
+            }
+            SlashCommand::Mailbox => {
+                self.open_mailbox_view();
             }
             SlashCommand::Quit => {
                 self.app_event_tx.send(AppEvent::ExitRequest);
@@ -1466,8 +1578,8 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
-            EventMsg::MailboxDelivery(_) => {}
-            EventMsg::Heartbeat(_) => {}
+            EventMsg::MailboxDelivery(event) => self.on_mailbox_delivery(event),
+            EventMsg::Heartbeat(ev) => self.on_heartbeat(ev),
         }
     }
 
@@ -2160,9 +2272,20 @@ impl WidgetRef for &ChatWidget {
 }
 
 enum Notification {
-    AgentTurnComplete { response: String },
-    ExecApprovalRequested { command: String },
-    EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
+    AgentTurnComplete {
+        response: String,
+    },
+    ExecApprovalRequested {
+        command: String,
+    },
+    EditApprovalRequested {
+        cwd: PathBuf,
+        changes: Vec<PathBuf>,
+    },
+    Mailbox {
+        subject: Option<String>,
+        ack_required: bool,
+    },
 }
 
 impl Notification {
@@ -2186,6 +2309,19 @@ impl Notification {
                     }
                 )
             }
+            Notification::Mailbox {
+                subject,
+                ack_required,
+            } => {
+                let headline = subject
+                    .clone()
+                    .unwrap_or_else(|| "New mailbox message".to_string());
+                if *ack_required {
+                    format!("Mailbox (ack required): {headline}")
+                } else {
+                    format!("Mailbox: {headline}")
+                }
+            }
         }
     }
 
@@ -2194,6 +2330,7 @@ impl Notification {
             Notification::AgentTurnComplete { .. } => "agent-turn-complete",
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. } => "approval-requested",
+            Notification::Mailbox { .. } => "mailbox",
         }
     }
 

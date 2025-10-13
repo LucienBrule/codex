@@ -7,6 +7,7 @@ use crate::exec_cell::output_lines;
 use crate::exec_cell::spinner;
 use crate::exec_command::relativize_to_home;
 use crate::exec_command::strip_bash_lc_and_escape;
+use crate::mailbox::MailboxActionOutcome;
 use crate::markdown::MarkdownCitationContext;
 use crate::markdown::append_markdown;
 use crate::render::line_utils::line_to_static;
@@ -24,10 +25,12 @@ use codex_core::config::Config;
 use codex_core::config_types::McpServerTransportConfig;
 use codex_core::config_types::ReasoningSummaryFormat;
 use codex_core::protocol::FileChange;
+use codex_core::protocol::MailboxDeliveryEvent;
 use codex_core::protocol::McpAuthStatus;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
@@ -50,6 +53,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+use textwrap::wrap;
 use tracing::error;
 use unicode_width::UnicodeWidthStr;
 
@@ -302,6 +306,34 @@ impl HistoryCell for PrefixedWrappedHistoryCell {
 
     fn desired_height(&self, width: u16) -> u16 {
         self.display_lines(width).len() as u16
+    }
+}
+
+#[derive(Debug)]
+struct MailboxHistoryCell {
+    lines: Vec<String>,
+}
+
+impl MailboxHistoryCell {
+    fn new(lines: Vec<String>) -> Self {
+        Self { lines }
+    }
+}
+
+impl HistoryCell for MailboxHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let max_width = width.max(1) as usize;
+        let mut out = Vec::new();
+        for raw in &self.lines {
+            if raw.is_empty() {
+                out.push(Line::from(""));
+                continue;
+            }
+            for wrapped in wrap(raw, max_width) {
+                out.push(Line::from(wrapped.to_string()));
+            }
+        }
+        out
     }
 }
 
@@ -1265,6 +1297,86 @@ fn format_mcp_invocation<'a>(invocation: McpInvocation) -> Line<'a> {
         ")".into(),
     ];
     invocation_spans.into()
+}
+
+pub(crate) fn new_mailbox_event(
+    _config: &Config,
+    delivery: &MailboxDeliveryEvent,
+    ack_hint: String,
+) -> impl HistoryCell {
+    let subject = delivery
+        .message
+        .body
+        .subject
+        .clone()
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let sender = delivery
+        .message
+        .sender
+        .display_name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| delivery.message.sender.id.clone());
+    let priority = format!("{:?}", delivery.message.priority).to_lowercase();
+    let mut lines: Vec<String> = Vec::new();
+    let header = if delivery.message.ack_policy.mode == MailboxAckMode::Required {
+        format!("[mailbox] {subject} (from {sender}, priority {priority}, ACK required)")
+    } else {
+        format!("[mailbox] {subject} (from {sender}, priority {priority})")
+    };
+    lines.push(header);
+    if let Some(request_id) = delivery.message.audit.request_id.clone() {
+        lines.push(format!("Request ID: {request_id}"));
+    }
+    lines.push(format!("Message ID: {}", delivery.message.message_id));
+    if let Some(observed) = delivery.observed_at {
+        lines.push(format!("Observed at: {observed}"));
+    }
+    if let Some(expires) = delivery.message.expires_at {
+        lines.push(format!("Expires at: {expires}"));
+    }
+    lines.push(String::new());
+    if delivery.message.body.content.trim().is_empty() {
+        lines.push("(empty mailbox message body)".to_string());
+    } else {
+        for row in delivery.message.body.content.lines() {
+            lines.push(row.to_string());
+        }
+    }
+    lines.push(String::new());
+    lines.push(format!("Action: {ack_hint}"));
+    MailboxHistoryCell::new(lines)
+}
+
+pub(crate) fn new_mailbox_ack(outcome: &MailboxActionOutcome) -> impl HistoryCell {
+    let subject = outcome
+        .subject
+        .clone()
+        .unwrap_or_else(|| outcome.message_id.to_string());
+    let mut line = Line::from(vec![
+        "[mailbox]".dim(),
+        " acknowledged ".into(),
+        subject.into(),
+    ]);
+    if outcome.ack_required {
+        line.push_span(" (required)".bold().fg(ratatui::style::Color::Red));
+    }
+    line.push_span(format!(" [{}]", truncate_text(&outcome.message_id.to_string(), 8)).dim());
+    PlainHistoryCell::new(vec![line])
+}
+
+pub(crate) fn new_mailbox_dismiss(outcome: &MailboxActionOutcome) -> impl HistoryCell {
+    let subject = outcome
+        .subject
+        .clone()
+        .unwrap_or_else(|| outcome.message_id.to_string());
+    let mut line = Line::from(vec![
+        "[mailbox]".dim(),
+        " dismissed ".into(),
+        subject.into(),
+    ]);
+    line.push_span(format!(" [{}]", truncate_text(&outcome.message_id.to_string(), 8)).dim());
+    PlainHistoryCell::new(vec![line])
 }
 
 #[cfg(test)]

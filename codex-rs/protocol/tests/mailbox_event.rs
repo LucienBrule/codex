@@ -1,4 +1,6 @@
-use codex_protocol::protocol::{MailboxDeliveryEvent, MailboxDeliveryState};
+use codex_protocol::protocol::{
+    MailboxDeliveryEvent, MailboxDeliveryIngress, MailboxDeliveryState,
+};
 use serde_json::Value;
 
 const ENQUEUED_FIXTURE: &str = include_str!("fixtures/mailbox_delivery_enqueued.json");
@@ -9,6 +11,8 @@ fn mailbox_delivery_event_deserializes_fixture() -> anyhow::Result<()> {
     assert!(matches!(event.state, MailboxDeliveryState::Enqueued));
     assert_eq!(event.queue_depth, Some(2));
     assert_eq!(event.message.sender.id, "orchestrator.test");
+    assert_eq!(event.correlation_id.as_deref(), Some("sub-1/mailbox"));
+    assert!(matches!(event.ingress, Some(MailboxDeliveryIngress::Cli)));
     Ok(())
 }
 

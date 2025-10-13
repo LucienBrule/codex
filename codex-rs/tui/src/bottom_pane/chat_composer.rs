@@ -48,6 +48,7 @@ use crate::bottom_pane::textarea::TextAreaState;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
 use crate::history_cell;
+use crate::mailbox::MailboxBadgeState;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 use codex_file_search::FileMatch;
 use std::cell::RefCell;
@@ -109,6 +110,7 @@ pub(crate) struct ChatComposer {
     footer_mode: FooterMode,
     footer_hint_override: Option<Vec<(String, String)>>,
     context_window_percent: Option<u8>,
+    mailbox_badge: Option<MailboxBadgeState>,
 }
 
 /// Popup state – at most one can be visible at any time.
@@ -152,6 +154,7 @@ impl ChatComposer {
             footer_mode: FooterMode::ShortcutSummary,
             footer_hint_override: None,
             context_window_percent: None,
+            mailbox_badge: None,
         };
         // Apply configuration via the setter to keep side-effects centralized.
         this.set_disable_paste_burst(disable_paste_burst);
@@ -1341,6 +1344,7 @@ impl ChatComposer {
             use_shift_enter_hint: self.use_shift_enter_hint,
             is_task_running: self.is_task_running,
             context_window_percent: self.context_window_percent,
+            mailbox_badge: self.mailbox_badge,
         }
     }
 
@@ -1484,6 +1488,13 @@ impl ChatComposer {
         } else {
             self.footer_mode = reset_mode_after_activity(self.footer_mode);
         }
+    }
+
+    pub(crate) fn set_mailbox_badge(&mut self, badge: Option<MailboxBadgeState>) {
+        if self.mailbox_badge == badge {
+            return;
+        }
+        self.mailbox_badge = badge;
     }
 }
 
