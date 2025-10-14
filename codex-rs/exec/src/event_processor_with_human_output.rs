@@ -10,6 +10,9 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::FileChange;
+use codex_core::protocol::MailboxDeliveryEvent;
+use codex_core::protocol::MailboxDeliveryIngress;
+use codex_core::protocol::MailboxDeliveryState;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
@@ -34,6 +37,7 @@ use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
 use codex_common::create_config_summary_entries;
+use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 
@@ -517,7 +521,9 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             EventMsg::AgentMessageDelta(_) => {}
             EventMsg::AgentReasoningDelta(_) => {}
             EventMsg::AgentReasoningRawContentDelta(_) => {}
-            EventMsg::MailboxDelivery(_) => {}
+            EventMsg::MailboxDelivery(delivery) => {
+                self.print_mailbox_delivery(delivery);
+            }
             EventMsg::Heartbeat(_) => {}
         }
         CodexStatus::Running
@@ -542,6 +548,126 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 print!("{message}");
             } else {
                 println!("{message}");
+            }
+        }
+    }
+}
+
+impl EventProcessorWithHumanOutput {
+    fn print_mailbox_delivery(&mut self, delivery: MailboxDeliveryEvent) {
+        let sender = delivery
+            .message
+            .sender
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| delivery.message.sender.id.clone());
+        let subject = delivery
+            .message
+            .body
+            .subject
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("(no subject)");
+        let priority = format!("{:?}", delivery.message.priority).to_lowercase();
+        let ack_mode = format!("{:?}", delivery.message.ack_policy.mode).to_lowercase();
+        let ack_required = matches!(delivery.message.ack_policy.mode, MailboxAckMode::Required);
+
+        let state_label = match delivery.state {
+            MailboxDeliveryState::Enqueued => "enqueued",
+            MailboxDeliveryState::Delivered => "delivered",
+        };
+
+        let ingress = delivery
+            .ingress
+            .map(format_mailbox_ingress)
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let queue_depth = delivery
+            .queue_depth
+            .map(|depth| depth.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let latency = delivery
+            .delivery_latency_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".to_string());
+
+        ts_msg!(
+            self,
+            "{} {}",
+            "mailbox".style(self.magenta).style(self.italic),
+            format!("{state_label} from {sender}").style(self.bold)
+        );
+
+        let priority_text = format!("priority={priority}");
+        let ingress_text = format!("ingress={ingress}");
+        let queue_text = format!("queue_depth={queue_depth}");
+        let latency_text = format!("latency={latency}");
+        let ack_text = format!("ack={ack_mode}");
+
+        let priority_fragment = priority_text.style(self.dimmed);
+        let ingress_fragment = ingress_text.style(self.dimmed);
+        let queue_fragment = queue_text.style(self.dimmed);
+        let latency_fragment = latency_text.style(self.dimmed);
+        let ack_fragment = if ack_required {
+            ack_text.style(self.red)
+        } else {
+            ack_text.style(self.dimmed)
+        };
+
+        ts_msg!(
+            self,
+            "  {} {} {} {} {}",
+            priority_fragment,
+            ack_fragment,
+            ingress_fragment,
+            queue_fragment,
+            latency_fragment,
+        );
+
+        let message_id_text = format!("message_id={}", delivery.message.message_id);
+        let message_id = message_id_text.style(self.dimmed);
+        if let Some(request_id) = delivery
+            .message
+            .audit
+            .request_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            let request_text = format!("request_id={request_id}");
+            let request_fragment = request_text.style(self.dimmed);
+            ts_msg!(self, "  {} {}", message_id, request_fragment);
+        } else {
+            ts_msg!(self, "  {}", message_id);
+        }
+
+        ts_msg!(self, "  subject: {}", subject.style(self.bold));
+
+        for line in delivery.message.body.content.lines() {
+            if line.trim().is_empty() {
+                ts_msg!(self, "");
+            } else {
+                ts_msg!(self, "    {}", line);
+            }
+        }
+
+        if ack_required {
+            if let Some(deadline) = delivery.message.ack_policy.deadline {
+                let formatted_deadline = deadline.to_string();
+                ts_msg!(
+                    self,
+                    "  ack deadline: {}",
+                    formatted_deadline.style(self.red)
+                );
+            }
+            if let Some(ticket) = delivery
+                .message
+                .ack_policy
+                .escalation_ticket
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                ts_msg!(self, "  escalation: {}", ticket.style(self.red));
             }
         }
     }
@@ -580,4 +706,8 @@ fn format_mcp_invocation(invocation: &McpInvocation) -> String {
     } else {
         format!("{fq_tool_name}({args_str})")
     }
+}
+
+fn format_mailbox_ingress(ingress: MailboxDeliveryIngress) -> String {
+    format!("{ingress:?}").to_lowercase()
 }
