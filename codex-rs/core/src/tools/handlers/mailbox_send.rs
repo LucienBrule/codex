@@ -19,6 +19,8 @@ use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 
+pub const MAILBOX_SEND_TOOL_NAME: &str = "codex_mailbox_send";
+
 pub struct MailboxSendHandler;
 
 #[derive(Debug, Deserialize)]
@@ -266,7 +268,7 @@ mod tests {
             tracker,
             sub_id: "sub-1".to_string(),
             call_id: "call-1".to_string(),
-            tool_name: "codex.mailbox.send".to_string(),
+            tool_name: MAILBOX_SEND_TOOL_NAME.to_string(),
             payload: ToolPayload::Function {
                 arguments: args.to_string(),
             },

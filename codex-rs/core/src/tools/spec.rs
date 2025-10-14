@@ -1,7 +1,7 @@
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
 use crate::model_family::ModelFamily;
-use crate::tools::handlers::PLAN_TOOL;
+use crate::tools::handlers::{MAILBOX_SEND_TOOL_NAME, PLAN_TOOL};
 use crate::tools::handlers::apply_patch::ApplyPatchToolType;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
 use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
@@ -287,7 +287,7 @@ fn create_mailbox_send_tool() -> ToolSpec {
     );
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "codex.mailbox.send".to_string(),
+        name: MAILBOX_SEND_TOOL_NAME.to_string(),
         description: "Enqueue a mailbox message for the active Codex session.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
@@ -631,8 +631,17 @@ pub(crate) fn mcp_tool_to_openai_tool(
     sanitize_json_schema(&mut serialized_input_schema);
     let input_schema = serde_json::from_value::<JsonSchema>(serialized_input_schema)?;
 
+    let sanitized_name = sanitize_tool_name(&fully_qualified_name);
+    if sanitized_name != fully_qualified_name {
+        tracing::warn!(
+            original = %fully_qualified_name,
+            sanitized = %sanitized_name,
+            "sanitizing MCP tool name"
+        );
+    }
+
     Ok(ResponsesApiTool {
-        name: fully_qualified_name,
+        name: sanitized_name,
         description: description.unwrap_or_default(),
         strict: false,
         parameters: input_schema,
@@ -750,6 +759,21 @@ fn sanitize_json_schema(value: &mut JsonValue) {
     }
 }
 
+pub(crate) fn sanitize_tool_name(name: &str) -> String {
+    name
+        .chars()
+        .map(|ch| match ch {
+            ch if ch.is_ascii_alphanumeric() => ch,
+            '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect()
+}
+
+pub(crate) fn is_valid_tool_name(name: &str) -> bool {
+    name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
 /// Builds the tool registry builder while collecting tool specs for later serialization.
 pub(crate) fn build_specs(
     config: &ToolsConfig,
@@ -763,7 +787,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ExecStreamHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
-    use crate::tools::handlers::MailboxSendHandler;
+    use crate::tools::handlers::{MailboxSendHandler, MAILBOX_SEND_TOOL_NAME};
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
@@ -819,7 +843,7 @@ pub(crate) fn build_specs(
     }
 
     builder.push_spec(create_mailbox_send_tool());
-    builder.register_handler("codex.mailbox.send", mailbox_send_handler);
+    builder.register_handler(MAILBOX_SEND_TOOL_NAME, mailbox_send_handler);
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {
@@ -886,8 +910,9 @@ pub(crate) fn build_specs(
         for (name, tool) in entries.into_iter() {
             match mcp_tool_to_openai_tool(name.clone(), tool.clone()) {
                 Ok(converted_tool) => {
+                    let sanitized_name = converted_tool.name.clone();
                     builder.push_spec(ToolSpec::Function(converted_tool));
-                    builder.register_handler(name, mcp_handler.clone());
+                    builder.register_handler(sanitized_name, mcp_handler.clone());
                 }
                 Err(e) => {
                     tracing::error!("Failed to convert {name:?} MCP tool to OpenAI tool: {e:?}");
@@ -964,7 +989,7 @@ mod tests {
 
         assert_eq_tool_names(
             &tools,
-            &["unified_exec", "update_plan", "web_search", "view_image"],
+            &["unified_exec", "update_plan", "codex_mailbox_send", "web_search", "view_image"],
         );
     }
 
@@ -984,7 +1009,7 @@ mod tests {
 
         assert_eq_tool_names(
             &tools,
-            &["unified_exec", "update_plan", "web_search", "view_image"],
+            &["unified_exec", "update_plan", "codex_mailbox_send", "web_search", "view_image"],
         );
     }
 
@@ -1058,7 +1083,7 @@ mod tests {
         let (tools, _) = build_specs(
             &config,
             Some(HashMap::from([(
-                "test_server/do_something_cool".to_string(),
+                "test_server__do_something_cool".to_string(),
                 mcp_types::Tool {
                     name: "do_something_cool".to_string(),
                     input_schema: ToolInputSchema {
@@ -1098,16 +1123,17 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "codex_mailbox_send",
                 "web_search",
                 "view_image",
-                "test_server/do_something_cool",
+                "test_server__do_something_cool",
             ],
         );
 
         assert_eq!(
-            tools[3].spec,
+            tools[4].spec,
             ToolSpec::Function(ResponsesApiTool {
-                name: "test_server/do_something_cool".to_string(),
+                name: "test_server__do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([
                         (
@@ -1164,7 +1190,7 @@ mod tests {
         // Intentionally construct a map with keys that would sort alphabetically.
         let tools_map: HashMap<String, mcp_types::Tool> = HashMap::from([
             (
-                "test_server/do".to_string(),
+                "test_server__do".to_string(),
                 mcp_types::Tool {
                     name: "a".to_string(),
                     input_schema: ToolInputSchema {
@@ -1179,7 +1205,7 @@ mod tests {
                 },
             ),
             (
-                "test_server/something".to_string(),
+                "test_server__something".to_string(),
                 mcp_types::Tool {
                     name: "b".to_string(),
                     input_schema: ToolInputSchema {
@@ -1194,7 +1220,7 @@ mod tests {
                 },
             ),
             (
-                "test_server/cool".to_string(),
+                "test_server__cool".to_string(),
                 mcp_types::Tool {
                     name: "c".to_string(),
                     input_schema: ToolInputSchema {
@@ -1216,10 +1242,11 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "codex_mailbox_send",
                 "view_image",
-                "test_server/cool",
-                "test_server/do",
-                "test_server/something",
+                "test_server__cool",
+                "test_server__do",
+                "test_server__something",
             ],
         );
     }
@@ -1266,17 +1293,18 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "codex_mailbox_send",
                 "apply_patch",
                 "web_search",
                 "view_image",
-                "dash/search",
+                "dash_search",
             ],
         );
 
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
-                name: "dash/search".to_string(),
+                name: "dash_search".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
                         "query".to_string(),
@@ -1333,16 +1361,17 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "codex_mailbox_send",
                 "apply_patch",
                 "web_search",
                 "view_image",
-                "dash/paginate",
+                "dash_paginate",
             ],
         );
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
-                name: "dash/paginate".to_string(),
+                name: "dash_paginate".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
                         "page".to_string(),
@@ -1397,16 +1426,17 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "codex_mailbox_send",
                 "apply_patch",
                 "web_search",
                 "view_image",
-                "dash/tags",
+                "dash_tags",
             ],
         );
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
-                name: "dash/tags".to_string(),
+                name: "dash_tags".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
                         "tags".to_string(),
@@ -1464,16 +1494,17 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "codex_mailbox_send",
                 "apply_patch",
                 "web_search",
                 "view_image",
-                "dash/value",
+                "dash_value",
             ],
         );
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
-                name: "dash/value".to_string(),
+                name: "dash_value".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
                         "value".to_string(),
@@ -1487,6 +1518,64 @@ mod tests {
             })
         );
     }
+
+    #[test]
+    fn test_exported_tool_names_are_regex_compliant() {
+        let model_family = find_family_for_model("o3").expect("o3 should be a valid model family");
+        let config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &model_family,
+            include_plan_tool: true,
+            include_apply_patch_tool: true,
+            include_web_search_request: true,
+            use_streamable_shell_tool: false,
+            include_view_image_tool: true,
+            experimental_unified_exec_tool: true,
+        });
+
+        let mcp_tools = HashMap::from([
+            (
+                "server.one/tool.with.dot".to_string(),
+                mcp_types::Tool {
+                    name: "tool.with.dot".to_string(),
+                    input_schema: ToolInputSchema {
+                        properties: Some(serde_json::json!({})),
+                        required: None,
+                        r#type: "object".to_string(),
+                    },
+                    output_schema: None,
+                    title: None,
+                    annotations: None,
+                    description: Some("Tool with invalid name".to_string()),
+                },
+            ),
+            (
+                "server-two__already_valid".to_string(),
+                mcp_types::Tool {
+                    name: "already_valid".to_string(),
+                    input_schema: ToolInputSchema {
+                        properties: Some(serde_json::json!({})),
+                        required: None,
+                        r#type: "object".to_string(),
+                    },
+                    output_schema: None,
+                    title: None,
+                    annotations: None,
+                    description: Some("Already valid".to_string()),
+                },
+            ),
+        ]);
+
+        let (tools, _) = build_specs(&config, Some(mcp_tools)).build();
+
+        for tool in &tools {
+            let name = tool_name(&tool.spec);
+            assert!(
+                is_valid_tool_name(name),
+                "tool name should match OpenAI regex: {name}"
+            );
+        }
+    }
+
 
     #[test]
     fn test_shell_tool() {
@@ -1519,7 +1608,7 @@ mod tests {
         let (tools, _) = build_specs(
             &config,
             Some(HashMap::from([(
-                "test_server/do_something_cool".to_string(),
+                "test_server__do_something_cool".to_string(),
                 mcp_types::Tool {
                     name: "do_something_cool".to_string(),
                     input_schema: ToolInputSchema {
@@ -1568,17 +1657,18 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "codex_mailbox_send",
                 "apply_patch",
                 "web_search",
                 "view_image",
-                "test_server/do_something_cool",
+                "test_server__do_something_cool",
             ],
         );
 
         assert_eq!(
-            tools[4].spec,
+            tools[5].spec,
             ToolSpec::Function(ResponsesApiTool {
-                name: "test_server/do_something_cool".to_string(),
+                name: "test_server__do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([
                         (

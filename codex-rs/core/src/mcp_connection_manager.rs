@@ -24,6 +24,7 @@ use mcp_types::Implementation;
 use mcp_types::Tool;
 
 use serde_json::json;
+use crate::tools::spec::{is_valid_tool_name, sanitize_tool_name};
 use sha1::Digest;
 use sha1::Sha1;
 use tokio::task::JoinSet;
@@ -66,13 +67,25 @@ fn qualify_tools(tools: Vec<ToolInfo>) -> HashMap<String, ToolInfo> {
             qualified_name = format!("{}{}", &qualified_name[..prefix_len], sha1_str);
         }
 
-        if used_names.contains(&qualified_name) {
-            warn!("skipping duplicated tool {}", qualified_name);
+        let sanitized_name = sanitize_tool_name(&qualified_name);
+        if sanitized_name != qualified_name {
+            warn!(
+                server = %tool.server_name,
+                tool = %tool.tool_name,
+                original = %qualified_name,
+                sanitized = %sanitized_name,
+                "sanitizing MCP tool name"
+            );
+        }
+        debug_assert!(is_valid_tool_name(&sanitized_name));
+
+        if used_names.contains(&sanitized_name) {
+            warn!("skipping duplicated tool {}", sanitized_name);
             continue;
         }
 
-        used_names.insert(qualified_name.clone());
-        qualified_tools.insert(qualified_name, tool);
+        used_names.insert(sanitized_name.clone());
+        qualified_tools.insert(sanitized_name, tool);
     }
 
     qualified_tools
