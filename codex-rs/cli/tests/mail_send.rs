@@ -42,7 +42,7 @@ fn write_registry(
         "namespace": namespace,
         "updated_at": "2025-10-14T00:00:00Z",
         "entries": {
-            conversation_id.to_string(): {
+            (conversation_id.to_string()): {
                 "conversation_id": conversation_id,
                 "socket_path": socket_path.to_string_lossy(),
                 "pid": 4242,
