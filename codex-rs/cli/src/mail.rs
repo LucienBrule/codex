@@ -692,6 +692,45 @@ Run `codex_ctl mailbox sweep` and retry once the worker reconnects.",
         }
     };
 
+    // If caller requested JSON and ack mode is 'none', write payload and emit minimal JSON
+    // without waiting for an acknowledgement. This prevents empty/zero-length JSON outputs
+    // when servers choose not to reply for ack-less deliveries.
+    if json && matches!(message.ack_policy.mode, MailboxAckMode::None) {
+        // Write message then return immediately with a minimal result payload
+        let mut stream = stream;
+        let mut payload = serde_json::to_vec(&message).map_err(|err| {
+            MailboxCliError::io_failure(format!("failed to serialize mailbox message: {err}"))
+        })?;
+        payload.push(b'\n');
+        use tokio::io::AsyncWriteExt;
+        stream
+            .write_all(&payload)
+            .await
+            .map_err(|err| MailboxCliError::io_failure(format!("failed to send mailbox payload: {err}")))?;
+        stream
+            .flush()
+            .await
+            .map_err(|err| MailboxCliError::io_failure(format!("failed to flush mailbox payload: {err}")))?;
+
+        let output = MailboxSendJsonOutput {
+            ok: true,
+            message_id: message.message_id,
+            request_id: message.audit.request_id.clone(),
+            conversation_id,
+            ack: Some("none".to_string()),
+            queue_depth: None,
+            correlation_id: None,
+            socket_path: socket_path.display().to_string(),
+        };
+        let serialized = serde_json::to_string_pretty(&output).map_err(|err| {
+            MailboxCliError::io_failure(format!(
+                "failed to serialize mailbox acknowledgement output: {err}"
+            ))
+        })?;
+        println!("{serialized}");
+        return Ok(());
+    }
+
     let ack = write_message_and_receive_ack(stream, &message, wait_timeout).await?;
 
     if !ack.ok {

@@ -176,6 +176,85 @@ fn mail_send_registry_success() -> Result<()> {
 }
 
 #[test]
+fn mail_send_registry_json_mode_none_minimal_output() -> Result<()> {
+    // Arrange a registry and a listener that accepts but does not send an ack line,
+    // simulating an ack-less server. With --json and ack-mode none, the CLI must
+    // still print a minimal JSON payload and exit success without waiting.
+    let codex_home = TempDir::new()?;
+    let namespace = "codex";
+    let conversation_id = Uuid::now_v7();
+    let message_id = Uuid::now_v7();
+    let mailbox_dir = registry_dir(codex_home.path(), namespace);
+    fs::create_dir_all(&mailbox_dir)?;
+    let socket_path = mailbox_dir.join(format!("{conversation_id}.sock"));
+    write_registry(codex_home.path(), namespace, conversation_id, &socket_path)?;
+
+    // Listener: accept and do nothing (no ack)
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let sp = socket_path.clone();
+    let listener = thread::spawn(move || -> Result<()> {
+        let _ = fs::remove_file(&sp);
+        let listener = UnixListener::bind(&sp)
+            .with_context(|| format!("failed to bind {}", sp.display()))?;
+        ready_tx.send(()).ok();
+        // accept one connection and intentionally do not reply
+        let _ = listener.accept();
+        Ok(())
+    });
+    ready_rx.recv().context("listener did not signal readiness")?;
+
+    // Act: send with ack-mode none and --json
+    let mut cmd = codex_command(codex_home.path())?;
+    let output = cmd
+        .args([
+            "mail",
+            "send",
+            "--sender-id",
+            "orchestrator.test",
+            "--content",
+            "noop ackless",
+            "--priority",
+            "normal",
+            "--ack-mode",
+            "none",
+            "--timeout",
+            "1s",
+            "--audit-request-id",
+            "req-test",
+            "--conversation-id",
+            &conversation_id.to_string(),
+            "--message-id",
+            &message_id.to_string(),
+            "--json",
+        ])
+        .output()
+        .context("failed to run codex mail send")?;
+
+    listener.join().expect("listener join")?;
+
+    // Assert: success and minimal JSON present
+    assert!(
+        output.status.success(),
+        "mail send exited with {:?}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout)?;
+    let payload: JsonValue = serde_json::from_str(&stdout)?;
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
+    assert_eq!(payload.get("ack").and_then(|v| v.as_str()), Some("none"));
+    assert_eq!(
+        payload.get("message_id").and_then(|v| v.as_str()),
+        Some(message_id.to_string().as_str())
+    );
+    assert_eq!(
+        payload.get("conversation_id").and_then(|v| v.as_str()),
+        Some(conversation_id.to_string().as_str())
+    );
+    Ok(())
+}
+
+#[test]
 fn mail_send_registry_missing_socket() -> Result<()> {
     let codex_home = TempDir::new()?;
     let namespace = "codex";
