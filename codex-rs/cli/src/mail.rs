@@ -221,6 +221,10 @@ pub struct SendArgs {
     #[arg(long = "conversation-id")]
     pub conversation_id: Option<Uuid>,
 
+    /// Logical contact name (resolved via contacts.toml).
+    #[arg(long = "to")]
+    pub to: Option<String>,
+
     /// Target worker identifier.
     #[arg(long = "worker-id")]
     pub worker_id: Option<String>,
@@ -438,6 +442,7 @@ async fn run_send(
         audit_created_by,
         audit_justification,
         conversation_id,
+        to,
         worker_id,
         audience_scopes,
         allow_broadcast,
@@ -452,6 +457,29 @@ async fn run_send(
         timeout,
         json,
     } = args;
+
+    // Load config early to resolve contacts if needed
+    let config =
+        load_config(cli_overrides.clone(), config_profile.clone(), cwd.clone(), codex_linux_sandbox_exe.clone()).await?;
+
+    // Resolve contact name to conversation id if provided
+    let resolved_contact_id: Option<Uuid> = if let Some(name) = &to {
+        let ns = resolve_namespace();
+        let contacts = codex_core::contacts::load_contacts(&config.codex_home, &ns)
+            .map_err(|e| anyhow!(e))?;
+        match contacts.resolve(name) {
+            Some(id) => Some(id),
+            None => {
+                let (primary, _global) = codex_core::contacts::contacts_paths(&config.codex_home, &ns);
+                return Err(anyhow::Error::new(MailboxCliError::io_failure(format!(
+                    "Contact '{name}' not found in namespace '{ns}'. Check {} or run `codex_ctl mailbox sweep` if the mapping is stale.",
+                    primary.display()
+                ))));
+            }
+        }
+    } else {
+        None
+    };
 
     let body_content = load_body(content, content_file)?;
     if body_content.trim().is_empty() {
@@ -514,13 +542,15 @@ async fn run_send(
     let tags = parse_tags(tags)?;
     let metadata = parse_metadata(metadata)?;
 
-    let audience = if conversation_id.is_some()
+    let target_conversation_id = conversation_id.or(resolved_contact_id);
+
+    let audience = if target_conversation_id.is_some()
         || worker_id.is_some()
         || !audience_scopes.is_empty()
         || allow_broadcast
     {
         Some(build_audience(
-            conversation_id,
+            target_conversation_id,
             worker_id,
             audience_scopes,
             allow_broadcast,
@@ -568,9 +598,7 @@ async fn run_send(
     apply_mailbox_defaults(&mut message);
     validate_mailbox_message(&message)?;
 
-    let config = load_config(cli_overrides, config_profile, cwd, codex_linux_sandbox_exe).await?;
-
-    if let Some(target_conversation_id) = conversation_id {
+    if let Some(target_conversation_id) = target_conversation_id {
         send_via_registry(message, target_conversation_id, &config, wait_timeout, json)
             .await
             .map_err(|err| anyhow::Error::new(err))?;

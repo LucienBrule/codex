@@ -33,6 +33,10 @@ pub struct MailboxSendHandler;
 struct MailboxSendArgs {
     #[serde(default)]
     message: MailboxMessage,
+    #[serde(default)]
+    to: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
     #[serde(default = "default_timeout_seconds")]
     timeout_seconds: u64,
     #[serde(default = "default_wait_for_delivery")]
@@ -109,11 +113,50 @@ impl ToolHandler for MailboxSendHandler {
             }
         };
 
-        let MailboxSendArgs {
-            mut message,
-            timeout_seconds,
-            wait_for_delivery,
-        } = args;
+        let MailboxSendArgs { mut message, to, conversation_id, timeout_seconds, wait_for_delivery } = args;
+
+        // Resolve explicit conversation_id (if provided) or via contacts when 'to' is set.
+        let requested_id: Option<Uuid> = if let Some(cid) = conversation_id.as_ref() {
+            match Uuid::parse_str(cid) {
+                Ok(id) => Some(id),
+                Err(_) => {
+                    return Err(FunctionCallError::RespondToModel(
+                        format!("invalid conversation_id UUID: {cid}"),
+                    ))
+                }
+            }
+        } else if let Some(name) = to.as_ref() {
+            let (home, ns) = crate::contacts::get_runtime_home_and_namespace();
+            match crate::contacts::load_contacts(&home, &ns) {
+                Ok(book) => match book.resolve(name) {
+                    Some(id) => Some(id),
+                    None => {
+                        let primary_path = format!("codex_home/{}/contacts.toml", ns);
+                        return Err(FunctionCallError::RespondToModel(format!(
+                            "Contact '{name}' not found in namespace '{ns}'. Check {primary_path} or use CLI 'codex mail send --conversation-id …'"
+                        )));
+                    }
+                },
+                Err(err) => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "failed to load contacts: {err}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+        // Phase 1 behavior: only current session supported for MCP
+        if let Some(id) = requested_id {
+            let current_uuid = uuid::Uuid::parse_str(&session.get_conversation_id().to_string())
+                .unwrap_or_else(|_| uuid::Uuid::nil());
+            if id != current_uuid {
+                return Err(FunctionCallError::RespondToModel(
+                    "cross-session mailbox send not yet supported via MCP; use CLI 'codex mail send --conversation-id …'".to_string(),
+                ));
+            }
+        }
 
         apply_mailbox_defaults(&mut message);
         validate_mailbox_message(&message)
@@ -265,6 +308,100 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    #[tokio::test]
+    async fn mailbox_send_handler_resolves_to_same_session_via_contacts() {
+        let (_guard, session, turn_context, submission_task) =
+            spawn_test_mailbox_session().await.expect("spawn session");
+
+        // Seed a temporary CODEX_HOME with contacts mapping to current session id
+        let home = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("CODEX_HOME", home.path()); }
+        let ns = "codex";
+        let nsdir = home.path().join(ns);
+        std::fs::create_dir_all(&nsdir).unwrap();
+        let mapping = format!(
+            "[contacts]\nself.session = \"{}\"\n",
+            session.get_conversation_id()
+        );
+        std::fs::write(nsdir.join("contacts.toml"), mapping).unwrap();
+
+        let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let message = serde_json::json!({
+            "sender": {"id": "system.test", "role": "system"},
+            "body": {"content": "mcp contacts test", "content_type": "text/plain"},
+            "audit": {"request_id": "REQ-ct", "justification": "test"}
+        });
+        let args = serde_json::json!({
+            "message": message,
+            "to": "self.session",
+            "timeout_seconds": 5,
+            "wait_for_delivery": true
+        });
+
+        let handler = MailboxSendHandler;
+        let invocation = ToolInvocation {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn_context),
+            tracker,
+            sub_id: "sub-contacts".to_string(),
+            call_id: "call-contacts".to_string(),
+            tool_name: MAILBOX_SEND_TOOL_NAME.to_string(),
+            payload: ToolPayload::Function { arguments: args.to_string() },
+        };
+
+        let output = handler.handle(invocation).await.expect("tool success");
+        let ToolOutput::Function { content, .. } = output else { panic!("expected function output") };
+        let parsed: MailboxSendJsonOutputNormalized = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.ok, true);
+        assert_eq!(parsed.ack.as_deref(), Some("delivered"));
+        submission_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mailbox_send_handler_cross_session_rejected() {
+        let (_guard, session, turn_context, _submission_task) =
+            spawn_test_mailbox_session().await.expect("spawn session");
+        let home = tempfile::TempDir::new().unwrap();
+        unsafe { std::env::set_var("CODEX_HOME", home.path()); }
+        let ns = "codex";
+        let nsdir = home.path().join(ns);
+        std::fs::create_dir_all(&nsdir).unwrap();
+        let other_id = uuid::Uuid::now_v7();
+        let mapping = format!("[contacts]\nother.session = \"{other_id}\"\n");
+        std::fs::write(nsdir.join("contacts.toml"), mapping).unwrap();
+
+        let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let message = serde_json::json!({
+            "sender": {"id": "system.test", "role": "system"},
+            "body": {"content": "mcp cross test", "content_type": "text/plain"},
+            "audit": {"request_id": "REQ-x", "justification": "test"}
+        });
+        let args = serde_json::json!({
+            "message": message,
+            "to": "other.session",
+            "timeout_seconds": 2,
+            "wait_for_delivery": false
+        });
+
+        let handler = MailboxSendHandler;
+        let invocation = ToolInvocation {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn_context),
+            tracker,
+            sub_id: "sub-x".to_string(),
+            call_id: "call-x".to_string(),
+            tool_name: MAILBOX_SEND_TOOL_NAME.to_string(),
+            payload: ToolPayload::Function { arguments: args.to_string() },
+        };
+
+        let err = handler.handle(invocation).await.unwrap_err();
+        match err {
+            FunctionCallError::RespondToModel(msg) => {
+                assert!(msg.contains("cross-session mailbox send not yet supported"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
     #[tokio::test]
     async fn mailbox_send_handler_enqueues_and_waits_for_delivery() {
         let (_guard, session, turn_context, submission_task) =

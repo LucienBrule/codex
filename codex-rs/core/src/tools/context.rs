@@ -63,7 +63,7 @@ impl ToolPayload {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum ToolOutput {
     Function {
         content: String,

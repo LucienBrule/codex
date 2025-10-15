@@ -271,6 +271,24 @@ fn create_mailbox_send_tool() -> ToolSpec {
         },
     );
     properties.insert(
+        "to".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Logical contact name to target (resolved via codex_home/<ns>/contacts.toml)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "conversation_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Target conversation UUID. If provided, takes precedence over 'to'."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
         "timeout_seconds".to_string(),
         JsonSchema::Number {
             description: Some(
