@@ -577,6 +577,10 @@ impl Session {
         Ok((sess, turn_context))
     }
 
+    pub(crate) fn get_conversation_id(&self) -> ConversationId {
+        self.conversation_id
+    }
+
     pub(crate) fn get_tx_event(&self) -> Sender<Event> {
         self.tx_event.clone()
     }

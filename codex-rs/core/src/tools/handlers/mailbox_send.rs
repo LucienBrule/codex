@@ -22,7 +22,10 @@ use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 
-pub const MAILBOX_SEND_TOOL_NAME: &str = "codex_mailbox_send";
+// Primary, provider-safe MCP tool name (underscore only)
+pub const MAILBOX_SEND_TOOL_NAME: &str = "mailbox_send";
+// Back-compat alias retained for older prompts/tests
+pub const MAILBOX_SEND_TOOL_ALIAS: &str = "codex_mailbox_send";
 
 pub struct MailboxSendHandler;
 
@@ -45,14 +48,21 @@ fn default_wait_for_delivery() -> bool {
 }
 
 #[derive(Serialize, Deserialize)]
-struct MailboxSendResult {
-    submission_id: String,
+struct MailboxSendJsonOutputNormalized {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
     message_id: Uuid,
     request_id: Option<String>,
-    priority: String,
-    enqueued: MailboxEventSnapshot,
+    conversation_id: codex_protocol::ConversationId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    delivered: Option<MailboxEventSnapshot>,
+    ack: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    queue_depth: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    correlation_id: Option<String>,
+    // For parity with CLI JSON; not meaningful for MCP tools but kept for consistency
+    socket_path: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -143,13 +153,32 @@ impl ToolHandler for MailboxSendHandler {
             None
         };
 
-        let output = MailboxSendResult {
-            submission_id,
+        // Normalize to CLI-aligned JSON output
+        let (ack, queue_depth, correlation_id) = if let Some(delivery) = &delivered_event {
+            (
+                Some("delivered".to_string()),
+                delivery.queue_depth.map(|q| q as u64),
+                delivery.correlation_id.clone(),
+            )
+        } else {
+            (
+                Some("enqueued".to_string()),
+                enqueued_event.queue_depth.map(|q| q as u64),
+                enqueued_event.correlation_id.clone(),
+            )
+        };
+
+        let output = MailboxSendJsonOutputNormalized {
+            ok: true,
+            mode: Some(if wait_for_delivery { "wait" } else { "enqueue_only" }.to_string()),
             message_id: message.message_id,
             request_id: message.audit.request_id.clone(),
-            priority: format!("{:?}", message.priority).to_lowercase(),
-            enqueued: MailboxEventSnapshot::from(&enqueued_event),
-            delivered: delivered_event.as_ref().map(MailboxEventSnapshot::from),
+            conversation_id: session.get_conversation_id(),
+            ack,
+            queue_depth,
+            correlation_id,
+            // MCP tools do not use a socket path; return empty for parity.
+            socket_path: String::new(),
         };
 
         let content = serde_json::to_string_pretty(&output).map_err(|err| {
@@ -288,9 +317,10 @@ mod tests {
             panic!("expected function output");
         };
 
-        let parsed: MailboxSendResult = serde_json::from_str(&content).expect("parse result");
-        assert_eq!(parsed.priority, "high");
-        assert!(parsed.delivered.is_some());
+        let parsed: MailboxSendJsonOutputNormalized =
+            serde_json::from_str(&content).expect("parse result");
+        assert_eq!(parsed.ok, true);
+        assert_eq!(parsed.ack.as_deref(), Some("delivered"));
 
         submission_task.abort();
     }

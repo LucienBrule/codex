@@ -2,6 +2,7 @@ use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
 use crate::model_family::ModelFamily;
 use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
+use crate::tools::handlers::MAILBOX_READ_TOOL_NAME;
 use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::apply_patch::ApplyPatchToolType;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
@@ -294,6 +295,109 @@ fn create_mailbox_send_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["message".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_mailbox_send_alias_tool() -> ToolSpec {
+    // Legacy alias with identical schema under the old name
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "message".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(true.into()),
+        },
+    );
+    properties.insert(
+        "timeout_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Seconds to wait for mailbox delivery acknowledgement (default 30).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "wait_for_delivery".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When false, return immediately after enqueueing without waiting for delivery."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "codex_mailbox_send".to_string(),
+        description: "Enqueue a mailbox message (legacy alias).".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["message".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_mailbox_read_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "max".to_string(),
+        JsonSchema::Number {
+            description: Some("Maximum messages to return (default 50).".to_string()),
+        },
+    );
+    properties.insert(
+        "ack".to_string(),
+        JsonSchema::Boolean {
+            description: Some("When true, mark returned messages as read/acked.".to_string()),
+        },
+    );
+
+    let mut filter_props = BTreeMap::new();
+    filter_props.insert(
+        "from".to_string(),
+        JsonSchema::String {
+            description: Some("Filter by sender.id".to_string()),
+        },
+    );
+    filter_props.insert(
+        "subject_contains".to_string(),
+        JsonSchema::String {
+            description: Some("Substring match on subject".to_string()),
+        },
+    );
+    filter_props.insert(
+        "since".to_string(),
+        JsonSchema::String {
+            description: Some("RFC3339 timestamp".to_string()),
+        },
+    );
+    filter_props.insert(
+        "conversation_id".to_string(),
+        JsonSchema::String {
+            description: Some("Conversation ID override (UUID)".to_string()),
+        },
+    );
+
+    properties.insert(
+        "filter".to_string(),
+        JsonSchema::Object {
+            properties: filter_props,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: MAILBOX_READ_TOOL_NAME.to_string(),
+        description: "List unread mailbox messages and optionally acknowledge them.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
             additional_properties: Some(false.into()),
         },
     })
@@ -809,6 +913,7 @@ pub(crate) fn build_specs(
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mailbox_send_handler = Arc::new(MailboxSendHandler);
+    let mailbox_read_handler = Arc::new(crate::tools::handlers::MailboxReadHandler);
 
     if config.experimental_unified_exec_tool {
         builder.push_spec(create_unified_exec_tool());
@@ -845,7 +950,14 @@ pub(crate) fn build_specs(
     }
 
     builder.push_spec(create_mailbox_send_tool());
-    builder.register_handler(MAILBOX_SEND_TOOL_NAME, mailbox_send_handler);
+    // Back-compat alias for legacy prompts/tests
+    builder.push_spec(create_mailbox_send_alias_tool());
+    builder.register_handler(MAILBOX_SEND_TOOL_NAME, mailbox_send_handler.clone());
+    builder.register_handler("codex_mailbox_send", mailbox_send_handler);
+
+    // New mailbox_read tool
+    builder.push_spec(create_mailbox_read_tool());
+    builder.register_handler(MAILBOX_READ_TOOL_NAME, mailbox_read_handler);
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {
@@ -994,7 +1106,9 @@ mod tests {
             &[
                 "unified_exec",
                 "update_plan",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "web_search",
                 "view_image",
             ],
@@ -1020,7 +1134,9 @@ mod tests {
             &[
                 "unified_exec",
                 "update_plan",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "web_search",
                 "view_image",
             ],
@@ -1137,7 +1253,9 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "web_search",
                 "view_image",
                 "test_server__do_something_cool",
@@ -1145,7 +1263,7 @@ mod tests {
         );
 
         assert_eq!(
-            tools[4].spec,
+            tools[6].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "test_server__do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
@@ -1256,7 +1374,9 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "view_image",
                 "test_server__cool",
                 "test_server__do",
@@ -1307,7 +1427,9 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1316,7 +1438,7 @@ mod tests {
         );
 
         assert_eq!(
-            tools[5].spec,
+            tools[7].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "dash_search".to_string(),
                 parameters: JsonSchema::Object {
@@ -1375,7 +1497,9 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1383,7 +1507,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            tools[5].spec,
+            tools[7].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "dash_paginate".to_string(),
                 parameters: JsonSchema::Object {
@@ -1440,7 +1564,9 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1448,7 +1574,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            tools[5].spec,
+            tools[7].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "dash_tags".to_string(),
                 parameters: JsonSchema::Object {
@@ -1508,7 +1634,9 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1516,7 +1644,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            tools[5].spec,
+            tools[7].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "dash_value".to_string(),
                 parameters: JsonSchema::Object {
@@ -1670,7 +1798,9 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_read",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1679,7 +1809,7 @@ mod tests {
         );
 
         assert_eq!(
-            tools[5].spec,
+            tools[7].spec,
             ToolSpec::Function(ResponsesApiTool {
                 name: "test_server__do_something_cool".to_string(),
                 parameters: JsonSchema::Object {

@@ -184,7 +184,9 @@ pub struct SendArgs {
     pub expires_in: Option<String>,
 
     /// Configure acknowledgement behaviour.
-    #[arg(long = "ack-mode", value_enum, default_value_t = AckModeCli::None)]
+    /// Default is `passive` to preserve prior behaviour of waiting
+    /// for a single delivery acknowledgement line from the mailbox.
+    #[arg(long = "ack-mode", value_enum, default_value_t = AckModeCli::Passive)]
     pub ack_mode: AckModeCli,
 
     /// Deadline for required acknowledgements (RFC3339).
@@ -699,21 +701,28 @@ Run `codex_ctl mailbox sweep` and retry once the worker reconnects.",
     // without waiting for an acknowledgement. This prevents empty/zero-length JSON outputs
     // when servers choose not to reply for ack-less deliveries.
     if json && matches!(message.ack_policy.mode, MailboxAckMode::None) {
-        // Write message then return immediately with a minimal result payload
+        // Write message then return immediately with a minimal result payload.
+        // If the listener closes immediately (EPIPE/ConnectionReset), treat it as
+        // success for ack-less mode to support fire-and-forget receivers.
         let mut stream = stream;
         let mut payload = serde_json::to_vec(&message).map_err(|err| {
             MailboxCliError::io_failure(format!("failed to serialize mailbox message: {err}"))
         })?;
         payload.push(b'\n');
         use tokio::io::AsyncWriteExt;
-        stream
-            .write_all(&payload)
-            .await
-            .map_err(|err| MailboxCliError::io_failure(format!("failed to send mailbox payload: {err}")))?;
-        stream
-            .flush()
-            .await
-            .map_err(|err| MailboxCliError::io_failure(format!("failed to flush mailbox payload: {err}")))?;
+        if let Err(err) = stream.write_all(&payload).await {
+            if err.kind() != io::ErrorKind::BrokenPipe && err.kind() != io::ErrorKind::ConnectionReset {
+                return Err(MailboxCliError::io_failure(format!(
+                    "failed to send mailbox payload: {err}"
+                )));
+            }
+        } else if let Err(err) = stream.flush().await {
+            if err.kind() != io::ErrorKind::BrokenPipe && err.kind() != io::ErrorKind::ConnectionReset {
+                return Err(MailboxCliError::io_failure(format!(
+                    "failed to flush mailbox payload: {err}"
+                )));
+            }
+        }
 
         let output = MailboxSendJsonOutput {
             ok: true,
