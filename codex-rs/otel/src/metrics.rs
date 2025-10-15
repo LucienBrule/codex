@@ -4,7 +4,10 @@ mod imp {
     use opentelemetry::global;
     use opentelemetry::metrics::Counter;
     use opentelemetry::metrics::Histogram;
+    use opentelemetry::metrics::UpDownCounter;
     use std::sync::OnceLock;
+    use std::sync::Mutex;
+    use std::collections::HashMap;
 
     const METER_NAME: &str = "codex.keepalive";
     const MAILBOX_METER_NAME: &str = "codex.mailbox";
@@ -57,6 +60,10 @@ mod imp {
         delivery_latency: Histogram<u64>,
         ack_total: Counter<u64>,
         expiry_total: Counter<u64>,
+        // New OTEL instruments per TASK: accept_total, errors_total, queue depth gauge
+        accept_total: Counter<u64>,
+        errors_total: Counter<u64>,
+        queue_depth_gauge: UpDownCounter<i64>,
     }
 
     impl MailboxMetrics {
@@ -82,11 +89,29 @@ mod imp {
                 .u64_counter("codex_mailbox_expiry_total")
                 .with_description("Count of mailbox envelopes configured with expiry timestamps.")
                 .build();
+            // New: total accepted envelopes per namespace
+            let accept_total = meter
+                .u64_counter("codex_mailbox_accept_total")
+                .with_description("Count of accepted mailbox envelopes.")
+                .build();
+            // New: total errors per namespace/kind
+            let errors_total = meter
+                .u64_counter("codex_mailbox_errors_total")
+                .with_description("Count of mailbox errors, labeled by kind.")
+                .build();
+            // New: queue depth gauge (implemented as up/down counter with deltas)
+            let queue_depth_gauge = meter
+                .i64_up_down_counter("codex_mailbox_queue_depth_gauge")
+                .with_description("Current mailbox queue depth, per namespace (up/down counter-based gauge).")
+                .build();
             Self {
                 queue_depth,
                 delivery_latency,
                 ack_total,
                 expiry_total,
+                accept_total,
+                errors_total,
+                queue_depth_gauge,
             }
         }
     }
@@ -106,6 +131,17 @@ mod imp {
             KeyValue::new("priority", priority.to_string()),
             KeyValue::new("ack_mode", ack_mode.to_string()),
             KeyValue::new("sender_role", sender_role.to_string()),
+        ]
+    }
+
+    fn ns_attr(namespace: &str) -> [KeyValue; 1] {
+        [KeyValue::new("namespace", namespace.to_string())]
+    }
+
+    fn ns_err_attrs(namespace: &str, error_kind: &str) -> [KeyValue; 2] {
+        [
+            KeyValue::new("namespace", namespace.to_string()),
+            KeyValue::new("error_kind", error_kind.to_string()),
         ]
     }
 
@@ -176,6 +212,36 @@ mod imp {
         let attrs = mailbox_attrs(ingress, priority, ack_mode, sender_role);
         mailbox_metrics().expiry_total.add(1, &attrs);
     }
+
+    // New entry points
+    pub fn record_mailbox_accept_total(namespace: &str) {
+        let attrs = ns_attr(namespace);
+        mailbox_metrics().accept_total.add(1, &attrs);
+    }
+
+    pub fn record_mailbox_error_total(namespace: &str, error_kind: &str) {
+        let attrs = ns_err_attrs(namespace, error_kind);
+        mailbox_metrics().errors_total.add(1, &attrs);
+    }
+
+    // Maintain last-seen queue depth per namespace to drive an up/down counter as a gauge.
+    static QUEUE_DEPTH_STATE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+    fn queue_depth_state() -> &'static Mutex<HashMap<String, i64>> {
+        QUEUE_DEPTH_STATE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub fn update_mailbox_queue_depth_gauge(namespace: &str, current_depth: u64) {
+        let current = current_depth as i64;
+        let mut map = queue_depth_state().lock().unwrap();
+        let prev = map.get(namespace).copied().unwrap_or(0);
+        let delta = current - prev;
+        if delta != 0 {
+            let attrs = ns_attr(namespace);
+            mailbox_metrics().queue_depth_gauge.add(delta, &attrs);
+            map.insert(namespace.to_string(), current);
+        }
+    }
 }
 
 #[cfg(not(feature = "otel"))]
@@ -200,6 +266,15 @@ mod imp {
 
     #[inline]
     pub fn record_mailbox_expiry_total(_: &str, _: &str, _: &str, _: &str) {}
+
+    #[inline]
+    pub fn record_mailbox_accept_total(_: &str) {}
+
+    #[inline]
+    pub fn record_mailbox_error_total(_: &str, _: &str) {}
+
+    #[inline]
+    pub fn update_mailbox_queue_depth_gauge(_: &str, _: u64) {}
 }
 
 pub use imp::record_heartbeat;
@@ -208,4 +283,7 @@ pub use imp::record_mailbox_ack_total;
 pub use imp::record_mailbox_delivery_latency;
 pub use imp::record_mailbox_expiry_total;
 pub use imp::record_mailbox_queue_depth;
+pub use imp::record_mailbox_accept_total;
+pub use imp::record_mailbox_error_total;
+pub use imp::update_mailbox_queue_depth_gauge;
 pub use imp::record_reconnect;

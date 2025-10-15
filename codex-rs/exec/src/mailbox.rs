@@ -362,7 +362,18 @@ async fn process_envelope(
         Ok(Ok(MailboxEventOutcome::Enqueued {
             submission_id,
             delivery,
-        })) => MailboxOutcome::Enqueued(submission_id, delivery),
+        })) => {
+            // Record accept and queue depth gauge per namespace
+            #[cfg(feature = "otel")]
+            {
+                let ns = mailbox_namespace();
+                codex_otel::metrics::record_mailbox_accept_total(&ns);
+                if let Some(depth) = delivery.queue_depth {
+                    codex_otel::metrics::update_mailbox_queue_depth_gauge(&ns, depth as u64);
+                }
+            }
+            MailboxOutcome::Enqueued(submission_id, delivery)
+        },
         Ok(Ok(MailboxEventOutcome::QueueFull(capacity))) => MailboxOutcome::QueueFull(capacity),
         Ok(Ok(MailboxEventOutcome::Disabled)) => MailboxOutcome::Disabled,
         Ok(Ok(MailboxEventOutcome::DispatcherClosed)) => MailboxOutcome::DispatcherClosed,
@@ -440,69 +451,118 @@ impl AckResponse {
                     capacity: None,
                 }
             }
-            MailboxOutcome::QueueFull(capacity) => AckResponse {
-                ok: false,
-                submission_id: None,
-                message_id: None,
-                queue_depth: None,
-                err: Some("queue_full".to_string()),
-                detail: Some("Mailbox queue is full".to_string()),
-                capacity,
-            },
-            MailboxOutcome::Disabled => AckResponse {
-                ok: false,
-                submission_id: None,
-                message_id: None,
-                queue_depth: None,
-                err: Some("disabled".to_string()),
-                detail: Some("Mailbox dispatcher disabled".to_string()),
-                capacity: None,
-            },
-            MailboxOutcome::DispatcherClosed => AckResponse {
-                ok: false,
-                submission_id: None,
-                message_id: None,
-                queue_depth: None,
-                err: Some("closed".to_string()),
-                detail: Some("Mailbox dispatcher unavailable".to_string()),
-                capacity: None,
-            },
-            MailboxOutcome::RuntimeError(msg) => AckResponse {
-                ok: false,
-                submission_id: None,
-                message_id: None,
-                queue_depth: None,
-                err: Some("error".to_string()),
-                detail: Some(msg),
-                capacity: None,
-            },
-            MailboxOutcome::Invalid(err) => AckResponse {
-                ok: false,
-                submission_id: None,
-                message_id: None,
-                queue_depth: None,
-                err: Some("invalid_message".to_string()),
-                detail: Some(err.to_string()),
-                capacity: None,
-            },
-            MailboxOutcome::SubmitFailed(msg) => AckResponse {
-                ok: false,
-                submission_id: None,
-                message_id: None,
-                queue_depth: None,
-                err: Some("submit_failed".to_string()),
-                detail: Some(msg),
-                capacity: None,
-            },
-            MailboxOutcome::Timeout => AckResponse {
-                ok: false,
-                submission_id: None,
-                message_id: None,
-                queue_depth: None,
-                err: Some("timeout".to_string()),
-                detail: Some("Timed out waiting for mailbox acknowledgement".to_string()),
-                capacity: None,
-            },
+            MailboxOutcome::QueueFull(capacity) => {
+                #[cfg(feature = "otel")]
+                {
+                    let ns = mailbox_namespace();
+                    codex_otel::metrics::record_mailbox_error_total(&ns, "enqueue_full");
+                }
+                AckResponse {
+                    ok: false,
+                    submission_id: None,
+                    message_id: None,
+                    queue_depth: None,
+                    err: Some("queue_full".to_string()),
+                    detail: Some("Mailbox queue is full".to_string()),
+                    capacity,
+                }
+            }
+            MailboxOutcome::Disabled => {
+                #[cfg(feature = "otel")]
+                {
+                    let ns = mailbox_namespace();
+                    codex_otel::metrics::record_mailbox_error_total(&ns, "disabled");
+                }
+                AckResponse {
+                    ok: false,
+                    submission_id: None,
+                    message_id: None,
+                    queue_depth: None,
+                    err: Some("disabled".to_string()),
+                    detail: Some("Mailbox dispatcher disabled".to_string()),
+                    capacity: None,
+                }
+            }
+            MailboxOutcome::DispatcherClosed => {
+                #[cfg(feature = "otel")]
+                {
+                    let ns = mailbox_namespace();
+                    codex_otel::metrics::record_mailbox_error_total(&ns, "dispatcher_closed");
+                }
+                AckResponse {
+                    ok: false,
+                    submission_id: None,
+                    message_id: None,
+                    queue_depth: None,
+                    err: Some("closed".to_string()),
+                    detail: Some("Mailbox dispatcher unavailable".to_string()),
+                    capacity: None,
+                }
+            }
+            MailboxOutcome::RuntimeError(msg) => {
+                #[cfg(feature = "otel")]
+                {
+                    let ns = mailbox_namespace();
+                    codex_otel::metrics::record_mailbox_error_total(&ns, "runtime_error");
+                }
+                AckResponse {
+                    ok: false,
+                    submission_id: None,
+                    message_id: None,
+                    queue_depth: None,
+                    err: Some("error".to_string()),
+                    detail: Some(msg),
+                    capacity: None,
+                }
+            }
+            MailboxOutcome::Invalid(err) => {
+                #[cfg(feature = "otel")]
+                {
+                    let ns = mailbox_namespace();
+                    codex_otel::metrics::record_mailbox_error_total(&ns, "invalid_message");
+                }
+                AckResponse {
+                    ok: false,
+                    submission_id: None,
+                    message_id: None,
+                    queue_depth: None,
+                    err: Some("invalid_message".to_string()),
+                    detail: Some(err.to_string()),
+                    capacity: None,
+                }
+            }
+            MailboxOutcome::SubmitFailed(msg) => {
+                #[cfg(feature = "otel")]
+                {
+                    let ns = mailbox_namespace();
+                    codex_otel::metrics::record_mailbox_error_total(&ns, "submit_failed");
+                }
+                AckResponse {
+                    ok: false,
+                    submission_id: None,
+                    message_id: None,
+                    queue_depth: None,
+                    err: Some("submit_failed".to_string()),
+                    detail: Some(msg),
+                    capacity: None,
+                }
+            }
+            MailboxOutcome::Timeout => {
+                #[cfg(feature = "otel")]
+                {
+                    let ns = mailbox_namespace();
+                    codex_otel::metrics::record_mailbox_error_total(&ns, "ack_timeout");
+                }
+                AckResponse {
+                    ok: false,
+                    submission_id: None,
+                    message_id: None,
+                    queue_depth: None,
+                    err: Some("timeout".to_string()),
+                    detail: Some("Timed out waiting for mailbox acknowledgement".to_string()),
+                    capacity: None,
+                }
+            }
         }
     }
 }

@@ -873,6 +873,11 @@ async fn write_message_and_receive_ack(
     let bytes_read = timeout(wait_timeout, reader.read_line(&mut ack_line))
         .await
         .map_err(|_| {
+            #[cfg(feature = "otel")]
+            {
+                let ns = resolve_namespace();
+                codex_otel::metrics::record_mailbox_error_total(&ns, "ack_timeout");
+            }
             MailboxCliError::io_failure("timed out waiting for mailbox acknowledgement".to_string())
         })?
         .map_err(|err| {
@@ -1064,11 +1069,21 @@ async fn await_delivery_events(
     loop {
         let now = Instant::now();
         if now >= deadline {
+            #[cfg(feature = "otel")]
+            {
+                let ns = resolve_namespace();
+                codex_otel::metrics::record_mailbox_error_total(&ns, "ack_timeout");
+            }
             bail!("timed out waiting for mailbox delivery acknowledgement");
         }
 
         let remaining = deadline.saturating_duration_since(now);
         if remaining.is_zero() {
+            #[cfg(feature = "otel")]
+            {
+                let ns = resolve_namespace();
+                codex_otel::metrics::record_mailbox_error_total(&ns, "ack_timeout");
+            }
             bail!("timed out waiting for mailbox delivery acknowledgement");
         }
 
