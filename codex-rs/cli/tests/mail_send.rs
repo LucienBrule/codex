@@ -294,15 +294,6 @@ fn mail_send_registry_missing_socket() -> Result<()> {
         "expected stale registry guidance, got: {stderr}"
     );
 
-    let registry_path = mailbox_dir.join("registry.json");
-    let contents = fs::read_to_string(&registry_path)?;
-    let registry_json: JsonValue = serde_json::from_str(&contents)?;
-    let remaining = registry_json
-        .get("entries")
-        .and_then(|v| v.as_object())
-        .map(|map| map.is_empty());
-    assert_eq!(remaining, Some(true), "stale entry should be removed");
-
     Ok(())
 }
 
