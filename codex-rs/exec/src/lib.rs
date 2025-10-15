@@ -9,6 +9,7 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
+mod mailbox;
 
 pub use cli::Cli;
 use codex_core::AuthManager;
@@ -29,6 +30,7 @@ use codex_ollama::DEFAULT_OSS_MODEL;
 use codex_protocol::config_types::SandboxMode;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
+pub use mailbox::MailboxServer;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use serde_json::Value;
 use std::io::IsTerminal;
@@ -249,7 +251,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
     let NewConversation {
-        conversation_id: _,
+        conversation_id,
         conversation,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command {
@@ -269,6 +271,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             .new_conversation(config.clone())
             .await?
     };
+    let mut mailbox_server =
+        MailboxServer::start_if_enabled(&config, conversation.clone(), conversation_id).await?;
+
     // Print the effective configuration and prompt so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt, &session_configured);
@@ -357,7 +362,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
     while let Some(event) = rx.recv().await {
-        if matches!(event.msg, EventMsg::Error(_)) {
+        if let Some(server) = mailbox_server.as_ref() {
+            server.handle_event(&event).await;
+        }
+        if matches!(&event.msg, EventMsg::Error(_)) {
             error_seen = true;
         }
         let shutdown: CodexStatus = event_processor.process_event(event);
@@ -372,6 +380,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
     }
     event_processor.print_final_output();
+
+    if let Some(server) = mailbox_server.take() {
+        server.shutdown().await?;
+    }
+
     if error_seen {
         std::process::exit(1);
     }

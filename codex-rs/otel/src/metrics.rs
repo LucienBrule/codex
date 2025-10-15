@@ -1,8 +1,9 @@
 #[cfg(feature = "otel")]
 mod imp {
-    use opentelemetry::global;
-    use opentelemetry::metrics::{Counter, Histogram};
     use opentelemetry::KeyValue;
+    use opentelemetry::global;
+    use opentelemetry::metrics::Counter;
+    use opentelemetry::metrics::Histogram;
     use std::sync::OnceLock;
 
     const METER_NAME: &str = "codex.keepalive";
@@ -63,7 +64,9 @@ mod imp {
             let meter = global::meter(MAILBOX_METER_NAME);
             let queue_depth = meter
                 .u64_histogram("codex_mailbox_queue_depth")
-                .with_description("Observed mailbox queue depth during enqueue and delivery events.")
+                .with_description(
+                    "Observed mailbox queue depth during enqueue and delivery events.",
+                )
                 .build();
             let delivery_latency = meter
                 .u64_histogram("codex_mailbox_delivery_latency_ms")
@@ -149,7 +152,9 @@ mod imp {
         sender_role: &str,
     ) {
         let attrs = mailbox_attrs(ingress, priority, ack_mode, sender_role);
-        mailbox_metrics().delivery_latency.record(latency_ms, &attrs);
+        mailbox_metrics()
+            .delivery_latency
+            .record(latency_ms, &attrs);
     }
 
     pub fn record_mailbox_ack_total(
@@ -197,8 +202,10 @@ mod imp {
     pub fn record_mailbox_expiry_total(_: &str, _: &str, _: &str, _: &str) {}
 }
 
-pub use imp::{
-    record_heartbeat, record_idle_timeout, record_mailbox_ack_total,
-    record_mailbox_delivery_latency, record_mailbox_expiry_total, record_mailbox_queue_depth,
-    record_reconnect,
-};
+pub use imp::record_heartbeat;
+pub use imp::record_idle_timeout;
+pub use imp::record_mailbox_ack_total;
+pub use imp::record_mailbox_delivery_latency;
+pub use imp::record_mailbox_expiry_total;
+pub use imp::record_mailbox_queue_depth;
+pub use imp::record_reconnect;

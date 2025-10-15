@@ -1,4 +1,5 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
@@ -7,17 +8,31 @@ use crate::bottom_pane::CancellationEvent;
 use crate::key_hint;
 use crate::render::renderable::Renderable;
 use crate::text_formatting::truncate_text;
-use crossterm::event::{KeyCode, KeyEvent};
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style, Stylize};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Widget, Wrap};
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use ratatui::layout::Constraint;
+use ratatui::layout::Layout;
+use ratatui::layout::Rect;
+use ratatui::style::Color;
+use ratatui::style::Modifier;
+use ratatui::style::Style;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::text::Span;
+use ratatui::widgets::Block;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Widget;
+use ratatui::widgets::Wrap;
 use textwrap::wrap;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use codex_core::protocol::{MailboxDeliveryEvent, MailboxDeliveryState};
-use codex_protocol::mailbox::{MailboxAckMode, MailboxMessage, MailboxPriority, MailboxSenderRole};
+use codex_core::protocol::MailboxDeliveryEvent;
+use codex_core::protocol::MailboxDeliveryState;
+use codex_protocol::mailbox::MailboxAckMode;
+use codex_protocol::mailbox::MailboxMessage;
+use codex_protocol::mailbox::MailboxPriority;
+use codex_protocol::mailbox::MailboxSenderRole;
 
 /// Shared mailbox store exposed to the TUI widgets.
 pub(crate) type SharedMailboxStore = Arc<Mutex<MailboxStore>>;
@@ -576,7 +591,9 @@ mod tests {
     use super::*;
     use crate::app_event::AppEvent;
     use crate::app_event_sender::AppEventSender;
-    use codex_protocol::mailbox::{MailboxAckPolicy, MailboxBody, MailboxContentType};
+    use codex_protocol::mailbox::MailboxAckPolicy;
+    use codex_protocol::mailbox::MailboxBody;
+    use codex_protocol::mailbox::MailboxContentType;
     use insta::assert_snapshot;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;

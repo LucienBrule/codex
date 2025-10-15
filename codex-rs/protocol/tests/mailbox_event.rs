@@ -1,6 +1,6 @@
-use codex_protocol::protocol::{
-    MailboxDeliveryEvent, MailboxDeliveryIngress, MailboxDeliveryState,
-};
+use codex_protocol::protocol::MailboxDeliveryEvent;
+use codex_protocol::protocol::MailboxDeliveryIngress;
+use codex_protocol::protocol::MailboxDeliveryState;
 use serde_json::Value;
 
 const ENQUEUED_FIXTURE: &str = include_str!("fixtures/mailbox_delivery_enqueued.json");

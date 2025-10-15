@@ -3,10 +3,14 @@ use codex_core::protocol::MailboxDeliveryState;
 use codex_core::protocol::Op;
 use codex_protocol::mailbox::MailboxMessage;
 use core_test_support::skip_if_no_network;
-use core_test_support::test_codex::{TestCodex, test_codex};
+use core_test_support::test_codex::TestCodex;
+use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 struct EnvGuard {
     key: &'static str,

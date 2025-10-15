@@ -18,7 +18,9 @@ use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;

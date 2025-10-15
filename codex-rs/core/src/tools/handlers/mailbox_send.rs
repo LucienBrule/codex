@@ -2,8 +2,11 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use codex_protocol::mailbox::MailboxMessage;
-use codex_protocol::protocol::{MailboxDeliveryEvent, MailboxDeliveryIngress, MailboxDeliveryState};
-use serde::{Deserialize, Serialize};
+use codex_protocol::protocol::MailboxDeliveryEvent;
+use codex_protocol::protocol::MailboxDeliveryIngress;
+use codex_protocol::protocol::MailboxDeliveryState;
+use serde::Deserialize;
+use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -195,15 +198,17 @@ async fn wait_for_delivery_event(
 impl From<&MailboxDeliveryEvent> for MailboxEventSnapshot {
     fn from(event: &MailboxDeliveryEvent) -> Self {
         let observed_at = event.observed_at.and_then(|ts| ts.format(&Rfc3339).ok());
-        let ingress = event.ingress.as_ref().map(|ingress| match ingress {
-            MailboxDeliveryIngress::Cli => "cli",
-            MailboxDeliveryIngress::Script => "script",
-            MailboxDeliveryIngress::Mcp => "mcp",
-            MailboxDeliveryIngress::Vscode => "vscode",
-            MailboxDeliveryIngress::Api => "api",
-            MailboxDeliveryIngress::Unknown => "unknown",
-        }
-        .to_string());
+        let ingress = event.ingress.as_ref().map(|ingress| {
+            match ingress {
+                MailboxDeliveryIngress::Cli => "cli",
+                MailboxDeliveryIngress::Script => "script",
+                MailboxDeliveryIngress::Mcp => "mcp",
+                MailboxDeliveryIngress::Vscode => "vscode",
+                MailboxDeliveryIngress::Api => "api",
+                MailboxDeliveryIngress::Unknown => "unknown",
+            }
+            .to_string()
+        });
         Self {
             state: match event.state {
                 MailboxDeliveryState::Enqueued => "enqueued".to_string(),

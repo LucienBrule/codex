@@ -1,9 +1,20 @@
+use std::fs;
+use std::io::BufRead;
+use std::io::BufReader;
+use std::io::Write;
+use std::os::unix::net::UnixListener;
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::mpsc;
+use std::thread;
 
+use anyhow::Context;
 use anyhow::Result;
 use assert_cmd::Command;
 use serde_json::Value as JsonValue;
+use serde_json::json;
 use tempfile::TempDir;
+use uuid::Uuid;
 
 fn codex_command(home: &Path) -> Result<Command> {
     let mut cmd = Command::cargo_bin("codex")?;
@@ -14,9 +25,100 @@ fn codex_command(home: &Path) -> Result<Command> {
     Ok(cmd)
 }
 
+fn registry_dir(home: &Path, namespace: &str) -> PathBuf {
+    home.join(namespace).join("mailbox")
+}
+
+fn write_registry(
+    home: &Path,
+    namespace: &str,
+    conversation_id: Uuid,
+    socket_path: &Path,
+) -> Result<PathBuf> {
+    let dir = registry_dir(home, namespace);
+    fs::create_dir_all(&dir)?;
+    let registry = json!({
+        "version": 1,
+        "namespace": namespace,
+        "updated_at": "2025-10-14T00:00:00Z",
+        "sessions": {
+            conversation_id.to_string(): {
+                "conversation_id": conversation_id,
+                "socket_path": socket_path.to_string_lossy(),
+                "pid": 4242,
+                "worker_id": "worker.test",
+                "last_heartbeat": "2025-10-14T00:00:00Z"
+            }
+        }
+    });
+    let path = dir.join("registry.json");
+    fs::write(&path, serde_json::to_vec_pretty(&registry)?)?;
+    Ok(path)
+}
+
+fn spawn_mailbox_listener(
+    socket_path: PathBuf,
+    ack_payload: serde_json::Value,
+) -> (thread::JoinHandle<Result<()>>, mpsc::Receiver<()>) {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let handle = thread::spawn(move || -> Result<()> {
+        let _ = fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path)
+            .with_context(|| format!("failed to bind {}", socket_path.display()))?;
+        ready_tx.send(()).ok();
+
+        if let Ok((stream, _addr)) = listener.accept() {
+            let mut cloned = stream
+                .try_clone()
+                .context("failed to clone unix stream for reading")?;
+            let mut reader = BufReader::new(&mut cloned);
+            let mut payload = String::new();
+            reader
+                .read_line(&mut payload)
+                .context("failed to read mailbox payload")?;
+
+            let mut stream = stream;
+            let mut ack_line = ack_payload.to_string();
+            ack_line.push('\n');
+            stream
+                .write_all(ack_line.as_bytes())
+                .context("failed to write ack")?;
+            stream.flush().context("failed to flush ack")?;
+        }
+
+        Ok(())
+    });
+
+    (handle, ready_rx)
+}
+
 #[test]
-fn mail_send_basic_json_output() -> Result<()> {
+fn mail_send_registry_success() -> Result<()> {
     let codex_home = TempDir::new()?;
+    let namespace = "codex";
+    let conversation_id = Uuid::now_v7();
+    let message_id = Uuid::now_v7();
+    let mailbox_dir = registry_dir(codex_home.path(), namespace);
+    fs::create_dir_all(&mailbox_dir)?;
+    let socket_path = mailbox_dir.join(format!("{conversation_id}.sock"));
+    write_registry(codex_home.path(), namespace, conversation_id, &socket_path)?;
+
+    let message_id_str = message_id.to_string();
+    let conversation_id_str = conversation_id.to_string();
+    let socket_path_str = socket_path.display().to_string();
+
+    let ack_payload = json!({
+        "ok": true,
+        "ack": "delivered",
+        "queue_depth": 0,
+        "message_id": message_id,
+        "correlation_id": "test-correlation"
+    });
+    let (listener, ready_rx) = spawn_mailbox_listener(socket_path.clone(), ack_payload);
+    ready_rx
+        .recv()
+        .context("listener did not signal readiness")?;
+
     let mut cmd = codex_command(codex_home.path())?;
     let output = cmd
         .args([
@@ -31,12 +133,20 @@ fn mail_send_basic_json_output() -> Result<()> {
             "--priority",
             "normal",
             "--timeout",
-            "10s",
+            "5s",
             "--audit-request-id",
             "req-test",
+            "--conversation-id",
+            &conversation_id.to_string(),
+            "--message-id",
+            &message_id.to_string(),
             "--json",
         ])
-        .output()?;
+        .output()
+        .context("failed to run codex mail send")?;
+
+    listener.join().expect("listener join")?;
+
     assert!(
         output.status.success(),
         "mail send exited with {:?}\nstderr: {}",
@@ -45,22 +155,138 @@ fn mail_send_basic_json_output() -> Result<()> {
     );
     let stdout = String::from_utf8(output.stdout)?;
     let payload: JsonValue = serde_json::from_str(&stdout)?;
-    assert!(payload.get("message_id").is_some(), "message_id missing");
+    assert_eq!(payload.get("ok").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(
-        payload
-            .get("submission_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.is_empty()),
-        Some(false)
+        payload.get("message_id").and_then(|v| v.as_str()),
+        Some(message_id_str.as_str())
     );
-    let delivered_queue_depth = payload
-        .pointer("/delivered/queue_depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or_default();
     assert_eq!(
-        delivered_queue_depth, 0,
-        "expected queue to drain after delivery"
+        payload.get("conversation_id").and_then(|v| v.as_str()),
+        Some(conversation_id_str.as_str())
     );
+    assert_eq!(
+        payload.pointer("/queue_depth").and_then(|v| v.as_u64()),
+        Some(0)
+    );
+    assert_eq!(
+        payload.get("socket_path").and_then(|v| v.as_str()),
+        Some(socket_path_str.as_str())
+    );
+    Ok(())
+}
+
+#[test]
+fn mail_send_registry_missing_socket() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let namespace = "codex";
+    let conversation_id = Uuid::now_v7();
+    let message_id = Uuid::now_v7();
+    let mailbox_dir = registry_dir(codex_home.path(), namespace);
+    fs::create_dir_all(&mailbox_dir)?;
+    let socket_path = mailbox_dir.join(format!("{conversation_id}.sock"));
+    write_registry(codex_home.path(), namespace, conversation_id, &socket_path)?;
+
+    // Intentionally do not create the socket; CLI should treat registry entry as stale.
+    let mut cmd = codex_command(codex_home.path())?;
+    let output = cmd
+        .args([
+            "mail",
+            "send",
+            "--sender-id",
+            "orchestrator.test",
+            "--content",
+            "stale socket test",
+            "--priority",
+            "normal",
+            "--audit-request-id",
+            "req-test",
+            "--conversation-id",
+            &conversation_id.to_string(),
+            "--message-id",
+            &message_id.to_string(),
+        ])
+        .output()
+        .context("failed to run codex mail send")?;
+
+    assert_eq!(output.status.code(), Some(64));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Run `codex_ctl mailbox sweep`"),
+        "expected stale registry guidance, got: {stderr}"
+    );
+
+    let registry_path = mailbox_dir.join("registry.json");
+    let contents = fs::read_to_string(&registry_path)?;
+    let registry_json: JsonValue = serde_json::from_str(&contents)?;
+    let remaining_sessions = registry_json
+        .get("sessions")
+        .and_then(|v| v.as_object())
+        .map(|map| map.is_empty());
+    assert_eq!(
+        remaining_sessions,
+        Some(true),
+        "stale entry should be removed"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn mail_send_registry_queue_full() -> Result<()> {
+    let codex_home = TempDir::new()?;
+    let namespace = "codex";
+    let conversation_id = Uuid::now_v7();
+    let message_id = Uuid::now_v7();
+    let mailbox_dir = registry_dir(codex_home.path(), namespace);
+    fs::create_dir_all(&mailbox_dir)?;
+    let socket_path = mailbox_dir.join(format!("{conversation_id}.sock"));
+    write_registry(codex_home.path(), namespace, conversation_id, &socket_path)?;
+
+    let ack_payload = json!({
+        "ok": false,
+        "err": "queue_full",
+        "queue_depth": 64,
+        "reason": "simulated backpressure"
+    });
+    let (listener, ready_rx) = spawn_mailbox_listener(socket_path.clone(), ack_payload);
+    ready_rx
+        .recv()
+        .context("listener did not signal readiness")?;
+
+    let mut cmd = codex_command(codex_home.path())?;
+    let output = cmd
+        .args([
+            "mail",
+            "send",
+            "--sender-id",
+            "orchestrator.test",
+            "--content",
+            "queue full test",
+            "--priority",
+            "normal",
+            "--audit-request-id",
+            "req-test",
+            "--conversation-id",
+            &conversation_id.to_string(),
+            "--message-id",
+            &message_id.to_string(),
+        ])
+        .output()
+        .context("failed to run codex mail send")?;
+
+    listener.join().expect("listener join")?;
+
+    assert_eq!(
+        output.status.code(),
+        Some(69),
+        "expected queue full exit code"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Mailbox queue is full"),
+        "unexpected stderr: {stderr}"
+    );
+
     Ok(())
 }
 
@@ -87,7 +313,8 @@ fn mail_send_rejects_automation_high_priority() -> Result<()> {
             "--audit-justification",
             "validation",
         ])
-        .output()?;
+        .output()
+        .context("failed to run codex mail send")?;
     assert!(
         !output.status.success(),
         "mail send should fail for automation high priority"

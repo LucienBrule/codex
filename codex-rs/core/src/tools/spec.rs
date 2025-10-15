@@ -1,7 +1,8 @@
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
 use crate::model_family::ModelFamily;
-use crate::tools::handlers::{MAILBOX_SEND_TOOL_NAME, PLAN_TOOL};
+use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
+use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::apply_patch::ApplyPatchToolType;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
 use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
@@ -760,8 +761,7 @@ fn sanitize_json_schema(value: &mut JsonValue) {
 }
 
 pub(crate) fn sanitize_tool_name(name: &str) -> String {
-    name
-        .chars()
+    name.chars()
         .map(|ch| match ch {
             ch if ch.is_ascii_alphanumeric() => ch,
             '-' | '_' => ch,
@@ -771,7 +771,8 @@ pub(crate) fn sanitize_tool_name(name: &str) -> String {
 }
 
 pub(crate) fn is_valid_tool_name(name: &str) -> bool {
-    name.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+    name.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
 /// Builds the tool registry builder while collecting tool specs for later serialization.
@@ -787,7 +788,8 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::ExecStreamHandler;
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
-    use crate::tools::handlers::{MailboxSendHandler, MAILBOX_SEND_TOOL_NAME};
+    use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
+    use crate::tools::handlers::MailboxSendHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
@@ -989,7 +991,13 @@ mod tests {
 
         assert_eq_tool_names(
             &tools,
-            &["unified_exec", "update_plan", "codex_mailbox_send", "web_search", "view_image"],
+            &[
+                "unified_exec",
+                "update_plan",
+                "codex_mailbox_send",
+                "web_search",
+                "view_image",
+            ],
         );
     }
 
@@ -1009,7 +1017,13 @@ mod tests {
 
         assert_eq_tool_names(
             &tools,
-            &["unified_exec", "update_plan", "codex_mailbox_send", "web_search", "view_image"],
+            &[
+                "unified_exec",
+                "update_plan",
+                "codex_mailbox_send",
+                "web_search",
+                "view_image",
+            ],
         );
     }
 
@@ -1575,7 +1589,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn test_shell_tool() {

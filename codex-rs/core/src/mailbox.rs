@@ -1,7 +1,11 @@
 use crate::flags::CODEX_MAILBOX_OOB;
 
-use anyhow::{Result, bail, ensure};
-use async_channel::{Receiver, Sender, TrySendError};
+use anyhow::Result;
+use anyhow::bail;
+use anyhow::ensure;
+use async_channel::Receiver;
+use async_channel::Sender;
+use async_channel::TrySendError;
 use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::mailbox::MailboxMessage;
 use codex_protocol::mailbox::MailboxPriority;

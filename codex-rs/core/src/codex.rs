@@ -4,7 +4,8 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::AuthManager;
 use crate::client_common::REVIEW_PROMPT;
@@ -234,12 +235,15 @@ impl Codex {
         })
     }
 
+    pub(crate) fn allocate_submission_id(&self) -> String {
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .to_string()
+    }
+
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .to_string();
+        let id = self.allocate_submission_id();
         let sub = Submission { id: id.clone(), op };
         self.submit_with_id(sub).await?;
         Ok(id)
@@ -285,7 +289,7 @@ pub(crate) struct Session {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum MailboxEnqueueError {
+pub enum MailboxEnqueueError {
     #[error("mailbox dispatcher disabled (set CODEX_MAILBOX_OOB=1 to enable)")]
     Disabled,
     #[error("mailbox queue is full (capacity = {capacity})")]

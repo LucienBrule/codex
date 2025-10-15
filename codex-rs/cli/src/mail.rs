@@ -1,11 +1,21 @@
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::io::Read;
+use std::io::{self};
+use std::path::Path;
 use std::path::PathBuf;
+use std::process;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use clap::ArgAction;
+use clap::Parser;
+use clap::Subcommand;
+use clap::ValueEnum;
 use codex_common::CliConfigOverrides;
 use codex_core::AuthManager;
 use codex_core::ConversationManager;
@@ -34,12 +44,72 @@ use codex_protocol::mailbox::MailboxRateLimitHint;
 use codex_protocol::mailbox::MailboxRateLimitScope;
 use codex_protocol::mailbox::MailboxSender;
 use codex_protocol::mailbox::MailboxSenderRole;
+use serde::Deserialize;
+use serde::Serialize;
 use serde_json::Value as JsonValue;
 use time::Duration as TimeDuration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tokio::time::{Instant, timeout};
+use tokio::io::AsyncBufReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::io::BufReader;
+use tokio::net::UnixStream;
+use tokio::time::Instant;
+use tokio::time::sleep;
+use tokio::time::timeout;
 use uuid::Uuid;
+
+mod registry;
+
+use self::registry::MailboxRegistry;
+
+const EXIT_UNKNOWN_SESSION: i32 = 64;
+const EXIT_QUEUE_FULL: i32 = 69;
+const EXIT_IO_FAILURE: i32 = 70;
+const CONNECT_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(50),
+    Duration::from_millis(200),
+    Duration::from_secs(1),
+];
+
+#[derive(Debug)]
+struct MailboxCliError {
+    exit_code: i32,
+    message: String,
+}
+
+impl MailboxCliError {
+    fn new(exit_code: i32, message: impl Into<String>) -> Self {
+        Self {
+            exit_code,
+            message: message.into(),
+        }
+    }
+
+    fn unknown_session(message: impl Into<String>) -> Self {
+        Self::new(EXIT_UNKNOWN_SESSION, message)
+    }
+
+    fn queue_full(message: impl Into<String>) -> Self {
+        Self::new(EXIT_QUEUE_FULL, message)
+    }
+
+    fn io_failure(message: impl Into<String>) -> Self {
+        Self::new(EXIT_IO_FAILURE, message)
+    }
+
+    fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+}
+
+impl std::fmt::Display for MailboxCliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for MailboxCliError {}
 
 #[derive(Debug, Parser)]
 pub struct MailCli {
@@ -323,7 +393,16 @@ impl MailCli {
     pub async fn run(self, codex_linux_sandbox_exe: Option<PathBuf>) -> Result<()> {
         match self.command {
             MailSubcommand::Send(args) => {
-                run_send(args, self.config_overrides, codex_linux_sandbox_exe).await
+                match run_send(args, self.config_overrides, codex_linux_sandbox_exe).await {
+                    Ok(()) => Ok(()),
+                    Err(err) => match err.downcast::<MailboxCliError>() {
+                        Ok(cli_err) => {
+                            eprintln!("{cli_err}");
+                            process::exit(cli_err.exit_code());
+                        }
+                        Err(err) => Err(err),
+                    },
+                }
             }
         }
     }
@@ -488,6 +567,14 @@ async fn run_send(
     validate_mailbox_message(&message)?;
 
     let config = load_config(cli_overrides, config_profile, cwd, codex_linux_sandbox_exe).await?;
+
+    if let Some(target_conversation_id) = conversation_id {
+        send_via_registry(message, target_conversation_id, &config, wait_timeout, json)
+            .await
+            .map_err(|err| anyhow::Error::new(err))?;
+        return Ok(());
+    }
+
     let auth_manager = AuthManager::shared(config.codex_home.clone(), true);
     let manager = ConversationManager::new(auth_manager, SessionSource::Exec);
     let NewConversation { conversation, .. } = manager
@@ -539,6 +626,230 @@ async fn run_send(
     }
 
     Ok(())
+}
+
+async fn send_via_registry(
+    message: MailboxMessage,
+    conversation_id: Uuid,
+    config: &Config,
+    wait_timeout: Duration,
+    json: bool,
+) -> Result<(), MailboxCliError> {
+    let namespace = resolve_namespace();
+    let mailbox_dir = config.codex_home.join(&namespace).join("mailbox");
+    let registry_path = mailbox_dir.join("registry.json");
+
+    let mut registry =
+        MailboxRegistry::load(registry_path.clone(), namespace.clone()).map_err(|err| {
+            MailboxCliError::io_failure(format!(
+                "failed to load mailbox registry {}: {err}",
+                registry_path.display()
+            ))
+        })?;
+
+    let entry = registry.find(&conversation_id).cloned().ok_or_else(|| {
+        MailboxCliError::unknown_session(format!(
+            "Conversation {conversation_id} is not registered in namespace {namespace}. \
+Run `codex_ctl mailbox sweep` to remove stale entries and ensure the worker is online."
+        ))
+    })?;
+
+    let stored_socket_path = entry.socket_path.clone();
+    let socket_path = if stored_socket_path.is_absolute() {
+        stored_socket_path.clone()
+    } else {
+        mailbox_dir.join(&stored_socket_path)
+    };
+
+    let stream = match connect_with_retry(&socket_path).await {
+        Ok(stream) => stream,
+        Err(err)
+            if matches!(
+                err.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            let removed = registry.remove_if_socket_matches(&conversation_id, &stored_socket_path);
+            if removed {
+                if let Err(save_err) = registry.save() {
+                    return Err(MailboxCliError::io_failure(format!(
+                        "failed to update mailbox registry {}: {save_err}",
+                        registry_path.display()
+                    )));
+                }
+            }
+            return Err(MailboxCliError::unknown_session(format!(
+                "Failed to reach socket {} for conversation {conversation_id}. \
+Run `codex_ctl mailbox sweep` and retry once the worker reconnects.",
+                socket_path.display()
+            )));
+        }
+        Err(err) => {
+            return Err(MailboxCliError::io_failure(format!(
+                "failed to connect to mailbox socket {}: {err}",
+                socket_path.display()
+            )));
+        }
+    };
+
+    let ack = write_message_and_receive_ack(stream, &message, wait_timeout).await?;
+
+    if !ack.ok {
+        if ack.err.as_deref() == Some("queue_full") {
+            let queue_depth = ack.queue_depth.unwrap_or_default();
+            let mut guidance = format!(
+                "Mailbox queue is full (depth {queue_depth}). Clear the inbox or retry after consumers catch up."
+            );
+            if let Some(reason) = ack.reason.as_ref() {
+                guidance.push_str(" ");
+                guidance.push_str(reason);
+            }
+            return Err(MailboxCliError::queue_full(guidance));
+        }
+        if ack.err.as_deref() == Some("unknown_conversation") {
+            let removed = registry.remove_if_socket_matches(&conversation_id, &stored_socket_path);
+            if removed {
+                if let Err(save_err) = registry.save() {
+                    return Err(MailboxCliError::io_failure(format!(
+                        "failed to update mailbox registry {}: {save_err}",
+                        registry_path.display()
+                    )));
+                }
+            }
+            return Err(MailboxCliError::unknown_session(format!(
+                "Conversation {conversation_id} returned unknown_conversation. \
+Run `codex_ctl mailbox sweep` and ensure the worker session is online."
+            )));
+        }
+        let err_label = ack.err.unwrap_or_else(|| "unknown_error".to_string());
+        let reason = ack
+            .reason
+            .unwrap_or_else(|| "no additional context provided".to_string());
+        return Err(MailboxCliError::io_failure(format!(
+            "Mailbox delivery failed ({err_label}): {reason}"
+        )));
+    }
+
+    if let Some(ack_message_id) = ack.message_id {
+        if ack_message_id != message.message_id {
+            return Err(MailboxCliError::io_failure(format!(
+                "Mailbox acknowledgement referenced unexpected message id {ack_message_id}"
+            )));
+        }
+    }
+
+    if json {
+        let output = MailboxSendJsonOutput {
+            ok: ack.ok,
+            message_id: message.message_id,
+            request_id: message.audit.request_id.clone(),
+            conversation_id,
+            ack: ack.ack.clone(),
+            queue_depth: ack.queue_depth,
+            correlation_id: ack.correlation_id.clone(),
+            socket_path: socket_path.display().to_string(),
+        };
+        let serialized = serde_json::to_string_pretty(&output).map_err(|err| {
+            MailboxCliError::io_failure(format!(
+                "failed to serialize mailbox acknowledgement output: {err}"
+            ))
+        })?;
+        println!("{serialized}");
+    } else {
+        let ack_label = ack.ack.as_deref().unwrap_or("delivered");
+        let queue_depth = ack.queue_depth.unwrap_or_default();
+        println!(
+            "Mailbox message {} delivered to conversation {} (ack={}, queue_depth={}, socket={})",
+            message.message_id,
+            conversation_id,
+            ack_label,
+            queue_depth,
+            socket_path.display()
+        );
+        if let Some(req) = &message.audit.request_id {
+            println!("Audit request id: {req}");
+        }
+        if let Some(correlation) = &ack.correlation_id {
+            println!("Delivery correlation id: {correlation}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn connect_with_retry(socket_path: &Path) -> Result<UnixStream, io::Error> {
+    let mut delays = CONNECT_RETRY_DELAYS.iter();
+    loop {
+        match UnixStream::connect(socket_path).await {
+            Ok(stream) => return Ok(stream),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) =>
+            {
+                if let Some(delay) = delays.next() {
+                    sleep(*delay).await;
+                    continue;
+                }
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn write_message_and_receive_ack(
+    stream: UnixStream,
+    message: &MailboxMessage,
+    wait_timeout: Duration,
+) -> Result<MailboxIpcAck, MailboxCliError> {
+    let mut stream = stream;
+    let mut payload = serde_json::to_vec(message).map_err(|err| {
+        MailboxCliError::io_failure(format!("failed to serialize mailbox message: {err}"))
+    })?;
+    payload.push(b'\n');
+
+    stream.write_all(&payload).await.map_err(|err| {
+        MailboxCliError::io_failure(format!("failed to send mailbox payload: {err}"))
+    })?;
+    stream.flush().await.map_err(|err| {
+        MailboxCliError::io_failure(format!("failed to flush mailbox payload: {err}"))
+    })?;
+
+    let mut reader = BufReader::new(stream);
+    let mut ack_line = String::new();
+    let bytes_read = timeout(wait_timeout, reader.read_line(&mut ack_line))
+        .await
+        .map_err(|_| {
+            MailboxCliError::io_failure("timed out waiting for mailbox acknowledgement".to_string())
+        })?
+        .map_err(|err| {
+            MailboxCliError::io_failure(format!("failed to read mailbox acknowledgement: {err}"))
+        })?;
+
+    if bytes_read == 0 {
+        return Err(MailboxCliError::io_failure(
+            "mailbox listener closed the connection without sending an acknowledgement".to_string(),
+        ));
+    }
+
+    let ack_line = ack_line.trim();
+    let ack: MailboxIpcAck = serde_json::from_str(ack_line).map_err(|err| {
+        MailboxCliError::io_failure(format!(
+            "failed to parse mailbox acknowledgement '{}': {err}",
+            ack_line
+        ))
+    })?;
+    Ok(ack)
+}
+
+fn resolve_namespace() -> String {
+    env::var("CODEX_NAMESPACE")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "codex".to_string())
 }
 
 fn load_body(content: Option<String>, content_file: Option<PathBuf>) -> Result<String> {
@@ -748,4 +1059,33 @@ fn event_snapshot(event: &codex_core::protocol::MailboxDeliveryEvent) -> JsonVal
         "delivery_latency_ms": event.delivery_latency_ms,
         "correlation_id": event.correlation_id.clone(),
     })
+}
+
+#[derive(Debug, Deserialize)]
+struct MailboxIpcAck {
+    ok: bool,
+    #[serde(default)]
+    ack: Option<String>,
+    #[serde(default)]
+    err: Option<String>,
+    #[serde(default)]
+    queue_depth: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
+    #[serde(default)]
+    correlation_id: Option<String>,
+    #[serde(default)]
+    message_id: Option<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+struct MailboxSendJsonOutput {
+    ok: bool,
+    message_id: Uuid,
+    request_id: Option<String>,
+    conversation_id: Uuid,
+    ack: Option<String>,
+    queue_depth: Option<u64>,
+    correlation_id: Option<String>,
+    socket_path: String,
 }

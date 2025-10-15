@@ -41,6 +41,13 @@ use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 
+/// Timestamped helper. The timestamp is styled with self.dimmed.
+macro_rules! ts_msg {
+    ($self:ident, $($arg:tt)*) => {{
+        eprintln!($($arg)*);
+    }};
+}
+
 /// This should be configurable. When used in CI, users may not want to impose
 /// a limit so they can see the full transcript.
 const MAX_OUTPUT_LINES_FOR_EXEC_TOOL_CALL: usize = 20;
@@ -62,6 +69,8 @@ pub(crate) struct EventProcessorWithHumanOutput {
     /// Whether to include `AgentReasoning` events in the output.
     show_agent_reasoning: bool,
     show_raw_agent_reasoning: bool,
+    show_diff_logs: bool,
+    diff_logging_notice_emitted: bool,
     last_message_path: Option<PathBuf>,
     last_total_token_usage: Option<codex_core::protocol::TokenUsageInfo>,
     final_message: Option<String>,
@@ -74,6 +83,7 @@ impl EventProcessorWithHumanOutput {
         last_message_path: Option<PathBuf>,
     ) -> Self {
         let call_id_to_patch = HashMap::new();
+        let show_diff_logs = Self::resolve_diff_logging_preference(config);
 
         if with_ansi {
             Self {
@@ -87,6 +97,8 @@ impl EventProcessorWithHumanOutput {
                 cyan: Style::new().cyan(),
                 show_agent_reasoning: !config.hide_agent_reasoning,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+                show_diff_logs,
+                diff_logging_notice_emitted: false,
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
@@ -103,24 +115,45 @@ impl EventProcessorWithHumanOutput {
                 cyan: Style::new(),
                 show_agent_reasoning: !config.hide_agent_reasoning,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+                show_diff_logs,
+                diff_logging_notice_emitted: false,
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
             }
         }
     }
+
+    fn resolve_diff_logging_preference(_config: &Config) -> bool {
+        match std::env::var("CODEX_DIFF_LOG") {
+            Ok(value) => {
+                let normalized = value.trim().to_ascii_lowercase();
+                !matches!(
+                    normalized.as_str(),
+                    "" | "0" | "false" | "off" | "no" | "disable" | "disabled"
+                )
+            }
+            Err(_) => true,
+        }
+    }
+
+    fn emit_diff_logging_notice_if_needed(&mut self) {
+        if self.show_diff_logs || self.diff_logging_notice_emitted {
+            return;
+        }
+
+        ts_msg!(
+            self,
+            "{}",
+            "diff logging muted via CODEX_DIFF_LOG; snippets suppressed.".style(self.dimmed)
+        );
+        self.diff_logging_notice_emitted = true;
+    }
 }
 
 struct PatchApplyBegin {
     start_time: Instant,
     auto_approved: bool,
-}
-
-/// Timestamped helper. The timestamp is styled with self.dimmed.
-macro_rules! ts_msg {
-    ($self:ident, $($arg:tt)*) => {{
-        eprintln!($($arg)*);
-    }};
 }
 
 impl EventProcessor for EventProcessorWithHumanOutput {
@@ -306,11 +339,20 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     },
                 );
 
+                let file_update_banner = if self.show_diff_logs {
+                    "file update"
+                } else {
+                    "file update (diff logging muted)"
+                };
                 ts_msg!(
                     self,
                     "{}",
-                    "file update".style(self.magenta).style(self.italic),
+                    file_update_banner.style(self.magenta).style(self.italic),
                 );
+
+                if !self.show_diff_logs {
+                    self.emit_diff_logging_notice_if_needed();
+                }
 
                 // Pretty-print the patch summary with colored diff markers so
                 // it's easy to scan in the terminal output.
@@ -323,8 +365,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                                 path.to_string_lossy()
                             );
                             eprintln!("{}", header.style(self.magenta));
-                            for line in content.lines() {
-                                eprintln!("{}", line.style(self.green));
+                            if self.show_diff_logs {
+                                for line in content.lines() {
+                                    eprintln!("{}", line.style(self.green));
+                                }
                             }
                         }
                         FileChange::Delete { content } => {
@@ -334,8 +378,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                                 path.to_string_lossy()
                             );
                             eprintln!("{}", header.style(self.magenta));
-                            for line in content.lines() {
-                                eprintln!("{}", line.style(self.red));
+                            if self.show_diff_logs {
+                                for line in content.lines() {
+                                    eprintln!("{}", line.style(self.red));
+                                }
                             }
                         }
                         FileChange::Update {
@@ -354,18 +400,20 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                             };
                             eprintln!("{}", header.style(self.magenta));
 
-                            // Colorize diff lines. We keep file header lines
-                            // (--- / +++) without extra coloring so they are
-                            // still readable.
-                            for diff_line in unified_diff.lines() {
-                                if diff_line.starts_with('+') && !diff_line.starts_with("+++") {
-                                    eprintln!("{}", diff_line.style(self.green));
-                                } else if diff_line.starts_with('-')
-                                    && !diff_line.starts_with("---")
-                                {
-                                    eprintln!("{}", diff_line.style(self.red));
-                                } else {
-                                    eprintln!("{diff_line}");
+                            if self.show_diff_logs {
+                                // Colorize diff lines. We keep file header lines
+                                // (--- / +++) without extra coloring so they are
+                                // still readable.
+                                for diff_line in unified_diff.lines() {
+                                    if diff_line.starts_with('+') && !diff_line.starts_with("+++") {
+                                        eprintln!("{}", diff_line.style(self.green));
+                                    } else if diff_line.starts_with('-')
+                                        && !diff_line.starts_with("---")
+                                    {
+                                        eprintln!("{}", diff_line.style(self.red));
+                                    } else {
+                                        eprintln!("{diff_line}");
+                                    }
                                 }
                             }
                         }
@@ -408,12 +456,23 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
             }
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => {
-                ts_msg!(
-                    self,
-                    "{}",
-                    "file update:".style(self.magenta).style(self.italic)
-                );
-                eprintln!("{unified_diff}");
+                if self.show_diff_logs {
+                    ts_msg!(
+                        self,
+                        "{}",
+                        "file update:".style(self.magenta).style(self.italic)
+                    );
+                    eprintln!("{unified_diff}");
+                } else {
+                    self.emit_diff_logging_notice_if_needed();
+                    ts_msg!(
+                        self,
+                        "{}",
+                        "file update (diff logging muted)"
+                            .style(self.magenta)
+                            .style(self.italic)
+                    );
+                }
             }
             EventMsg::ExecApprovalRequest(_) => {
                 // Should we exit?

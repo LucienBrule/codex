@@ -1,15 +1,20 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
-use codex_otel::metrics::{
-    record_mailbox_ack_total, record_mailbox_delivery_latency, record_mailbox_expiry_total,
-    record_mailbox_queue_depth,
-};
-use codex_protocol::mailbox::{MailboxAckMode, MailboxMessage, MailboxPriority, MailboxSenderRole};
-use codex_protocol::protocol::{
-    MailboxDeliveryEvent, MailboxDeliveryIngress, MailboxDeliveryState, MailboxLivenessState,
-};
+use codex_otel::metrics::record_mailbox_ack_total;
+use codex_otel::metrics::record_mailbox_delivery_latency;
+use codex_otel::metrics::record_mailbox_expiry_total;
+use codex_otel::metrics::record_mailbox_queue_depth;
+use codex_protocol::mailbox::MailboxAckMode;
+use codex_protocol::mailbox::MailboxMessage;
+use codex_protocol::mailbox::MailboxPriority;
+use codex_protocol::mailbox::MailboxSenderRole;
+use codex_protocol::protocol::MailboxDeliveryEvent;
+use codex_protocol::protocol::MailboxDeliveryIngress;
+use codex_protocol::protocol::MailboxDeliveryState;
+use codex_protocol::protocol::MailboxLivenessState;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -174,7 +179,8 @@ impl MailboxDeliveryTelemetry {
     ) -> MailboxTelemetrySnapshot {
         let pending = self.pending.remove(&event.message.message_id);
         if let Some(pending) = pending {
-            if let (Some(enqueued_at), Some(delivered_at)) = (pending.observed_at, event.observed_at)
+            if let (Some(enqueued_at), Some(delivered_at)) =
+                (pending.observed_at, event.observed_at)
             {
                 let delta = delivered_at - enqueued_at;
                 let millis = delta.whole_milliseconds();

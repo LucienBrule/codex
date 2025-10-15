@@ -1,7 +1,8 @@
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::AuthManager;
 use crate::auth::CodexAuth;

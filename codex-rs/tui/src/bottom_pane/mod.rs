@@ -44,7 +44,8 @@ pub(crate) use chat_composer::InputResult;
 use codex_protocol::custom_prompts::CustomPrompt;
 
 use crate::mailbox::MailboxBadgeState;
-use crate::status_indicator_widget::{LivenessBadge, StatusIndicatorWidget};
+use crate::status_indicator_widget::LivenessBadge;
+use crate::status_indicator_widget::StatusIndicatorWidget;
 pub(crate) use list_selection_view::SelectionAction;
 pub(crate) use list_selection_view::SelectionItem;
 

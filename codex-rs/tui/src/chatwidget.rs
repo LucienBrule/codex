@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use codex_core::config::Config;
@@ -86,9 +87,11 @@ use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
-use crate::mailbox::{
-    MailboxActionKind, MailboxActionOutcome, MailboxStore, MailboxView, SharedMailboxStore,
-};
+use crate::mailbox::MailboxActionKind;
+use crate::mailbox::MailboxActionOutcome;
+use crate::mailbox::MailboxStore;
+use crate::mailbox::MailboxView;
+use crate::mailbox::SharedMailboxStore;
 use crate::markdown::append_markdown;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;

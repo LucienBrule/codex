@@ -1,8 +1,12 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use codex_core::protocol::{EventMsg, MailboxDeliveryState, Op};
-use codex_protocol::mailbox::{MailboxMessage, MailboxSenderRole};
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::MailboxDeliveryState;
+use codex_core::protocol::Op;
+use codex_protocol::mailbox::MailboxMessage;
+use codex_protocol::mailbox::MailboxSenderRole;
 use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event_with_timeout;
@@ -10,8 +14,11 @@ use serde_json::json;
 use tokio::sync::Mutex;
 use tokio::time::Duration;
 use uuid::Uuid;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::Mock;
+use wiremock::MockServer;
+use wiremock::ResponseTemplate;
+use wiremock::matchers::method;
+use wiremock::matchers::path;
 
 struct MailboxEnvGuard {
     key: &'static str,
@@ -72,7 +79,9 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
     let total_messages: usize = senders.iter().map(|(_, _, count)| *count).sum();
 
     let expected_order = Arc::new(Mutex::new(HashMap::<String, Vec<Uuid>>::new()));
-    let enqueued_events = Arc::new(Mutex::new(HashMap::<Uuid, MailboxDeliveryEventSnapshot>::new()));
+    let enqueued_events = Arc::new(Mutex::new(
+        HashMap::<Uuid, MailboxDeliveryEventSnapshot>::new(),
+    ));
     let deliveries = Arc::new(Mutex::new(Vec::<MailboxDeliveryEventSnapshot>::new()));
     let queue_depths = Arc::new(Mutex::new(Vec::<usize>::new()));
 
@@ -99,10 +108,10 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
                         if let Some(depth) = event.queue_depth {
                             listener_depths.lock().await.push(depth);
                         }
-                        listener_enqueued
-                            .lock()
-                            .await
-                            .insert(event.message.message_id, MailboxDeliveryEventSnapshot::from(&event));
+                        listener_enqueued.lock().await.insert(
+                            event.message.message_id,
+                            MailboxDeliveryEventSnapshot::from(&event),
+                        );
                     }
                     MailboxDeliveryState::Delivered => {
                         listener_deliveries
@@ -134,13 +143,9 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
                 );
                 message.audit.request_id = Some(format!("req-{sender_id}-{seq}"));
                 if idx == 1 {
-                    message
-                        .metadata
-                        .insert("ingress".into(), json!("script"));
+                    message.metadata.insert("ingress".into(), json!("script"));
                 } else if idx == 2 {
-                    message
-                        .metadata
-                        .insert("ingress".into(), json!("mcp"));
+                    message.metadata.insert("ingress".into(), json!("mcp"));
                 }
 
                 let message_id = message.message_id;
@@ -152,9 +157,7 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
                     .push(message_id);
 
                 codex
-                    .submit(Op::MailboxEnvelope {
-                        envelope: message,
-                    })
+                    .submit(Op::MailboxEnvelope { envelope: message })
                     .await
                     .expect("enqueue mailbox envelope");
 
@@ -179,7 +182,11 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
     let delivered_events = deliveries.lock().await.clone();
     let enqueued_map = enqueued_events.lock().await.clone();
 
-    assert_eq!(delivered_events.len(), total_messages, "expected all messages to deliver");
+    assert_eq!(
+        delivered_events.len(),
+        total_messages,
+        "expected all messages to deliver"
+    );
 
     let mut actual_map: HashMap<String, Vec<Uuid>> = HashMap::new();
     let mut ingress_values = HashSet::new();
@@ -196,11 +203,19 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
         if let Some(latency) = event.delivery_latency_ms {
             latency_ms.push(latency);
             // Guard against starvation by capping acceptable delivery latency.
-            assert!(latency <= 1_000, "latency exceeded 1s for {}", event.message_id);
+            assert!(
+                latency <= 1_000,
+                "latency exceeded 1s for {}",
+                event.message_id
+            );
         } else if let Some(enqueued) = enqueued_map.get(&event.message_id) {
             if let (Some(start), Some(end)) = (enqueued.observed_at_ms, event.observed_at_ms) {
                 let diff = end.saturating_sub(start);
-                assert!(diff <= 1_000, "derived latency exceeded 1s for {}", event.message_id);
+                assert!(
+                    diff <= 1_000,
+                    "derived latency exceeded 1s for {}",
+                    event.message_id
+                );
                 latency_ms.push(diff);
             }
         }
@@ -227,7 +242,10 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
 
     if !latency_ms.is_empty() {
         let max_latency = latency_ms.into_iter().max().unwrap();
-        assert!(max_latency <= 1_000, "max latency {max_latency}ms exceeded bound");
+        assert!(
+            max_latency <= 1_000,
+            "max latency {max_latency}ms exceeded bound"
+        );
     }
 
     let depth_samples = queue_depths.lock().await.clone();

@@ -32,12 +32,18 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 shlex = { workspace = true }
 supports-color = { workspace = true }
+libc = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
+    "net",
     "process",
     "rt-multi-thread",
     "signal",
+    "sync",
+    "time",
 ] }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

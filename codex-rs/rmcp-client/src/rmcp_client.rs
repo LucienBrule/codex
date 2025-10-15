@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use anyhow::anyhow;
@@ -37,7 +39,9 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time;
 use tokio::time::MissedTickBehavior;
-use tracing::{event, info, warn};
+use tracing::event;
+use tracing::info;
+use tracing::warn;
 
 use crate::load_oauth_tokens;
 use crate::logging_client_handler::LoggingClientHandler;

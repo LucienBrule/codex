@@ -1,16 +1,19 @@
 use codex_core::config::MailboxLivenessSettings;
-use codex_core::telemetry::{
-    MailboxDeliveryTelemetry, MailboxLivenessTelemetry, MailboxTelemetryLabels,
-};
-use codex_protocol::mailbox::{
-    MailboxAckMode, MailboxMessage, MailboxPriority, MailboxSenderRole,
-};
-use codex_protocol::protocol::{
-    MailboxDeliveryEvent, MailboxDeliveryIngress, MailboxDeliveryState, MailboxLivenessState,
-};
-use std::time::{Duration, Instant};
-use time::macros::datetime;
+use codex_core::telemetry::MailboxDeliveryTelemetry;
+use codex_core::telemetry::MailboxLivenessTelemetry;
+use codex_core::telemetry::MailboxTelemetryLabels;
+use codex_protocol::mailbox::MailboxAckMode;
+use codex_protocol::mailbox::MailboxMessage;
+use codex_protocol::mailbox::MailboxPriority;
+use codex_protocol::mailbox::MailboxSenderRole;
+use codex_protocol::protocol::MailboxDeliveryEvent;
+use codex_protocol::protocol::MailboxDeliveryIngress;
+use codex_protocol::protocol::MailboxDeliveryState;
+use codex_protocol::protocol::MailboxLivenessState;
+use std::time::Duration;
+use std::time::Instant;
 use time::OffsetDateTime;
+use time::macros::datetime;
 
 fn baseline_settings() -> MailboxLivenessSettings {
     let mut settings = MailboxLivenessSettings::default();
@@ -124,10 +127,8 @@ fn mailbox_delivery_telemetry_computes_latency() {
         ingress: Some(MailboxDeliveryIngress::Cli),
         delivery_latency_ms: None,
     };
-    let enqueued_labels = MailboxTelemetryLabels::new(
-        MailboxDeliveryIngress::Cli,
-        &enqueued_event.message,
-    );
+    let enqueued_labels =
+        MailboxTelemetryLabels::new(MailboxDeliveryIngress::Cli, &enqueued_event.message);
     let enqueued_snapshot = telemetry.record_enqueued(&enqueued_event, &enqueued_labels);
     assert_eq!(enqueued_snapshot.delivery_latency_ms, None);
 
@@ -140,10 +141,8 @@ fn mailbox_delivery_telemetry_computes_latency() {
         ingress: Some(MailboxDeliveryIngress::Cli),
         delivery_latency_ms: None,
     };
-    let delivered_labels = MailboxTelemetryLabels::new(
-        MailboxDeliveryIngress::Cli,
-        &delivered_event.message,
-    );
+    let delivered_labels =
+        MailboxTelemetryLabels::new(MailboxDeliveryIngress::Cli, &delivered_event.message);
     let delivered_snapshot = telemetry.record_delivered(&mut delivered_event, &delivered_labels);
     assert_eq!(delivered_snapshot.queue_depth, Some(1));
     assert_eq!(delivered_snapshot.delivery_latency_ms, Some(5000));
