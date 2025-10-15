@@ -41,7 +41,7 @@ fn write_registry(
         "version": 1,
         "namespace": namespace,
         "updated_at": "2025-10-14T00:00:00Z",
-        "sessions": {
+        "entries": {
             conversation_id.to_string(): {
                 "conversation_id": conversation_id,
                 "socket_path": socket_path.to_string_lossy(),
@@ -297,15 +297,11 @@ fn mail_send_registry_missing_socket() -> Result<()> {
     let registry_path = mailbox_dir.join("registry.json");
     let contents = fs::read_to_string(&registry_path)?;
     let registry_json: JsonValue = serde_json::from_str(&contents)?;
-    let remaining_sessions = registry_json
-        .get("sessions")
+    let remaining = registry_json
+        .get("entries")
         .and_then(|v| v.as_object())
         .map(|map| map.is_empty());
-    assert_eq!(
-        remaining_sessions,
-        Some(true),
-        "stale entry should be removed"
-    );
+    assert_eq!(remaining, Some(true), "stale entry should be removed");
 
     Ok(())
 }

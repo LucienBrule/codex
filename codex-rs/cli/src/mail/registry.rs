@@ -43,7 +43,7 @@ struct MailboxRegistryFile {
     namespace: String,
     #[serde(default)]
     updated_at: Option<String>,
-    #[serde(default, alias = "sessions")]
+    #[serde(default)]
     entries: BTreeMap<Uuid, MailboxRegistryEntry>,
 }
 
