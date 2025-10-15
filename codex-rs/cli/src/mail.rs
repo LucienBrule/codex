@@ -669,7 +669,10 @@ Run `codex_ctl mailbox sweep` to remove stale entries and ensure the worker is o
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
             ) =>
         {
-            let removed = registry.remove_if_socket_matches(&conversation_id, &stored_socket_path);
+            // Treat unreachable sockets as stale: remove the entry unconditionally to avoid replays
+            let removed =
+                registry.remove_if_socket_matches(&conversation_id, &stored_socket_path)
+                    || registry.remove(&conversation_id);
             if removed {
                 if let Err(save_err) = registry.save() {
                     return Err(MailboxCliError::io_failure(format!(

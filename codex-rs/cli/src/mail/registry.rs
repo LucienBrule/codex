@@ -127,6 +127,10 @@ impl MailboxRegistry {
         should_remove
     }
 
+    pub fn remove(&mut self, conversation_id: &Uuid) -> bool {
+        self.data.entries.remove(conversation_id).is_some()
+    }
+
     pub fn purge_where<F>(&mut self, mut predicate: F) -> Vec<Uuid>
     where
         F: FnMut(&Uuid, &MailboxRegistryEntry) -> bool,
