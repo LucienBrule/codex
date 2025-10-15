@@ -14,6 +14,9 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+otel = []
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -36,6 +39,7 @@ supports-color = { workspace = true }
 libc = { workspace = true }
 time = { workspace = true }
 uuid = { workspace = true }
+bytecount = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",

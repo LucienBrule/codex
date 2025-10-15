@@ -46,6 +46,9 @@ use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
+mod mailbox_spool;
+use mailbox_spool::MailboxSpoolWriter;
+
 const DEFAULT_SOCKET_BACKLOG: libc::c_int = 16;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
 const MAX_STALE_HEARTBEAT_AGE: Duration = Duration::from_secs(300);
@@ -65,6 +68,7 @@ pub struct MailboxServer {
     listener_handle: JoinHandle<()>,
     heartbeat_handle: JoinHandle<()>,
     events: Arc<MailboxEventRegistry>,
+    spool: Option<MailboxSpoolWriter>,
 }
 
 impl MailboxServer {
@@ -114,12 +118,27 @@ impl MailboxServer {
             socket_path: socket_path.to_string_lossy().into_owned(),
             created_at: now,
             last_heartbeat: now,
-            namespace,
+            namespace: namespace.clone(),
         };
         registry.upsert_entry(entry).await?;
 
         let shutdown = Arc::new(Notify::new());
         let events = Arc::new(MailboxEventRegistry::default());
+
+        // Initialize per-conversation spool writer (best-effort, non-fatal)
+        let spool = match MailboxSpoolWriter::new(
+            config.clone(),
+            &namespace,
+            conversation_id,
+        )
+        .await
+        {
+            Ok(writer) => Some(writer),
+            Err(err) => {
+                warn!(target: "codex::mailbox", event = "mailbox.spool.init_failed", ?err, "failed to initialize mailbox spool; continuing without persistence");
+                None
+            }
+        };
 
         let listener_shutdown = shutdown.clone();
         let listener_registry = registry.clone();
@@ -155,6 +174,7 @@ impl MailboxServer {
             listener_handle,
             heartbeat_handle,
             events,
+            spool,
         }))
     }
 
@@ -186,6 +206,17 @@ impl MailboxServer {
     pub async fn handle_event(&self, event: &Event) {
         if let Some(outcome) = classify_event(event) {
             self.events.resolve(&event.id, outcome).await;
+        }
+
+        // Append mailbox delivery events to per-conversation spool (best-effort)
+        if let EventMsg::MailboxDelivery(delivery) = &event.msg {
+            if matches!(delivery.state, MailboxDeliveryState::Enqueued | MailboxDeliveryState::Delivered) {
+                if let Some(spool) = &self.spool {
+                    if let Err(err) = spool.append_delivery(delivery.clone()).await {
+                        warn!(target: "codex::mailbox", event = "mailbox.spool.append_failed", ?err, "failed to append mailbox delivery to spool");
+                    }
+                }
+            }
         }
     }
 }

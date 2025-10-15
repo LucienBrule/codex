@@ -1,11 +1,12 @@
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use codex_protocol::protocol::{EventMsg, MailboxDeliveryEvent, MailboxDeliveryState, RolloutItem, RolloutLine};
@@ -96,8 +97,16 @@ impl ToolHandler for MailboxReadHandler {
             return Ok(ToolOutput::Function { content, success: Some(true) });
         };
 
-        // Load rollout file and collect MailboxDelivery events
-        let events = read_mailbox_events(&rollout_path).await.map_err(|e| FunctionCallError::Fatal(format!("failed to read rollout: {e}")))?;
+        // Prefer JSONL inbox spool if present; fall back to rollout
+        let ns = std::env::var("CODEX_NAMESPACE").unwrap_or_else(|_| "codex".to_string());
+        let spool_dir = resolve_spool_dir_from_rollout(&rollout_path, &ns);
+        let spool_path = spool_dir.as_ref().map(|d| d.join(format!("inbox-{}.jsonl", conv_id)));
+        let events = if let Some(p) = &spool_path {
+            if p.exists() { read_spool_deliveries(p).await.unwrap_or_default() }
+            else { read_mailbox_events(&rollout_path).await.map_err(|e| FunctionCallError::Fatal(format!("failed to read rollout: {e}")))? }
+        } else {
+            read_mailbox_events(&rollout_path).await.map_err(|e| FunctionCallError::Fatal(format!("failed to read rollout: {e}")))?
+        };
 
         // Keep only latest entry per message_id, prefer Delivered over Enqueued
         use std::collections::HashMap;
@@ -131,12 +140,18 @@ impl ToolHandler for MailboxReadHandler {
 
         let mut out_msgs: Vec<MailboxReadMessageOut> = Vec::new();
         let mut to_ack: Vec<Uuid> = Vec::new();
+        // Load persisted sidecar acks if available
+        let sidecar_acked: Option<std::collections::HashSet<Uuid>> = if let Some(dir) = &spool_dir {
+            let sidecar = dir.join(format!("acks-{}.jsonl", conv_id));
+            if sidecar.exists() { read_sidecar_acks(&sidecar).await.ok() } else { None }
+        } else { None };
         {
             let acked = ACKED.lock().await;
             for ev in latest.values() {
                 // Only consider delivered messages for inbox semantics
                 if ev.state != MailboxDeliveryState::Delivered { continue; }
                 if acked.contains(&(conv_id, ev.message.message_id)) { continue; }
+                if let Some(ref set) = sidecar_acked { if set.contains(&ev.message.message_id) { continue; } }
                 if let Some(since) = since_ts {
                     if let Some(obs) = ev.observed_at { if obs < since { continue; } }
                 }
@@ -175,6 +190,12 @@ impl ToolHandler for MailboxReadHandler {
         let acked_count = if args.ack && !to_ack.is_empty() {
             let mut acked = ACKED.lock().await;
             for mid in &to_ack { acked.insert((conv_id, *mid)); }
+            // Also persist to sidecar if spool directory available (best effort)
+            if let Some(dir) = &spool_dir {
+                let sidecar = dir.join(format!("acks-{}.jsonl", conv_id));
+                let now = time::OffsetDateTime::now_utc();
+                for mid in &to_ack { let _ = append_ack_sidecar(&sidecar, *mid, now).await; }
+            }
             Some(to_ack.len() as u64)
         } else { None };
 
@@ -222,6 +243,82 @@ async fn read_mailbox_events(path: &PathBuf) -> std::io::Result<Vec<MailboxDeliv
         }
     }
     Ok(out)
+}
+
+fn resolve_spool_dir_from_rollout(rollout_path: &Path, namespace: &str) -> Option<PathBuf> {
+    // layout: <codex_home>/sessions/YYYY/MM/DD/rollout-...jsonl
+    let mut cur = rollout_path.to_path_buf();
+    for _ in 0..5 { cur = cur.parent()?.to_path_buf(); }
+    Some(cur.join(namespace).join("mailbox").join("inbox"))
+}
+
+async fn read_spool_deliveries(path: &Path) -> std::io::Result<Vec<MailboxDeliveryEvent>> {
+    #[derive(serde::Deserialize)]
+    struct SpoolIn {
+        #[serde(rename = "type")] _t: Option<String>,
+        message_id: Uuid,
+        from: String,
+        role: Option<String>,
+        subject: Option<String>,
+        content: String,
+        content_type: String,
+        received_at: Option<time::OffsetDateTime>,
+    }
+    let text = tokio::fs::read_to_string(path).await?;
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim(); if trimmed.is_empty() { continue; }
+        match serde_json::from_str::<SpoolIn>(trimmed) {
+            Ok(rec) => {
+                use codex_protocol::{mailbox::*, protocol::*};
+                let mut msg = MailboxMessage::default();
+                msg.message_id = rec.message_id;
+                msg.sender.id = rec.from;
+                if let Some(role) = rec.role {
+                    msg.sender.role = match role.to_ascii_lowercase().as_str() {
+                        "system" => MailboxSenderRole::System,
+                        "orchestrator" => MailboxSenderRole::Orchestrator,
+                        "operator" => MailboxSenderRole::Operator,
+                        "automation" => MailboxSenderRole::Automation,
+                        _ => MailboxSenderRole::System,
+                    };
+                }
+                msg.body.subject = rec.subject;
+                msg.body.content = rec.content;
+                msg.body.content_type = match rec.content_type.as_str() {
+                    "text/markdown" => MailboxContentType::TextMarkdown,
+                    "application/json" => MailboxContentType::ApplicationJson,
+                    _ => MailboxContentType::TextPlain,
+                };
+                let ev = MailboxDeliveryEvent { state: MailboxDeliveryState::Delivered, message: msg, observed_at: rec.received_at, queue_depth: None, ingress: None, delivery_latency_ms: None, correlation_id: None };
+                out.push(ev);
+            }
+            Err(_) => continue,
+        }
+    }
+    Ok(out)
+}
+
+async fn append_ack_sidecar(path: &Path, message_id: Uuid, ts: time::OffsetDateTime) -> std::io::Result<()> {
+    #[derive(serde::Serialize)]
+    struct AckOut<'a> { r#type: &'static str, message_id: &'a Uuid, #[serde(with = "time::serde::rfc3339")] acked_at: time::OffsetDateTime }
+    if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await.ok(); }
+    let mut file = tokio::fs::OpenOptions::new().create(true).append(true).open(path).await?;
+    let line = AckOut { r#type: "ack", message_id: &message_id, acked_at: ts };
+    let mut json = serde_json::to_string(&line)?; json.push('\n');
+    file.write_all(json.as_bytes()).await?; file.flush().await?; Ok(())
+}
+
+async fn read_sidecar_acks(path: &Path) -> std::io::Result<std::collections::HashSet<Uuid>> {
+    #[derive(serde::Deserialize)]
+    struct AckIn { r#type: String, message_id: Uuid }
+    let text = tokio::fs::read_to_string(path).await?;
+    let mut set = std::collections::HashSet::new();
+    for line in text.lines() {
+        let trimmed = line.trim(); if trimmed.is_empty() { continue; }
+        if let Ok(rec) = serde_json::from_str::<AckIn>(trimmed) { if rec.r#type == "ack" { set.insert(rec.message_id); } }
+    }
+    Ok(set)
 }
 
 #[cfg(test)]
@@ -318,4 +415,6 @@ mod tests {
 
         submission_task.abort();
     }
+
+    // Sidecar ack behavior is exercised via integration and soak harnesses.
 }
