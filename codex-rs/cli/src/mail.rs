@@ -677,18 +677,28 @@ async fn send_via_registry(
             ))
         })?;
 
-    let entry = registry.find(&conversation_id).cloned().ok_or_else(|| {
-        MailboxCliError::unknown_session(format!(
-            "Conversation {conversation_id} is not registered in namespace {namespace}. \
-Run `codex_ctl mailbox sweep` to remove stale entries and ensure the worker is online."
-        ))
-    })?;
-
-    let stored_socket_path = entry.socket_path.clone();
-    let socket_path = if stored_socket_path.is_absolute() {
-        stored_socket_path.clone()
-    } else {
-        mailbox_dir.join(&stored_socket_path)
+    // Prefer registry entry when present, but fall back to a deterministic socket path
+    // when the registry has no record for the provided conversation id.
+    let (socket_path, stored_socket_path, have_registry_entry) = match registry
+        .find(&conversation_id)
+        .cloned()
+    {
+        Some(entry) => {
+            let stored = entry.socket_path.clone();
+            let resolved = if stored.is_absolute() {
+                stored.clone()
+            } else {
+                mailbox_dir.join(&stored)
+            };
+            (resolved, stored, true)
+        }
+        None => {
+            let resolved = mailbox_dir.join(format!("{}.sock", conversation_id));
+            // Use the resolved path as a stand-in for stored_socket_path when no registry
+            // entry exists. We will avoid any registry mutation paths guarded by
+            // `have_registry_entry` later.
+            (resolved.clone(), resolved, false)
+        }
     };
 
     let stream = match connect_with_retry(&socket_path).await {
@@ -699,21 +709,34 @@ Run `codex_ctl mailbox sweep` to remove stale entries and ensure the worker is o
                 io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
             ) =>
         {
-            // Treat unreachable sockets as stale: remove the entry unconditionally to avoid replays
-            let removed =
-                registry.remove_if_socket_matches(&conversation_id, &stored_socket_path)
-                    || registry.remove(&conversation_id);
-            if removed {
-                if let Err(save_err) = registry.save() {
-                    return Err(MailboxCliError::io_failure(format!(
-                        "failed to update mailbox registry {}: {save_err}",
-                        registry_path.display()
-                    )));
+            if have_registry_entry {
+                // Treat unreachable sockets as stale: remove the entry to avoid replays
+                let removed =
+                    registry.remove_if_socket_matches(&conversation_id, &stored_socket_path)
+                        || registry.remove(&conversation_id);
+                if removed {
+                    if let Err(save_err) = registry.save() {
+                        return Err(MailboxCliError::io_failure(format!(
+                            "failed to update mailbox registry {}: {save_err}",
+                            registry_path.display()
+                        )));
+                    }
                 }
-            }
-            return Err(MailboxCliError::unknown_session(format!(
-                "Failed to reach socket {} for conversation {conversation_id}. \
+                return Err(MailboxCliError::unknown_session(format!(
+                    "Failed to reach socket {} for conversation {conversation_id}. \
 Run `codex_ctl mailbox sweep` and retry once the worker reconnects.",
+                    socket_path.display()
+                )));
+            }
+            // No registry entry: clearly report the missing/unreachable socket path
+            let cause = match err.kind() {
+                io::ErrorKind::NotFound => "not found",
+                io::ErrorKind::ConnectionRefused => "connection refused",
+                _ => "unreachable",
+            };
+            return Err(MailboxCliError::unknown_session(format!(
+                "Conversation {conversation_id} is not registered in namespace {namespace}, and the mailbox socket at {} is {cause}. \
+Ensure the worker is online; the socket appears at this path when connected.",
                 socket_path.display()
             )));
         }
@@ -786,13 +809,16 @@ Run `codex_ctl mailbox sweep` and retry once the worker reconnects.",
             return Err(MailboxCliError::queue_full(guidance));
         }
         if ack.err.as_deref() == Some("unknown_conversation") {
-            let removed = registry.remove_if_socket_matches(&conversation_id, &stored_socket_path);
-            if removed {
-                if let Err(save_err) = registry.save() {
-                    return Err(MailboxCliError::io_failure(format!(
-                        "failed to update mailbox registry {}: {save_err}",
-                        registry_path.display()
-                    )));
+            if have_registry_entry {
+                let removed =
+                    registry.remove_if_socket_matches(&conversation_id, &stored_socket_path);
+                if removed {
+                    if let Err(save_err) = registry.save() {
+                        return Err(MailboxCliError::io_failure(format!(
+                            "failed to update mailbox registry {}: {save_err}",
+                            registry_path.display()
+                        )));
+                    }
                 }
             }
             return Err(MailboxCliError::unknown_session(format!(
