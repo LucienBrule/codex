@@ -194,6 +194,7 @@ wildmatch = "2.5.0"
 wiremock = "0.6"
 zeroize = "1.8.1"
 bytecount = "0.6"
+fs2 = "0.4"
 
 [workspace.lints]
 rust = {}

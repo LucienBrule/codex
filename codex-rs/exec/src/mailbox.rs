@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::fs::File;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
@@ -45,6 +46,7 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
+use fs2::FileExt as _;
 
 mod mailbox_spool;
 use mailbox_spool::MailboxSpoolWriter;
@@ -720,6 +722,7 @@ impl MailboxRegistry {
 
     async fn upsert_entry(&self, entry: RegistryEntry) -> Result<()> {
         let _guard = self.lock.lock().await;
+        let _flock = acquire_registry_lock(&self.path)?;
         let mut registry = self.load().await?;
         registry.version = REGISTRY_VERSION;
         registry.entries.insert(entry.session_id.clone(), entry);
@@ -728,6 +731,7 @@ impl MailboxRegistry {
 
     async fn update_heartbeat(&self, session_id: &str, ts: OffsetDateTime) -> Result<()> {
         let _guard = self.lock.lock().await;
+        let _flock = acquire_registry_lock(&self.path)?;
         let mut registry = self.load().await?;
         if let Some(entry) = registry.entries.get_mut(session_id) {
             entry.last_heartbeat = ts;
@@ -738,6 +742,7 @@ impl MailboxRegistry {
 
     async fn remove_entry(&self, session_id: &str) -> Result<()> {
         let _guard = self.lock.lock().await;
+        let _flock = acquire_registry_lock(&self.path)?;
         let mut registry = self.load().await?;
         registry.entries.remove(session_id);
         self.write(&registry).await
@@ -745,6 +750,7 @@ impl MailboxRegistry {
 
     async fn sweep_stale_entries(&self, max_age: Duration) -> Result<()> {
         let _guard = self.lock.lock().await;
+        let _flock = acquire_registry_lock(&self.path)?;
         let mut registry = self.load().await?;
         let now = OffsetDateTime::now_utc();
         let mut removed = Vec::new();
@@ -890,8 +896,14 @@ fn write_registry(path: &Path, registry: &RegistryFile) -> Result<()> {
         .ok_or_else(|| anyhow!("registry path {} missing parent", path.display()))?;
     fs::create_dir_all(parent)
         .with_context(|| format!("failed to create registry parent {}", parent.display()))?;
-    let mut tmp_path = path.to_path_buf();
-    tmp_path.set_extension("tmp");
+    // Use a unique temporary path in the same directory to avoid
+    // cross-process clobbering when multiple writers are active.
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("registry path {} missing filename", path.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let tmp_path = parent.join(format!("{}.tmp-{}", file_name, Uuid::new_v4()));
     let serialized = serde_json::to_vec_pretty(registry)?;
     let mut file = fs::File::create(&tmp_path)
         .with_context(|| format!("failed to create temp registry {}", tmp_path.display()))?;
@@ -902,4 +914,85 @@ fn write_registry(path: &Path, registry: &RegistryFile) -> Result<()> {
     fs::rename(&tmp_path, path)
         .with_context(|| format!("failed to replace registry {}", path.display()))?;
     Ok(())
+}
+
+fn acquire_registry_lock(registry_path: &Path) -> Result<File> {
+    let file_name = registry_path
+        .file_name()
+        .ok_or_else(|| anyhow!("registry path {} missing filename", registry_path.display()))?
+        .to_string_lossy();
+    let lock_path = registry_path
+        .with_file_name(format!("{}.lock", file_name));
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create lock parent {}", parent.display()))?;
+    }
+    let file = File::options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open lock file {}", lock_path.display()))?;
+    file.lock_exclusive()
+        .with_context(|| format!("lock {}", lock_path.display()))?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn registry_concurrent_upserts_are_atomic_and_merged() -> Result<()> {
+        // Run several rounds to shake out flakes
+        for _ in 0..10 {
+            let dir = TempDir::new().context("create temp dir")?;
+            let path = dir.path().join("registry.json");
+            let r1 = MailboxRegistry::new(path.clone());
+            let r2 = MailboxRegistry::new(path.clone());
+
+            let now = OffsetDateTime::now_utc();
+            let e1 = RegistryEntry {
+                session_id: "s1".into(),
+                pid: std::process::id(),
+                socket_path: dir.path().join("s1.sock").to_string_lossy().into_owned(),
+                created_at: now,
+                last_heartbeat: now,
+                namespace: "test".into(),
+            };
+            let e2 = RegistryEntry {
+                session_id: "s2".into(),
+                pid: std::process::id(),
+                socket_path: dir.path().join("s2.sock").to_string_lossy().into_owned(),
+                created_at: now,
+                last_heartbeat: now,
+                namespace: "test".into(),
+            };
+
+            // Concurrent writers simulating separate processes (distinct MailboxRegistry instances)
+            let t1 = tokio::spawn(async move {
+                for _ in 0..5 {
+                    // small jitter
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    r1.upsert_entry(e1.clone()).await.unwrap();
+                }
+            });
+            let t2 = tokio::spawn(async move {
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    r2.upsert_entry(e2.clone()).await.unwrap();
+                }
+            });
+
+            let _ = tokio::join!(t1, t2);
+
+            // Validate both entries are present
+            let reg = MailboxRegistry::new(path);
+            let file = reg.load().await?;
+            assert!(file.entries.contains_key("s1"), "missing s1 entry");
+            assert!(file.entries.contains_key("s2"), "missing s2 entry");
+        }
+        Ok(())
+    }
 }
