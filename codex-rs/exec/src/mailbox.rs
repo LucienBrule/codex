@@ -995,4 +995,139 @@ mod tests {
         }
         Ok(())
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn registry_parallel_upserts_merge_no_loss_many_ids() -> Result<()> {
+        // Larger fan-out to simulate multiple runtimes racing to upsert.
+        let dir = TempDir::new().context("create temp dir")?;
+        let path = dir.path().join("registry.json");
+
+        // Configure a modest N to keep runtime well below the 60s guardrail.
+        const N: usize = 8;
+        // Repeat several rounds to make flakiness visible if atomicity/locking regresses.
+        for round in 0..25 {
+            let mut tasks = Vec::with_capacity(N);
+            for i in 0..N {
+                let reg = MailboxRegistry::new(path.clone());
+                let sid = format!("s{round}-{i}");
+                let sock = dir
+                    .path()
+                    .join(format!("{sid}.sock"))
+                    .to_string_lossy()
+                    .into_owned();
+                let now = OffsetDateTime::now_utc();
+                let entry = RegistryEntry {
+                    session_id: sid.clone(),
+                    pid: std::process::id(),
+                    socket_path: sock,
+                    created_at: now,
+                    last_heartbeat: now,
+                    namespace: "test".into(),
+                };
+                tasks.push(tokio::spawn(async move {
+                    // Minor jitter helps widen interleavings across threads.
+                    tokio::time::sleep(Duration::from_micros(250)).await;
+                    reg.upsert_entry(entry).await
+                }));
+            }
+            for t in tasks {
+                t.await.expect("join upsert task")?;
+            }
+
+            // Validate that every ID for this round is present.
+            let reg = MailboxRegistry::new(path.clone());
+            let file = reg.load().await?;
+            for i in 0..N {
+                let sid = format!("s{round}-{i}");
+                assert!(
+                    file.entries.contains_key(&sid),
+                    "missing entry for {sid} in round {round}"
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn registry_never_writes_partial_json_under_contention() -> Result<()> {
+        // Stress concurrent writers while a separate reader continuously parses the file.
+        // This would fail on a non-atomic write scheme or without a proper lock.
+        let dir = TempDir::new().context("create temp dir")?;
+        let path = dir.path().join("registry.json");
+
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let running = Arc::new(AtomicBool::new(true));
+
+        // Spawn continuous reader loop that attempts to parse JSON without taking locks.
+        let reader_running = running.clone();
+        let reader_path = path.clone();
+        let reader = tokio::spawn(async move {
+            let mut ok_reads: u64 = 0;
+            while reader_running.load(Ordering::Relaxed) {
+                // Either see fully old or fully new file contents; never partial.
+                if reader_path.exists() {
+                    let data = tokio::fs::read(&reader_path).await.unwrap_or_default();
+                    if !data.is_empty() {
+                        // serde_json parse must never fail if writers use atomic rename
+                        let _: RegistryFile = serde_json::from_slice(&data)
+                            .expect("registry.json should never be partially written");
+                        ok_reads += 1;
+                    }
+                }
+                // Back off a hair to allow interleavings
+                tokio::time::sleep(Duration::from_micros(200)).await;
+            }
+            ok_reads
+        });
+
+        // Writers: multiple registries concurrently upserting different entries many times.
+        let mut writers = Vec::new();
+        for w in 0..6 {
+            let reg = MailboxRegistry::new(path.clone());
+            writers.push(tokio::spawn(async move {
+                for i in 0..50u32 {
+                    let sid = format!("w{w}-{i}");
+                    let now = OffsetDateTime::now_utc();
+                    let entry = RegistryEntry {
+                        session_id: sid,
+                        pid: std::process::id(),
+                        socket_path: format!("/tmp/{w}-{i}.sock"),
+                        created_at: now,
+                        last_heartbeat: now,
+                        namespace: "stress".into(),
+                    };
+                    // Mix in small random-ish delay to desynchronize
+                    tokio::time::sleep(Duration::from_micros(100 + (w as u64 * 17))).await;
+                    reg.upsert_entry(entry).await.unwrap();
+                }
+                Result::<(), anyhow::Error>::Ok(())
+            }));
+        }
+
+        for w in writers {
+            w.await.expect("join writer")?;
+        }
+        running.store(false, Ordering::Relaxed);
+        let ok_reads = reader.await.expect("join reader");
+        assert!(ok_reads > 0, "reader should have observed at least one parse");
+
+        // Ensure there are no leftover temp files from incomplete renames.
+        for entry in std::fs::read_dir(dir.path())? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !name.contains("registry.json.tmp-"),
+                "found leftover temp file: {}",
+                name
+            );
+        }
+
+        // Finally, ensure the resulting registry is valid JSON and contains a decent number of entries.
+        let reg = MailboxRegistry::new(path);
+        let file = reg.load().await?;
+        assert!(file.entries.len() >= 6, "expected several merged entries");
+        Ok(())
+    }
 }
