@@ -26,7 +26,6 @@ use crate::model_provider_info::built_in_model_providers;
 use crate::openai_model_info::get_model_info;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
-use anyhow::Context;
 use codex_app_server_protocol::Tools;
 use codex_app_server_protocol::UserSavedConfig;
 use codex_protocol::config_types::ReasoningEffort;
@@ -49,6 +48,9 @@ use toml_edit::Array as TomlArray;
 use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
 use toml_edit::Table as TomlTable;
+use crate::config_edit::{
+    persist_overrides_and_clear_if_none, CONFIG_KEY_EFFORT, CONFIG_KEY_MODEL,
+};
 
 #[cfg(target_os = "windows")]
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
@@ -68,6 +70,26 @@ const DEFAULT_MAILBOX_LIVENESS_EMIT_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_MAILBOX_LIVENESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
 
 pub(crate) const CONFIG_TOML_FILE: &str = "config.toml";
+
+/// Ensure the Codex home directory exists.
+fn ensure_codex_home(codex_home: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(codex_home)
+}
+
+/// Atomically write `contents` to `config.toml` at `config_path`.
+fn write_config_toml_atomic(config_path: &Path, contents: &str) -> std::io::Result<()> {
+    let Some(parent) = config_path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path has no parent directory",
+        ));
+    };
+    ensure_codex_home(parent)?;
+    let tmp_file = NamedTempFile::new_in(parent)?;
+    std::fs::write(tmp_file.path(), contents)?;
+    tmp_file.persist(config_path).map_err(|err| err.error)?;
+    Ok(())
+}
 
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
@@ -240,6 +262,9 @@ pub struct Config {
 
     /// Settings controlling how mailbox heartbeats are promoted to liveness telemetry.
     pub mailbox_liveness: MailboxLivenessSettings,
+
+    /// Settings controlling background conversation summaries.
+    pub summaries: SummariesSettings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -257,6 +282,61 @@ impl Default for MailboxLivenessSettings {
             idle_after: DEFAULT_MAILBOX_LIVENESS_IDLE_AFTER,
             stalled_after: DEFAULT_MAILBOX_LIVENESS_STALLED_AFTER,
             emit_interval: DEFAULT_MAILBOX_LIVENESS_EMIT_INTERVAL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummariesSettings {
+    pub enabled: bool,
+    pub emit_interval: Duration,
+    pub initial_delay: Duration,
+    /// Optional base directory override for summary checkpoints.
+    pub base_dir: Option<PathBuf>,
+}
+
+const DEFAULT_SUMMARIES_EMIT_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_SUMMARIES_INITIAL_DELAY: Duration = Duration::from_secs(10);
+const MIN_SUMMARIES_EMIT_INTERVAL: Duration = Duration::from_millis(500);
+
+impl Default for SummariesSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            emit_interval: DEFAULT_SUMMARIES_EMIT_INTERVAL,
+            initial_delay: DEFAULT_SUMMARIES_INITIAL_DELAY,
+            base_dir: None,
+        }
+    }
+}
+
+impl SummariesSettings {
+    pub fn from_toml(toml: Option<SummariesToml>) -> Self {
+        let raw = toml.unwrap_or_default();
+        let mut s = Self::default();
+        if let Some(enabled) = raw.enabled {
+            s.enabled = enabled;
+        }
+        if let Some(secs) = raw.emit_interval_seconds {
+            if let Ok(d) = Duration::try_from_secs_f64(secs) {
+                s.emit_interval = d;
+            }
+        }
+        if let Some(secs) = raw.initial_delay_seconds {
+            if let Ok(d) = Duration::try_from_secs_f64(secs) {
+                s.initial_delay = d;
+            }
+        }
+        if let Some(base) = raw.base_dir {
+            s.base_dir = Some(base);
+        }
+        s.normalize();
+        s
+    }
+
+    fn normalize(&mut self) {
+        if self.emit_interval < MIN_SUMMARIES_EMIT_INTERVAL {
+            self.emit_interval = MIN_SUMMARIES_EMIT_INTERVAL;
         }
     }
 }
@@ -486,12 +566,7 @@ pub fn write_global_mcp_servers(
         }
     }
 
-    std::fs::create_dir_all(codex_home)?;
-    let tmp_file = NamedTempFile::new_in(codex_home)?;
-    std::fs::write(tmp_file.path(), doc.to_string())?;
-    tmp_file.persist(config_path).map_err(|err| err.error)?;
-
-    Ok(())
+    write_config_toml_atomic(&config_path, &doc.to_string())
 }
 
 fn set_project_trusted_inner(doc: &mut DocumentMut, project_path: &Path) -> anyhow::Result<()> {
@@ -571,17 +646,7 @@ pub fn set_project_trusted(codex_home: &Path, project_path: &Path) -> anyhow::Re
     };
 
     set_project_trusted_inner(&mut doc, project_path)?;
-
-    // ensure codex_home exists
-    std::fs::create_dir_all(codex_home)?;
-
-    // create a tmp_file
-    let tmp_file = NamedTempFile::new_in(codex_home)?;
-    std::fs::write(tmp_file.path(), doc.to_string())?;
-
-    // atomically move the tmp file into config.toml
-    tmp_file.persist(config_path)?;
-
+    write_config_toml_atomic(&config_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -599,12 +664,7 @@ pub fn set_windows_wsl_setup_acknowledged(
 
     doc["windows_wsl_setup_acknowledged"] = toml_edit::value(acknowledged);
 
-    std::fs::create_dir_all(codex_home)?;
-
-    let tmp_file = NamedTempFile::new_in(codex_home)?;
-    std::fs::write(tmp_file.path(), doc.to_string())?;
-    tmp_file.persist(config_path)?;
-
+    write_config_toml_atomic(&config_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -665,58 +725,18 @@ pub async fn persist_model_selection(
     model: &str,
     effort: Option<ReasoningEffort>,
 ) -> anyhow::Result<()> {
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let serialized = match tokio::fs::read_to_string(&config_path).await {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err.into()),
-    };
+    let effort_string = effort.as_ref().map(|e| e.to_string());
+    let effort_ref = effort_string.as_deref();
 
-    let mut doc = if serialized.is_empty() {
-        DocumentMut::new()
-    } else {
-        serialized.parse::<DocumentMut>()?
-    };
-
-    if let Some(profile_name) = active_profile {
-        let profile_table = ensure_profile_table(&mut doc, profile_name)?;
-        profile_table["model"] = toml_edit::value(model);
-        match effort {
-            Some(effort) => {
-                profile_table["model_reasoning_effort"] = toml_edit::value(effort.to_string());
-            }
-            None => {
-                profile_table.remove("model_reasoning_effort");
-            }
-        }
-    } else {
-        let table = doc.as_table_mut();
-        table["model"] = toml_edit::value(model);
-        match effort {
-            Some(effort) => {
-                table["model_reasoning_effort"] = toml_edit::value(effort.to_string());
-            }
-            None => {
-                table.remove("model_reasoning_effort");
-            }
-        }
-    }
-
-    // TODO(jif) refactor the home creation
-    tokio::fs::create_dir_all(codex_home)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create Codex home directory at {}",
-                codex_home.display()
-            )
-        })?;
-
-    tokio::fs::write(&config_path, doc.to_string())
-        .await
-        .with_context(|| format!("failed to persist config.toml at {}", config_path.display()))?;
-
-    Ok(())
+    persist_overrides_and_clear_if_none(
+        codex_home,
+        active_profile,
+        &[
+            (&[CONFIG_KEY_MODEL], Some(model)),
+            (&[CONFIG_KEY_EFFORT], effort_ref),
+        ],
+    )
+    .await
 }
 
 /// Apply a single dotted-path override onto a TOML value.
@@ -887,6 +907,10 @@ pub struct ConfigToml {
     /// OTEL configuration.
     pub otel: Option<crate::config_types::OtelConfigToml>,
 
+    /// Background conversation summaries configuration.
+    #[serde(default)]
+    pub summaries: Option<SummariesToml>,
+
     /// Tracks whether the Windows onboarding screen has been acknowledged.
     pub windows_wsl_setup_acknowledged: Option<bool>,
 }
@@ -948,6 +972,52 @@ pub struct MailboxLivenessToml {
     pub stalled_after_seconds: Option<f64>,
     #[serde(rename = "emit_interval_seconds")]
     pub emit_interval_seconds: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct SummariesToml {
+    pub enabled: Option<bool>,
+    /// Interval between background summary updates, in seconds.
+    #[serde(rename = "emit_interval_seconds")]
+    pub emit_interval_seconds: Option<f64>,
+    /// Initial startup delay before emitting the first summary, in seconds.
+    #[serde(rename = "initial_delay_seconds")]
+    pub initial_delay_seconds: Option<f64>,
+    /// Optional base directory for summary checkpoints.
+    pub base_dir: Option<PathBuf>,
+}
+
+/// Return a configured base directory for summaries if overridden by
+/// environment or config. Precedence:
+/// 1) CODEX_SUMMARIES_BASE_DIR env (non-empty)
+/// 2) CODEX_HOME/config.toml [summaries].base_dir
+pub fn summaries_base_dir_override() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("CODEX_SUMMARIES_BASE_DIR") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    let codex_home = match find_codex_home() {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    #[derive(Deserialize)]
+    struct PartialConfig { summaries: Option<SummariesToml> }
+
+    let cfg: PartialConfig = match toml::from_str(&contents) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    cfg.summaries.and_then(|s| s.base_dir)
 }
 
 impl ConfigToml {
@@ -1284,6 +1354,7 @@ impl Config {
                     exporter,
                 }
             },
+            summaries: SummariesSettings::from_toml(cfg.summaries.clone()),
             mailbox_liveness,
         };
         Ok(config)
@@ -2218,6 +2289,7 @@ model_verbosity = "high"
                 windows_wsl_setup_acknowledged: false,
                 disable_paste_burst: false,
                 tui_notifications: Default::default(),
+                summaries: SummariesSettings::default(),
                 otel: OtelConfig::default(),
             },
             o3_profile_config
@@ -2282,6 +2354,7 @@ model_verbosity = "high"
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
+            summaries: SummariesSettings::default(),
             otel: OtelConfig::default(),
         };
 
@@ -2361,6 +2434,7 @@ model_verbosity = "high"
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
+            summaries: SummariesSettings::default(),
             otel: OtelConfig::default(),
         };
 
@@ -2426,6 +2500,7 @@ model_verbosity = "high"
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
+            summaries: SummariesSettings::default(),
             otel: OtelConfig::default(),
         };
 

@@ -518,6 +518,12 @@ pub enum EventMsg {
     /// List of custom prompts available to the agent.
     ListCustomPromptsResponse(ListCustomPromptsResponseEvent),
 
+    /// Background conversation summary update produced by the SummariesService.
+    ///
+    /// This event is emitted opportunistically in the background to provide
+    /// a compact, human-readable running summary of the conversation.
+    SummaryUpdated(SummaryUpdatedEvent),
+
     PlanUpdate(UpdatePlanArgs),
 
     TurnAborted(TurnAbortedEvent),
@@ -1020,6 +1026,8 @@ pub enum RolloutItem {
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     EventMsg(EventMsg),
+    /// Durable background summary snapshot emitted by the summaries service.
+    SummarySnapshot(SummarySnapshotItem),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, TS)]
@@ -1048,6 +1056,23 @@ pub struct TurnContextItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffortConfig>,
     pub summary: ReasoningSummaryConfig,
+}
+
+/// A durable snapshot of the current conversation summary.
+///
+/// This is written to rollout files so that background summary updates can be
+/// recovered on resume and inspected offline without relying on transient UI
+/// state.
+#[derive(Serialize, Deserialize, Clone, Debug, TS)]
+pub struct SummarySnapshotItem {
+    /// Human‑readable running summary of the conversation so far.
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SummaryUpdatedEvent {
+    /// Human‑readable running summary of the conversation so far.
+    pub summary: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1513,5 +1538,33 @@ mod tests {
         assert!(decl.contains("transport_lag_ms"), "{decl}");
         assert!(decl.contains("queue_depth"), "{decl}");
         assert!(decl.contains("liveness"), "{decl}");
+    }
+
+    #[test]
+    fn rollout_summary_snapshot_roundtrip() -> Result<()> {
+        let item = RolloutItem::SummarySnapshot(SummarySnapshotItem {
+            summary: "hello world".to_string(),
+        });
+        let line = RolloutLine {
+            timestamp: "2025-10-17T00:00:00.000Z".to_string(),
+            item,
+        };
+
+        let json = serde_json::to_value(&line)?;
+        assert_eq!(
+            json,
+            json!({
+                "timestamp": "2025-10-17T00:00:00.000Z",
+                "type": "summary_snapshot",
+                "payload": {"summary": "hello world"}
+            })
+        );
+
+        let back: RolloutLine = serde_json::from_value(json)?;
+        match back.item {
+            RolloutItem::SummarySnapshot(s) => assert_eq!(s.summary, "hello world"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
+        Ok(())
     }
 }

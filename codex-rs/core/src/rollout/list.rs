@@ -383,6 +383,9 @@ async fn read_head_and_tail(
                     summary.saw_user_event = true;
                 }
             }
+            RolloutItem::SummarySnapshot(_) => {
+                // Not included in head; skip.
+            }
         }
     }
 

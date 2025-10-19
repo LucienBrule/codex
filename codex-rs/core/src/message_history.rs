@@ -16,9 +16,12 @@
 
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::Read;
 use std::io::Result;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -111,6 +114,7 @@ pub(crate) async fn append_entry(
     ensure_owner_only_permissions(&history_file).await?;
 
     // Perform a blocking write under an advisory write lock using std::fs.
+    let max_bytes_override = effective_max_bytes(config);
     tokio::task::spawn_blocking(move || -> Result<()> {
         // Retry a few times to avoid indefinite blocking when contended.
         for _ in 0..MAX_RETRIES {
@@ -119,6 +123,14 @@ pub(crate) async fn append_entry(
                     // While holding the exclusive lock, write the full line.
                     history_file.write_all(line.as_bytes())?;
                     history_file.flush()?;
+                    // Enforce max-bytes cap if configured. Done while the
+                    // exclusive lock is held to avoid races with other
+                    // appenders. Uses an atomic rewrite strategy.
+                    if let Some(max_bytes) = max_bytes_override {
+                        if max_bytes > 0 {
+                            enforce_max_bytes_locked(&mut history_file, &path, max_bytes)?;
+                        }
+                    }
                     return Ok(());
                 }
                 Err(std::fs::TryLockError::WouldBlock) => {
@@ -283,4 +295,202 @@ async fn ensure_owner_only_permissions(file: &File) -> Result<()> {
 async fn ensure_owner_only_permissions(_file: &File) -> Result<()> {
     // For now, on non-Unix, simply succeed.
     Ok(())
+}
+
+/// Determine the effective max-bytes cap for the history file.
+///
+/// Precedence:
+/// - Environment variable `CODEX_HISTORY_MAX_BYTES` (if set and > 0)
+/// - Config `history.max_bytes`
+fn effective_max_bytes(config: &Config) -> Option<usize> {
+    if let Ok(val) = std::env::var("CODEX_HISTORY_MAX_BYTES") {
+        if let Ok(parsed) = val.trim().parse::<usize>() {
+            if parsed > 0 {
+                return Some(parsed);
+            } else {
+                return None; // zero/negative disables enforcement via env
+            }
+        }
+    }
+    config.history.max_bytes
+}
+
+/// While holding the exclusive file lock, enforce that the history file does
+/// not exceed `max_bytes` by atomically rewriting it to keep only the trailing
+/// bytes on a line boundary. If the trailing window does not contain a full
+/// line (e.g., a single line longer than `max_bytes`), the file is truncated to
+/// empty to preserve the cap and JSONL validity.
+fn enforce_max_bytes_locked(file: &mut File, path: &Path, max_bytes: usize) -> Result<()> {
+    let meta = file.metadata()?;
+    let len = meta.len() as usize;
+    if len <= max_bytes {
+        return Ok(());
+    }
+
+    let start = len - max_bytes;
+    // Read the last `max_bytes` bytes into memory.
+    file.seek(SeekFrom::Start(start as u64))?;
+    let mut buf = vec![0u8; max_bytes];
+    let mut read_total = 0usize;
+    while read_total < max_bytes {
+        match file.read(&mut buf[read_total..]) {
+            Ok(0) => break,
+            Ok(n) => read_total += n,
+            Err(e) => return Err(std::io::Error::other(format!("read tail: {e}"))),
+        }
+    }
+    buf.truncate(read_total);
+
+    // Drop any partial first line so we start on a newline boundary.
+    let slice = if start > 0 {
+        match buf.iter().position(|&b| b == b'\n') {
+            Some(idx) => &buf[idx + 1..],
+            None => &[][..],
+        }
+    } else {
+        &buf[..]
+    };
+
+    // Write the trimmed tail to a temp file in the same directory and atomically
+    // replace the original file.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent.join(".history.jsonl.tmp");
+
+    // Create/truncate the tmp file with strict permissions.
+    #[allow(unused_mut)]
+    let mut tmp_opts = OpenOptions::new();
+    tmp_opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        tmp_opts.mode(0o600);
+    }
+    let mut tmp_file = tmp_opts.open(&tmp_path)?;
+    if !slice.is_empty() {
+        tmp_file.write_all(slice)?;
+        // Ensure the file ends with a newline so the last record is complete.
+        if !slice.ends_with(b"\n") {
+            tmp_file.write_all(b"\n")?;
+        }
+    } else {
+        // Keep empty file if no complete lines fit in the window.
+    }
+    tmp_file.flush()?;
+    tmp_file.sync_all().ok();
+
+    // Atomically replace the original file path. The existing open file handle
+    // (locked) continues to point at the old inode; subsequent opens will see
+    // the new file.
+    std::fs::rename(&tmp_path, path)?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod history_max_bytes {
+    use super::*;
+    use crate::config::{Config, ConfigOverrides, ConfigToml};
+    use crate::config_types::History;
+    use tempfile::TempDir;
+
+    fn build_config_with_home(codex_home: &Path, max_bytes: Option<usize>) -> Config {
+        let cfg = ConfigToml {
+            history: Some(History {
+                max_bytes,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.to_path_buf(),
+        )
+        .expect("load config")
+    }
+
+    fn history_path(config: &Config) -> PathBuf {
+        let mut p = config.codex_home.clone();
+        p.push(HISTORY_FILENAME);
+        p
+    }
+
+    #[tokio::test]
+    async fn enforces_cap_after_append() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let cap = 256usize;
+        let config = build_config_with_home(tmp.path(), Some(cap));
+        let id = ConversationId::new();
+
+        for i in 0..200u32 {
+            let msg = format!("line {:04}", i);
+            append_entry(&msg, &id, &config).await?;
+        }
+
+        let p = history_path(&config);
+        let size = tokio::fs::metadata(&p).await?.len() as usize;
+        assert!(size <= cap, "history size {} should be <= {}", size, cap);
+
+        // Ensure file starts at a JSONL boundary (first byte of file is '{' when non-empty)
+        if size > 0 {
+            let data = tokio::fs::read(&p).await?;
+            assert_eq!(data[0], b'{');
+            assert!(data.ends_with(b"\n"));
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trims_partial_prefix_and_preserves_lines() -> Result<()> {
+        let tmp = TempDir::new().unwrap();
+        let cap = 128usize;
+        let config = build_config_with_home(tmp.path(), Some(cap));
+        let p = history_path(&config);
+        tokio::fs::create_dir_all(p.parent().unwrap()).await?;
+
+        // Seed with a corrupted prefix that does not end on a newline plus some valid lines.
+        let mut seed = b"{not-json".to_vec();
+        for i in 0..50u32 {
+            let entry = HistoryEntry { session_id: "s".into(), ts: 1, text: format!("seed-{i}") };
+            let mut line = serde_json::to_vec(&entry).unwrap();
+            line.push(b'\n');
+            seed.extend_from_slice(&line);
+        }
+        tokio::fs::write(&p, &seed).await?;
+
+        // Append one more valid entry which will trigger trimming.
+        let id = ConversationId::new();
+        append_entry("final", &id, &config).await?;
+
+        let data = tokio::fs::read(&p).await?;
+        assert!(data.len() <= cap, "len {} > cap {}", data.len(), cap);
+        if !data.is_empty() {
+            assert_eq!(data[0], b'{', "file should start on JSONL boundary");
+            assert!(data.ends_with(b"\n"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn env_override_wins_over_config() -> Result<()> {
+        // Set a very small cap via env and a large cap via config.
+        unsafe { std::env::set_var("CODEX_HISTORY_MAX_BYTES", "64") };
+        let tmp = TempDir::new().unwrap();
+        let config = build_config_with_home(tmp.path(), Some(10_000));
+        let id = ConversationId::new();
+
+        for i in 0..200u32 {
+            let msg = format!("event {i} - {}", "x".repeat(32));
+            append_entry(&msg, &id, &config).await?;
+        }
+
+        let p = history_path(&config);
+        let size = tokio::fs::metadata(&p).await?.len() as usize;
+        assert!(size <= 64, "env override not enforced: size {}", size);
+
+        unsafe { std::env::remove_var("CODEX_HISTORY_MAX_BYTES") };
+        Ok(())
+    }
 }

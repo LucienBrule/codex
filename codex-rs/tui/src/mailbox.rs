@@ -615,11 +615,16 @@ mod tests {
             auto_ack_seconds: None,
             escalation_ticket: Some("SEC-12345".to_string()),
         };
+        // Adapt to protocol additions: provide optional fields to satisfy
+        // struct literal initialization across crate boundary.
         MailboxDeliveryEvent {
             message,
             state,
             queue_depth: Some(1),
             observed_at: Some(OffsetDateTime::now_utc()),
+            correlation_id: None,
+            ingress: None,
+            delivery_latency_ms: None,
         }
     }
 

@@ -9,9 +9,10 @@ pub(crate) fn is_persisted_response_item(item: &RolloutItem) -> bool {
         RolloutItem::ResponseItem(item) => should_persist_response_item(item),
         RolloutItem::EventMsg(ev) => should_persist_event_msg(ev),
         // Persist Codex executive markers so we can analyze flows (e.g., compaction, API turns).
-        RolloutItem::Compacted(_) | RolloutItem::TurnContext(_) | RolloutItem::SessionMeta(_) => {
-            true
-        }
+        RolloutItem::Compacted(_)
+        | RolloutItem::TurnContext(_)
+        | RolloutItem::SessionMeta(_)
+        | RolloutItem::SummarySnapshot(_) => true,
     }
 }
 
@@ -73,6 +74,7 @@ pub(crate) fn should_persist_event_msg(ev: &EventMsg) -> bool {
         | EventMsg::ShutdownComplete
         | EventMsg::Heartbeat(_)
         | EventMsg::ViewImageToolCall(_)
+        | EventMsg::SummaryUpdated(_)
         | EventMsg::ConversationPath(_) => false,
     }
 }

@@ -3,7 +3,9 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::time::Duration;
+use std::time::Instant;
 
 use codex_core::config::Config;
 use codex_core::config_types::Notifications;
@@ -320,6 +322,36 @@ impl ChatWidget {
         {
             self.add_boxed_history(cell);
         }
+    }
+
+    fn maybe_enqueue_summary_banner(&mut self) {
+        // Surface a concise, non-blocking banner when background summaries emit
+        // updates. Default behavior is quiet unless summaries are explicitly
+        // enabled in configuration.
+        if !self.config.summaries.enabled {
+            return;
+        }
+
+        // Throttle to avoid noisy updates if the emitter cadence is low.
+        const THROTTLE: Duration = Duration::from_secs(30);
+        static LAST_BANNER_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        let lock = LAST_BANNER_AT.get_or_init(|| Mutex::new(None));
+        let now = Instant::now();
+        if let Ok(mut last_opt) = lock.lock() {
+            if let Some(last) = *last_opt {
+                if now.duration_since(last) < THROTTLE {
+                    return;
+                }
+            }
+            *last_opt = Some(now);
+        }
+
+        // Prepend a single banner line ahead of any queued user messages.
+        let mut messages: Vec<String> = Vec::with_capacity(self.queued_user_messages.len() + 1);
+        messages.push("summary updated".to_string());
+        messages.extend(self.queued_user_messages.iter().map(|m| m.text.clone()));
+        self.bottom_pane.set_queued_user_messages(messages);
+        self.request_redraw();
     }
 
     fn set_status_header(&mut self, header: String) {
@@ -729,6 +761,11 @@ impl ChatWidget {
 
     fn on_background_event(&mut self, message: String) {
         debug!("BackgroundEvent: {message}");
+    }
+
+    fn on_summary_updated(&mut self) {
+        // Non-blocking: just push a banner into the status indicator with throttle.
+        self.maybe_enqueue_summary_banner();
     }
 
     fn on_stream_error(&mut self, message: String) {
@@ -1507,6 +1544,7 @@ impl ChatWidget {
 
         match msg {
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
+            EventMsg::SummaryUpdated(_) => self.on_summary_updated(),
             EventMsg::AgentMessage(AgentMessageEvent { message }) => self.on_agent_message(message),
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 self.on_agent_message_delta(delta)

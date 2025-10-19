@@ -6,6 +6,8 @@ use crate::unified_exec::UnifiedExecSessionManager;
 use crate::user_notification::UserNotifier;
 use tokio::sync::Mutex;
 
+use crate::summaries::SummariesService;
+
 pub(crate) struct SessionServices {
     pub(crate) mcp_connection_manager: McpConnectionManager,
     pub(crate) session_manager: ExecSessionManager,
@@ -15,4 +17,5 @@ pub(crate) struct SessionServices {
     pub(crate) user_shell: crate::shell::Shell,
     pub(crate) show_raw_agent_reasoning: bool,
     pub(crate) executor: Executor,
+    pub(crate) summaries: Mutex<Option<SummariesService>>,
 }

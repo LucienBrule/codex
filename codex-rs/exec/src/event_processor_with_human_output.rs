@@ -20,6 +20,7 @@ use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::StreamErrorEvent;
+use codex_core::protocol::SummaryUpdatedEvent;
 use codex_core::protocol::TaskCompleteEvent;
 use codex_core::protocol::TurnAbortReason;
 use codex_core::protocol::TurnDiffEvent;
@@ -74,6 +75,9 @@ pub(crate) struct EventProcessorWithHumanOutput {
     last_message_path: Option<PathBuf>,
     last_total_token_usage: Option<codex_core::protocol::TokenUsageInfo>,
     final_message: Option<String>,
+
+    // Optional: show concise notices for background summary updates.
+    show_summary_update_notice: bool,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -102,6 +106,7 @@ impl EventProcessorWithHumanOutput {
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
+                show_summary_update_notice: config.summaries.enabled,
             }
         } else {
             Self {
@@ -120,6 +125,7 @@ impl EventProcessorWithHumanOutput {
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
+                show_summary_update_notice: config.summaries.enabled,
             }
         }
     }
@@ -203,6 +209,11 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             EventMsg::StreamError(StreamErrorEvent { message }) => {
                 ts_msg!(self, "{}", message.style(self.dimmed));
+            }
+            EventMsg::SummaryUpdated(_) => {
+                if self.show_summary_update_notice {
+                    ts_msg!(self, "summary updated");
+                }
             }
             EventMsg::TaskStarted(_) => {
                 // Ignore.

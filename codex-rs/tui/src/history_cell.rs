@@ -36,6 +36,7 @@ use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use image::DynamicImage;
 use image::ImageReader;
+use image::ImageFormat;
 use mcp_types::EmbeddedResourceResource;
 use mcp_types::ResourceLink;
 use ratatui::prelude::*;
@@ -932,14 +933,22 @@ pub(crate) fn new_web_search_call(query: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
-/// If the first content is an image, return a new cell with the image.
-/// TODO(rgwood-dd): Handle images properly even if they're not the first result.
+/// If any content block is an image, return a new cell with the first image found.
+///
+/// Previously this only handled images when they were the first content block,
+/// which meant mixed‑content tool results like `[Text, Image]` did not surface
+/// an image cell. Scan all blocks to find the first `ImageContent` so images
+/// render even when not first.
 fn try_new_completed_mcp_tool_call_with_image_output(
     result: &Result<mcp_types::CallToolResult, String>,
 ) -> Option<CompletedMcpToolCallWithImageOutput> {
     match result {
         Ok(mcp_types::CallToolResult { content, .. }) => {
-            if let Some(mcp_types::ContentBlock::ImageContent(image)) = content.first() {
+            // Find the first image anywhere in the returned content blocks.
+            if let Some(image) = content.iter().find_map(|block| match block {
+                mcp_types::ContentBlock::ImageContent(img) => Some(img),
+                _ => None,
+            }) {
                 let raw_data = match base64::engine::general_purpose::STANDARD.decode(&image.data) {
                     Ok(data) => data,
                     Err(e) => {
@@ -947,11 +956,22 @@ fn try_new_completed_mcp_tool_call_with_image_output(
                         return None;
                     }
                 };
-                let reader = match ImageReader::new(Cursor::new(raw_data)).with_guessed_format() {
-                    Ok(reader) => reader,
-                    Err(e) => {
-                        error!("Failed to guess image format: {e}");
-                        return None;
+                // Prefer the declared MIME type when available; fall back to format guessing.
+                let reader = if image.mime_type.eq_ignore_ascii_case("image/png") {
+                    ImageReader::with_format(Cursor::new(&raw_data), ImageFormat::Png)
+                } else if image
+                    .mime_type
+                    .eq_ignore_ascii_case("image/jpeg")
+                    || image.mime_type.eq_ignore_ascii_case("image/jpg")
+                {
+                    ImageReader::with_format(Cursor::new(&raw_data), ImageFormat::Jpeg)
+                } else {
+                    match ImageReader::new(Cursor::new(&raw_data)).with_guessed_format() {
+                        Ok(reader) => reader,
+                        Err(e) => {
+                            error!("Failed to guess image format: {e}");
+                            return None;
+                        }
                     }
                 };
 
@@ -971,6 +991,8 @@ fn try_new_completed_mcp_tool_call_with_image_output(
         _ => None,
     }
 }
+
+// tests live below in the main tests module
 
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn new_warning_event(message: String) -> PlainHistoryCell {
@@ -1396,6 +1418,7 @@ mod tests {
     use mcp_types::CallToolResult;
     use mcp_types::ContentBlock;
     use mcp_types::TextContent;
+    use mcp_types::ImageContent;
 
     fn test_config() -> Config {
         Config::load_from_base_config_with_overrides(
@@ -1974,6 +1997,70 @@ mod tests {
         let lines = cell.display_lines(28);
         let rendered = render_lines(&lines).join("\n");
         insta::assert_snapshot!(rendered);
+    }
+
+    // --- Image handling tests ---
+    fn make_png_base64() -> String {
+        use image::Rgba;
+        use image::RgbaImage;
+        let img: RgbaImage = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 0]));
+        let dyn_img = image::DynamicImage::ImageRgba8(img);
+        let mut bytes = Vec::new();
+        {
+            let mut writer = std::io::Cursor::new(&mut bytes);
+            dyn_img
+                .write_to(&mut writer, image::ImageFormat::Png)
+                .expect("encode png");
+        }
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn image_not_first_block_emits_image_cell() {
+        // Sanity: verify the embedded PNG decodes and the image crate can read it.
+        let b64 = make_png_base64();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .expect("base64 decode");
+        let _img = image::load_from_memory_with_format(&raw, image::ImageFormat::Png)
+            .expect("png decode");
+
+        let result = Ok(CallToolResult {
+            content: vec![
+                ContentBlock::TextContent(TextContent {
+                    annotations: None,
+                    text: "hello".to_string(),
+                    r#type: "text".to_string(),
+                }),
+                ContentBlock::ImageContent(ImageContent {
+                    annotations: None,
+                    data: b64,
+                    mime_type: "image/png".to_string(),
+                    r#type: "image".to_string(),
+                }),
+            ],
+            is_error: None,
+            structured_content: None,
+        });
+
+        let cell = super::try_new_completed_mcp_tool_call_with_image_output(&result);
+        assert!(cell.is_some(), "expected image cell when image is not first block");
+    }
+
+    #[test]
+    fn text_only_result_emits_no_image_cell() {
+        let result = Ok(CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent {
+                annotations: None,
+                text: "only text".to_string(),
+                r#type: "text".to_string(),
+            })],
+            is_error: None,
+            structured_content: None,
+        });
+
+        let cell = super::try_new_completed_mcp_tool_call_with_image_output(&result);
+        assert!(cell.is_none(), "no image cell expected for text-only result");
     }
 
     #[test]

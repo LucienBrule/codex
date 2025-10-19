@@ -117,6 +117,9 @@ use crate::shell;
 use crate::state::ActiveTurn;
 use crate::state::SessionServices;
 use crate::tasks::CompactTask;
+use crate::summaries;
+use crate::summaries::build_prompt as build_sliding_window_prompt;
+use crate::summaries::SummariesState as SlidingSummariesState;
 use crate::tasks::RegularTask;
 use crate::tasks::ReviewTask;
 use crate::telemetry::MailboxDeliveryTelemetry;
@@ -527,6 +530,7 @@ impl Session {
                 turn_context.cwd.clone(),
                 config.codex_linux_sandbox_exe.clone(),
             )),
+            summaries: Mutex::new(None),
         };
 
         let mailbox_liveness = if config.mailbox_liveness.enabled {
@@ -535,6 +539,15 @@ impl Session {
             )))
         } else {
             None
+        };
+
+        // Read any existing summary checkpoint for this conversation to seed the summaries state.
+        let initial_summary = match summaries::read_summary_checkpoint(&conversation_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("failed to read summary checkpoint: {e}");
+                None
+            }
         };
 
         let sess = Arc::new(Session {
@@ -550,6 +563,16 @@ impl Session {
             mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
             mailbox_liveness,
         });
+
+        // Spawn background continuous summaries if enabled and install the handle.
+        if let Some(svc) = crate::summaries::SummariesService::spawn(
+            Arc::clone(&sess),
+            config.summaries.clone(),
+            initial_summary,
+        ) {
+            let mut slot = sess.services.summaries.lock().await;
+            *slot = Some(svc);
+        }
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
         // If resuming, include converted initial messages in the payload so UIs can render them immediately.
@@ -625,7 +648,26 @@ impl Session {
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, event: Event) {
         // Persist the event into rollout (recorder filters as needed)
-        let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+        let mut rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+
+        // For background summary updates, also persist a durable snapshot and write a checkpoint.
+        if let EventMsg::SummaryUpdated(crate::protocol::SummaryUpdatedEvent { summary }) = &event.msg {
+            rollout_items.push(RolloutItem::SummarySnapshot(
+                crate::protocol::SummarySnapshotItem {
+                    summary: summary.clone(),
+                },
+            ));
+
+            // Fire-and-forget checkpoint write to avoid blocking the event loop.
+            let cid = self.conversation_id;
+            let summary_for_write = summary.clone();
+            tokio::spawn(async move {
+                if let Err(e) = summaries::write_summary_checkpoint(&cid, &summary_for_write).await {
+                    tracing::warn!("failed to write summary checkpoint: {e}");
+                }
+            });
+        }
+
         self.persist_rollout_items(&rollout_items).await;
         if let Err(e) = self.tx_event.send(event).await {
             error!("failed to send tool call event: {e}");
@@ -2074,8 +2116,32 @@ pub(crate) async fn run_task(
             }
             review_thread_history.clone()
         } else {
+            // Preserve existing behavior: record pending items to history and rollout.
             sess.record_conversation_items(&pending_input).await;
-            sess.turn_input_with_history(pending_input).await
+
+            // Route prompt assembly through the sliding window prompt builder.
+            // If summaries are unavailable, the builder returns `history + pending` unchanged.
+            let history = sess.history_snapshot().await;
+
+            // Snapshot summaries state if the background service is enabled.
+            let summaries_state_snapshot: SlidingSummariesState = {
+                let svc_opt = {
+                    let guard = sess.services.summaries.lock().await;
+                    guard.as_ref().map(|svc| svc.state_arc())
+                };
+                if let Some(state_arc) = svc_opt {
+                    let s = state_arc.lock().await;
+                    s.clone()
+                } else {
+                    SlidingSummariesState::default()
+                }
+            };
+
+            // Budget is currently measured in item count; pass the full length
+            // so default behavior (no trimming) is preserved unless a future
+            // change opts into a smaller budget.
+            let budget = history.len().saturating_add(pending_input.len());
+            build_sliding_window_prompt(&summaries_state_snapshot, &history, &pending_input, budget)
         };
 
         let turn_input_messages: Vec<String> = turn_input
@@ -3297,6 +3363,7 @@ pub(crate) mod tests {
                 turn_context.cwd.clone(),
                 None,
             )),
+            summaries: Mutex::new(None),
         };
         let (mailbox_tx, _) = mailbox_channel(1);
         let session = Session {
@@ -3376,6 +3443,7 @@ pub(crate) mod tests {
                 config.cwd.clone(),
                 None,
             )),
+            summaries: Mutex::new(None),
         };
         let (mailbox_tx, _) = mailbox_channel(1);
         let session = Arc::new(Session {
