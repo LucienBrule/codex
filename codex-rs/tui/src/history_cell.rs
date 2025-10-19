@@ -1729,6 +1729,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         // Mark call complete so markers are ✓
         cell.complete_call(
@@ -1760,6 +1761,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         // Call 1: Search only
         cell.complete_call(
@@ -1842,6 +1844,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             "c1",
@@ -1870,6 +1873,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         // Mark call complete so it renders as "Ran"
         cell.complete_call(
@@ -1900,6 +1904,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             &call_id,
@@ -1928,6 +1933,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             &call_id,
@@ -1955,6 +1961,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             &call_id,
@@ -1983,6 +1990,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             &call_id,
@@ -2075,6 +2083,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         let stderr: String = (1..=10)
             .map(|n| n.to_string())
@@ -2121,6 +2130,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
 
         let stderr = "error: first line on stderr\nerror: second line on stderr".to_string();

@@ -14,9 +14,11 @@ use crate::wrapping::word_wrap_line;
 use crate::wrapping::word_wrap_lines;
 use codex_ansi_escape::ansi_escape_line;
 use codex_common::elapsed::format_duration;
+use codex_core::protocol::ExecOutputStream;
 use codex_protocol::parse_command::ParsedCommand;
 use itertools::Itertools;
 use ratatui::prelude::*;
+use ratatui::style::Color;
 use ratatui::style::Modifier;
 use ratatui::style::Stylize;
 use ratatui::widgets::Paragraph;
@@ -24,6 +26,9 @@ use ratatui::widgets::WidgetRef;
 use ratatui::widgets::Wrap;
 use textwrap::WordSplitter;
 use unicode_width::UnicodeWidthStr;
+
+use super::model::LiveExecOutputSnapshotLine;
+
 
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 5;
 
@@ -45,6 +50,7 @@ pub(crate) fn new_active_exec_command(
         output: None,
         start_time: Some(Instant::now()),
         duration: None,
+        live_output: Default::default(),
     })
 }
 
@@ -408,6 +414,66 @@ impl ExecCell {
                         Span::from(layout.output_block.subsequent_prefix),
                     ));
                 }
+            }
+        } else {
+            let snapshot = call.live_output.snapshot();
+            let mut raw_output_lines: Vec<Line<'static>> = Vec::new();
+
+            if snapshot.dropped_lines > 0 {
+                raw_output_lines.push(
+                    format!("… +{} earlier lines", snapshot.dropped_lines)
+                        .dim()
+                        .into(),
+                );
+            }
+
+            if snapshot.lines.is_empty() {
+                raw_output_lines.push("(waiting for output…)".dim().into());
+            } else {
+                for LiveExecOutputSnapshotLine {
+                    stream,
+                    content,
+                    is_partial,
+                } in snapshot.lines
+                {
+                    let mut line = if content.is_empty() {
+                        Line::from("")
+                    } else {
+                        ansi_escape_line(&content)
+                    };
+
+                    if stream == ExecOutputStream::Stderr {
+                        for span in line.spans.iter_mut() {
+                            span.style = span.style.fg(Color::Red);
+                        }
+                    }
+
+                    if is_partial {
+                        line.spans.push(" ▹".dim());
+                    }
+
+                    raw_output_lines.push(line);
+                }
+            }
+
+            let trimmed_output = Self::truncate_lines_middle(&raw_output_lines, layout.output_max_lines);
+
+            let mut wrapped_output: Vec<Line<'static>> = Vec::new();
+            let output_wrap_width = layout.output_block.wrap_width(width);
+            let output_opts = RtOptions::new(output_wrap_width).word_splitter(WordSplitter::NoHyphenation);
+            for line in trimmed_output {
+                push_owned_lines(
+                    &word_wrap_line(&line, output_opts.clone()),
+                    &mut wrapped_output,
+                );
+            }
+
+            if !wrapped_output.is_empty() {
+                lines.extend(prefix_lines(
+                    wrapped_output,
+                    Span::from(layout.output_block.initial_prefix).dim(),
+                    Span::from(layout.output_block.subsequent_prefix),
+                ));
             }
         }
 

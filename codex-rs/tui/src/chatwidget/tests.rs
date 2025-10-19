@@ -21,6 +21,8 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecApprovalRequestEvent;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
+use codex_core::protocol::ExecCommandOutputDeltaEvent;
+use codex_core::protocol::ExecOutputStream;
 use codex_core::protocol::ExitedReviewModeEvent;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::InputMessageKind;
@@ -275,6 +277,7 @@ fn make_chatwidget_manual() -> (
         rate_limit_warnings: RateLimitWarningState::default(),
         stream_controller: None,
         running_commands: HashMap::new(),
+        pending_exec_output: HashMap::new(),
         task_complete_pending: false,
         interrupts: InterruptManager::new(),
         reasoning_buffer: String::new(),
@@ -541,6 +544,17 @@ fn end_exec(chat: &mut ChatWidget, call_id: &str, stdout: &str, stderr: &str, ex
             exit_code,
             duration: std::time::Duration::from_millis(5),
             formatted_output: aggregated,
+        }),
+    });
+}
+
+fn stream_exec(chat: &mut ChatWidget, call_id: &str, stream: ExecOutputStream, chunk: &[u8]) {
+    chat.handle_codex_event(Event {
+        id: call_id.to_string(),
+        msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+            call_id: call_id.to_string(),
+            stream,
+            chunk: chunk.to_vec(),
         }),
     });
 }
@@ -1128,6 +1142,132 @@ fn exec_history_extends_previous_when_consecutive() {
     begin_exec(&mut chat, "call-cat-bar", "cat bar.txt");
     end_exec(&mut chat, "call-cat-bar", "hello from bar", "", 0);
     assert_snapshot!("exploring_step6_finish_cat_bar", active_blob(&chat));
+}
+
+#[test]
+fn exec_output_delta_streams_into_active_cell() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    begin_exec(&mut chat, "call-stream", "printf 'hello'");
+    stream_exec(
+        &mut chat,
+        "call-stream",
+        ExecOutputStream::Stdout,
+        b"hello",
+    );
+
+    let blob = active_blob(&chat);
+    assert!(blob.contains("hello"), "expected streamed text, got {blob}", blob = blob);
+    assert!(
+        blob.contains("▹"),
+        "expected partial marker while awaiting newline, got {blob}"
+        ,
+        blob = blob
+    );
+
+    stream_exec(
+        &mut chat,
+        "call-stream",
+        ExecOutputStream::Stdout,
+        b" world\nsecond\n",
+    );
+
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("hello world"),
+        "expected wrapped output, got {blob}",
+        blob = blob
+    );
+    assert!(
+        blob.contains("second"),
+        "expected tail lines, got {blob}",
+        blob = blob
+    );
+    assert!(
+        !blob.contains("▹"),
+        "partial marker should clear once newline received, blob: {blob}"
+        ,
+        blob = blob
+    );
+}
+
+#[test]
+fn exec_output_delta_handles_split_multibyte_utf8() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    begin_exec(&mut chat, "call-utf8", "printf 'hello €'");
+
+    stream_exec(
+        &mut chat,
+        "call-utf8",
+        ExecOutputStream::Stdout,
+        b"hello ",
+    );
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("hello "),
+        "expected base text after first chunk, blob: {blob}",
+        blob = blob
+    );
+    assert!(
+        !blob.contains('\u{FFFD}'),
+        "replacement char should not appear after ASCII chunk, blob: {blob}",
+        blob = blob
+    );
+
+    stream_exec(
+        &mut chat,
+        "call-utf8",
+        ExecOutputStream::Stdout,
+        &[0xE2],
+    );
+    let blob = active_blob(&chat);
+    assert!(
+        !blob.contains('\u{FFFD}'),
+        "partial multibyte chunk should not emit replacement char, blob: {blob}",
+        blob = blob
+    );
+
+    stream_exec(
+        &mut chat,
+        "call-utf8",
+        ExecOutputStream::Stdout,
+        &[0x82, 0xAC, b'\n'],
+    );
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("hello €"),
+        "expected completed multibyte character, blob: {blob}",
+        blob = blob
+    );
+    assert!(
+        !blob.contains('\u{FFFD}'),
+        "UTF-8 boundary handling should avoid replacement chars, blob: {blob}",
+        blob = blob
+    );
+}
+
+#[test]
+fn exec_output_delta_buffers_until_begin() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    stream_exec(
+        &mut chat,
+        "call-buffer",
+        ExecOutputStream::Stdout,
+        b"buffered line\n",
+    );
+
+    assert!(chat.active_cell.is_none(), "delta should not draw before begin");
+
+    begin_exec(&mut chat, "call-buffer", "echo buffered");
+
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("buffered line"),
+        "pending delta should replay after begin, blob: {blob}",
+        blob = blob
+    );
 }
 
 #[test]

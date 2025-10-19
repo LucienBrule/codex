@@ -25,6 +25,7 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecApprovalRequestEvent;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
+use codex_core::protocol::ExecCommandOutputDeltaEvent;
 use codex_core::protocol::ExitedReviewModeEvent;
 use codex_core::protocol::HeartbeatEvent;
 use codex_core::protocol::InputItem;
@@ -248,6 +249,7 @@ pub(crate) struct ChatWidget {
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
     running_commands: HashMap<String, RunningCommand>,
+    pending_exec_output: HashMap<String, Vec<ExecCommandOutputDeltaEvent>>,
     task_complete_pending: bool,
     // Queue of interruptive UI events deferred during an active write cycle
     interrupts: InterruptManager,
@@ -540,6 +542,7 @@ impl ChatWidget {
         self.bottom_pane.update_liveness_indicator(None);
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
+        self.pending_exec_output.clear();
         self.request_redraw();
 
         // If there is a queued user message, send exactly one now to begin the next turn.
@@ -602,6 +605,7 @@ impl ChatWidget {
         // Reset running state and clear streaming buffers.
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
+        self.pending_exec_output.clear();
         self.stream_controller = None;
     }
 
@@ -680,11 +684,58 @@ impl ChatWidget {
         self.defer_or_handle(|q| q.push_exec_begin(ev), |s| s.handle_exec_begin_now(ev2));
     }
 
-    fn on_exec_command_output_delta(
-        &mut self,
-        _ev: codex_core::protocol::ExecCommandOutputDeltaEvent,
-    ) {
-        // TODO: Handle streaming exec output if/when implemented
+    fn on_exec_command_output_delta(&mut self, ev: ExecCommandOutputDeltaEvent) {
+        let call_id = ev.call_id.clone();
+        if !self.apply_exec_output_delta(&ev) {
+            self.pending_exec_output
+                .entry(call_id)
+                .or_default()
+                .push(ev);
+        }
+    }
+
+    fn apply_exec_output_delta(&mut self, ev: &ExecCommandOutputDeltaEvent) -> bool {
+        if ev.chunk.is_empty() {
+            return true;
+        }
+
+        let Some(cell) = self.exec_cell_for_call_mut(&ev.call_id) else {
+            return false;
+        };
+
+        if cell.append_live_output(&ev.call_id, ev.stream.clone(), &ev.chunk) {
+            self.request_redraw();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn exec_cell_for_call_mut(&mut self, call_id: &str) -> Option<&mut ExecCell> {
+        let has_call = self
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .map(|exec| exec.iter_calls().any(|c| c.call_id == call_id))
+            .unwrap_or(false);
+
+        if !has_call {
+            let (command, parsed) = match self.running_commands.get(call_id) {
+                Some(running) => (running.command.clone(), running.parsed_cmd.clone()),
+                None => return None,
+            };
+
+            self.flush_active_cell();
+            self.active_cell = Some(Box::new(new_active_exec_command(
+                call_id.to_string(),
+                command,
+                parsed,
+            )));
+        }
+
+        self.active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
     }
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
@@ -850,6 +901,7 @@ impl ChatWidget {
 
     pub(crate) fn handle_exec_end_now(&mut self, ev: ExecCommandEndEvent) {
         let running = self.running_commands.remove(&ev.call_id);
+        self.pending_exec_output.remove(&ev.call_id);
         let (command, parsed) = match running {
             Some(rc) => (rc.command, rc.parsed_cmd),
             None => (vec![ev.call_id.clone()], Vec::new()),
@@ -967,6 +1019,12 @@ impl ChatWidget {
             )));
         }
 
+        if let Some(pending) = self.pending_exec_output.remove(&ev.call_id) {
+            for delta in pending {
+                let _ = self.apply_exec_output_delta(&delta);
+            }
+        }
+
         self.request_redraw();
     }
 
@@ -1074,6 +1132,7 @@ impl ChatWidget {
             rate_limit_warnings: RateLimitWarningState::default(),
             stream_controller: None,
             running_commands: HashMap::new(),
+            pending_exec_output: HashMap::new(),
             task_complete_pending: false,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
@@ -1142,6 +1201,7 @@ impl ChatWidget {
             rate_limit_warnings: RateLimitWarningState::default(),
             stream_controller: None,
             running_commands: HashMap::new(),
+            pending_exec_output: HashMap::new(),
             task_complete_pending: false,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
