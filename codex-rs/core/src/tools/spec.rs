@@ -675,6 +675,48 @@ fn create_list_dir_tool() -> ToolSpec {
         },
     })
 }
+
+fn create_wait_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "type".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Predicate kind to evaluate. Supported values: timer, filesystem, shell."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "predicate".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(true.into()),
+        },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum overall wait duration in milliseconds (default 300_000, max 3_600_000)."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "codex.wait".to_string(),
+        description: "Waits for a predicate to be satisfied without blocking the turn. Supports timer, filesystem, and shell predicates."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["type".to_string(), "predicate".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
 /// TODO(dylan): deprecate once we get rid of json tool
 #[derive(Serialize, Deserialize)]
 pub(crate) struct ApplyPatchToolArgs {
@@ -919,6 +961,7 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::TestSyncHandler;
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::handlers::ViewImageHandler;
+    use crate::tools::handlers::WaitHandler;
     use std::sync::Arc;
 
     let mut builder = ToolRegistryBuilder::new();
@@ -932,6 +975,7 @@ pub(crate) fn build_specs(
     let mcp_handler = Arc::new(McpHandler);
     let mailbox_send_handler = Arc::new(MailboxSendHandler);
     let mailbox_read_handler = Arc::new(crate::tools::handlers::MailboxReadHandler);
+    let wait_handler = Arc::new(WaitHandler);
 
     if config.experimental_unified_exec_tool {
         builder.push_spec(create_unified_exec_tool());
@@ -976,6 +1020,9 @@ pub(crate) fn build_specs(
     // New mailbox_read tool
     builder.push_spec(create_mailbox_read_tool());
     builder.register_handler(MAILBOX_READ_TOOL_NAME, mailbox_read_handler);
+
+    builder.push_spec_with_parallel_support(create_wait_tool(), true);
+    builder.register_handler("codex.wait", wait_handler);
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {
@@ -1127,6 +1174,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "web_search",
                 "view_image",
             ],
@@ -1155,6 +1203,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "web_search",
                 "view_image",
             ],
@@ -1274,6 +1323,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "web_search",
                 "view_image",
                 "test_server__do_something_cool",
@@ -1395,6 +1445,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "view_image",
                 "test_server__cool",
                 "test_server__do",
@@ -1448,6 +1499,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1518,6 +1570,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1585,6 +1638,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1655,6 +1709,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1819,6 +1874,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
+                "codex.wait",
                 "apply_patch",
                 "web_search",
                 "view_image",

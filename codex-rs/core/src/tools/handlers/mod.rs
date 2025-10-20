@@ -11,6 +11,7 @@ mod shell;
 mod test_sync;
 mod unified_exec;
 mod view_image;
+mod wait;
 
 pub use plan::PLAN_TOOL;
 
@@ -29,3 +30,4 @@ pub use shell::ShellHandler;
 pub use test_sync::TestSyncHandler;
 pub use unified_exec::UnifiedExecHandler;
 pub use view_image::ViewImageHandler;
+pub use wait::WaitHandler;

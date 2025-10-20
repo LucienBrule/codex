@@ -106,3 +106,6 @@ wiremock = { workspace = true }
 
 [package.metadata.cargo-shear]
 ignored = ["openssl-sys"]
+
+[target.'cfg(unix)'.dependencies]
+notify = { version = "6.1", default-features = true }
