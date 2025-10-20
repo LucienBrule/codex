@@ -18,7 +18,7 @@ use async_channel::Receiver;
 use async_channel::Sender;
 use codex_apply_patch::ApplyPatchAction;
 use codex_protocol::ConversationId;
-use codex_protocol::mailbox::MailboxMessage;
+use codex_protocol::mailbox::{MailboxContentType, MailboxMessage, MailboxSenderRole};
 use codex_protocol::protocol::ConversationPathResponseEvent;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::HeartbeatEvent;
@@ -40,6 +40,7 @@ use thiserror::Error;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
@@ -67,13 +68,15 @@ use crate::exec_command::WriteStdinParams;
 use crate::executor::Executor;
 use crate::executor::ExecutorConfig;
 use crate::executor::normalize_exec_result;
-use crate::mailbox::MAILBOX_QUEUE_CAPACITY;
+use crate::mailbox::apply_mailbox_defaults;
+use crate::mailbox::mailbox_channel;
+use crate::mailbox::mailbox_feature_enabled;
+use crate::mailbox::validate_mailbox_message;
 use crate::mailbox::MailboxEnvelope;
 use crate::mailbox::MailboxReceiver;
 use crate::mailbox::MailboxSender;
 use crate::mailbox::TryEnqueueError;
-use crate::mailbox::mailbox_channel;
-use crate::mailbox::mailbox_feature_enabled;
+use crate::mailbox::MAILBOX_QUEUE_CAPACITY;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_family::find_family_for_model;
@@ -128,6 +131,11 @@ use crate::telemetry::MailboxLivenessTelemetry;
 use crate::telemetry::MailboxTelemetryLabels;
 use crate::tools::ToolRouter;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::WaitTriggerCancelReason;
+use crate::tools::context::WaitTriggerCompletion;
+use crate::tools::context::WaitTriggerError;
+use crate::tools::context::WaitTriggerHandle;
+use crate::tools::context::WaitTriggerSpec;
 use crate::tools::format_exec_output_str;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
@@ -169,6 +177,7 @@ pub struct CodexSpawnOk {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
+pub(crate) const MAX_WAIT_TRIGGERS_PER_TURN: usize = 16;
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -285,6 +294,11 @@ pub(crate) struct Session {
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
     mailbox_tx: MailboxSender,
+    #[cfg(test)]
+    wait_trigger_mailbox_events: Mutex<Vec<MailboxDeliveryEvent>>,
+    #[cfg(test)]
+    wait_trigger_mailbox_failures: Mutex<Vec<MailboxEnqueueError>>,
+    wait_triggers: Mutex<HashMap<Uuid, WaitTriggerState>>,
     mailbox_waiters: Mutex<HashMap<Uuid, Vec<oneshot::Sender<MailboxDeliveryEvent>>>>,
     session_source: SessionSource,
     mailbox_metrics: Mutex<MailboxDeliveryTelemetry>,
@@ -299,6 +313,119 @@ pub enum MailboxEnqueueError {
     Full { capacity: usize },
     #[error("mailbox dispatcher unavailable")]
     Closed,
+}
+
+struct WaitTriggerState {
+    sub_id: String,
+    call_id: String,
+    predicate_id: String,
+    wake_deadline: Option<OffsetDateTime>,
+    request_id: String,
+    created_at: OffsetDateTime,
+    fire_quota: u32,
+    fires: u32,
+    abort_handle: AbortHandle,
+}
+
+impl WaitTriggerState {
+    fn new(
+        sub_id: String,
+        call_id: String,
+        predicate_id: String,
+        wake_deadline: Option<OffsetDateTime>,
+        request_id: String,
+        fire_quota: u32,
+        abort_handle: AbortHandle,
+    ) -> Self {
+        Self {
+            sub_id,
+            call_id,
+            predicate_id,
+            wake_deadline,
+            request_id,
+            created_at: OffsetDateTime::now_utc(),
+            fire_quota: fire_quota.max(1),
+            fires: 0,
+            abort_handle,
+        }
+    }
+
+    fn record_fire(&mut self) {
+        self.fires = self.fires.saturating_add(1);
+    }
+
+    fn completion_summary(&self, completion: &WaitTriggerCompletion) -> String {
+        let mut summary = match &completion.summary {
+            Some(summary) if !summary.is_empty() => format!(
+                "wait predicate `{}` (call {}) completed: {summary}",
+                self.predicate_id, self.call_id
+            ),
+            _ => format!(
+                "wait predicate `{}` (call {}) completed",
+                self.predicate_id, self.call_id
+            ),
+        };
+
+        let elapsed = OffsetDateTime::now_utc() - self.created_at;
+        summary.push_str(&format!(
+            " after {:.1}s (delivery {}/{})",
+            elapsed.as_seconds_f32(),
+            self.fires + 1,
+            self.fire_quota
+        ));
+
+        if let Some(deadline) = self.wake_deadline
+            && let Ok(formatted) = deadline.format(&Rfc3339)
+        {
+            summary.push_str(&format!("; deadline {formatted}"));
+        }
+
+        summary
+    }
+
+    fn cancellation_summary(&self, reason: WaitTriggerCancelReason) -> String {
+        let mut message = match reason {
+            WaitTriggerCancelReason::Explicit => format!(
+                "wait predicate `{}` (call {}) cancelled by tool context",
+                self.predicate_id, self.call_id
+            ),
+            WaitTriggerCancelReason::TurnShutdown => format!(
+                "wait predicate `{}` (call {}) cancelled when turn ended",
+                self.predicate_id, self.call_id
+            ),
+            WaitTriggerCancelReason::Dropped => format!(
+                "wait predicate `{}` (call {}) cancelled because the trigger handle was dropped",
+                self.predicate_id, self.call_id
+            ),
+        };
+
+        if let Some(deadline) = self.wake_deadline
+            && let Ok(formatted) = deadline.format(&Rfc3339)
+        {
+            message.push_str(&format!("; deadline {formatted}"));
+        }
+
+        message.push_str(&format!(
+            " (deliveries so far {}/{})",
+            self.fires, self.fire_quota
+        ));
+
+        message
+    }
+
+    fn default_mailbox_message(&self, summary: &str) -> MailboxMessage {
+        let mut message = MailboxMessage::default();
+        message.sender.id = "codex.wait".to_string();
+        message.sender.role = MailboxSenderRole::Automation;
+        message.body.subject = Some(format!(
+            "Wait trigger completed for call {}",
+            self.call_id
+        ));
+        message.body.content = summary.to_string();
+        message.body.content_type = MailboxContentType::TextPlain;
+        message.audit.request_id = Some(self.request_id.clone());
+        message
+    }
 }
 
 /// The context needed for a single turn of the conversation.
@@ -558,6 +685,11 @@ impl Session {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             mailbox_tx,
+            #[cfg(test)]
+            wait_trigger_mailbox_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
+            wait_triggers: Mutex::new(HashMap::new()),
             mailbox_waiters: Mutex::new(HashMap::new()),
             session_source,
             mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
@@ -1287,6 +1419,28 @@ impl Session {
         }
     }
 
+    pub async fn inject_response_items(
+        &self,
+        items: Vec<ResponseInputItem>,
+    ) -> Result<(), Vec<ResponseInputItem>> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut active = self.active_turn.lock().await;
+        match active.as_mut() {
+            Some(at) => {
+                let mut ts = at.turn_state.lock().await;
+                let mut pending = items;
+                for item in pending.drain(..) {
+                    ts.push_pending_input(item);
+                }
+                Ok(())
+            }
+            None => Err(items),
+        }
+    }
+
     pub async fn get_pending_input(&self) -> Vec<ResponseInputItem> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
@@ -1314,6 +1468,226 @@ impl Session {
         self.services
             .mcp_connection_manager
             .parse_tool_name(tool_name)
+    }
+
+    pub(crate) async fn schedule_wait_trigger(
+        self: &Arc<Self>,
+        sub_id: &str,
+        call_id: &str,
+        spec: WaitTriggerSpec,
+    ) -> Result<WaitTriggerHandle, WaitTriggerError> {
+        let WaitTriggerSpec {
+            predicate_id,
+            wake_deadline,
+            fire_quota,
+            request_id,
+        } = spec;
+
+        let quota = fire_quota.max(1);
+        let (trigger_id, effective_request_id) = {
+            let mut active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_mut() else {
+                return Err(WaitTriggerError::InactiveTurn);
+            };
+            let mut ts = active_turn.turn_state.lock().await;
+            if ts.trigger_count() >= MAX_WAIT_TRIGGERS_PER_TURN {
+                return Err(WaitTriggerError::QuotaExceeded {
+                    limit: MAX_WAIT_TRIGGERS_PER_TURN,
+                });
+            }
+            ts.create_trigger(
+                predicate_id.clone(),
+                sub_id.to_string(),
+                call_id.to_string(),
+                wake_deadline,
+                quota,
+                request_id.clone(),
+            )
+        };
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let session = Arc::clone(self);
+        let trigger_for_task = trigger_id;
+        let task_handle = tokio::spawn(async move {
+            match completion_rx.await {
+                Ok(completion) => {
+                    session
+                        .finalize_wait_trigger(trigger_for_task, Some(completion))
+                        .await;
+                }
+                Err(_) => {
+                    session.finalize_wait_trigger(trigger_for_task, None).await;
+                }
+            }
+        });
+        let abort_handle = task_handle.abort_handle();
+
+        let state = WaitTriggerState::new(
+            sub_id.to_string(),
+            call_id.to_string(),
+            predicate_id,
+            wake_deadline,
+            effective_request_id,
+            quota,
+            abort_handle,
+        );
+
+        {
+            let mut guard = self.wait_triggers.lock().await;
+            if guard.contains_key(&trigger_id) {
+                state.abort_handle.clone().abort();
+                return Err(WaitTriggerError::TriggerClosed);
+            }
+            guard.insert(trigger_id, state);
+        }
+
+        Ok(WaitTriggerHandle::new(self, trigger_id, completion_tx))
+    }
+
+    pub(crate) async fn cancel_wait_trigger(
+        self: &Arc<Self>,
+        trigger_id: Uuid,
+        reason: WaitTriggerCancelReason,
+    ) -> Result<(), WaitTriggerError> {
+        if self
+            .cancel_wait_trigger_internal(trigger_id, reason)
+            .await
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(WaitTriggerError::NotFound)
+        }
+    }
+
+    pub(crate) async fn cancel_wait_trigger_internal(
+        &self,
+        trigger_id: Uuid,
+        reason: WaitTriggerCancelReason,
+    ) -> Option<()> {
+        let state = {
+            let mut guard = self.wait_triggers.lock().await;
+            guard.remove(&trigger_id)
+        };
+
+        if let Some(state) = state {
+            state.abort_handle.abort();
+            self.remove_trigger_from_turn(&trigger_id).await;
+            self.handle_wait_trigger_cancellation(state, reason).await;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    async fn finalize_wait_trigger(
+        self: &Arc<Self>,
+        trigger_id: Uuid,
+        completion: Option<WaitTriggerCompletion>,
+    ) {
+        let state = {
+            let mut guard = self.wait_triggers.lock().await;
+            guard.remove(&trigger_id)
+        };
+        let _ = self.remove_trigger_from_turn(&trigger_id).await;
+
+        match (state, completion) {
+            (Some(mut state), Some(completion)) => {
+                state.record_fire();
+                self.handle_wait_trigger_success(state, completion).await;
+            }
+            (Some(state), None) => {
+                self.handle_wait_trigger_cancellation(state, WaitTriggerCancelReason::Dropped)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_wait_trigger_success(
+        &self,
+        state: WaitTriggerState,
+        completion: WaitTriggerCompletion,
+    ) {
+        let summary = state.completion_summary(&completion);
+        self.notify_background_event(&state.sub_id, summary.clone())
+            .await;
+
+        if !completion.inputs.is_empty() {
+            if let Err(unconsumed) = self.inject_response_items(completion.inputs.clone()).await {
+                warn!(
+                    predicate = %state.predicate_id,
+                    remaining = unconsumed.len(),
+                    "failed to inject wait trigger completion because the turn is no longer active"
+                );
+            }
+        }
+
+        if mailbox_feature_enabled() {
+            let mut message = completion
+                .mailbox_message
+                .unwrap_or_else(|| state.default_mailbox_message(&summary));
+            if message.audit.request_id.is_none() {
+                message.audit.request_id = Some(state.request_id.clone());
+            }
+            apply_mailbox_defaults(&mut message);
+            if let Err(err) = validate_mailbox_message(&message) {
+                warn!(
+                    predicate = %state.predicate_id,
+                    ?err,
+                    "wait trigger completion produced invalid mailbox message"
+                );
+            } else {
+                match self
+                    .enqueue_mailbox_envelope(state.sub_id.clone(), message, true)
+                    .await
+                {
+                    Ok(enqueued) => {
+                        #[cfg(test)]
+                        {
+                            let mut guard = self.wait_trigger_mailbox_events.lock().await;
+                            guard.push(enqueued.clone());
+                        }
+                        #[cfg(not(test))]
+                        {
+                            let _ = enqueued;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            predicate = %state.predicate_id,
+                            ?err,
+                            "failed to enqueue wait trigger mailbox notification"
+                        );
+                        #[cfg(test)]
+                        {
+                            let mut guard =
+                                self.wait_trigger_mailbox_failures.lock().await;
+                            guard.push(err);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_wait_trigger_cancellation(
+        &self,
+        state: WaitTriggerState,
+        reason: WaitTriggerCancelReason,
+    ) {
+        let message = state.cancellation_summary(reason);
+        self.notify_background_event(&state.sub_id, message).await;
+    }
+
+    async fn remove_trigger_from_turn(&self, trigger_id: &Uuid) -> bool {
+        let mut active = self.active_turn.lock().await;
+        if let Some(active_turn) = active.as_mut() {
+            let mut ts = active_turn.turn_state.lock().await;
+            ts.remove_trigger(trigger_id).is_some()
+        } else {
+            false
+        }
     }
 
     pub(crate) async fn handle_exec_command_tool(
@@ -1362,9 +1736,16 @@ impl Session {
         if let Ok(mut active) = self.active_turn.try_lock()
             && let Some(at) = active.as_mut()
         {
-            at.try_clear_pending_sync();
+            let trigger_ids = at.try_clear_pending_sync();
             let tasks = at.drain_tasks();
             *active = None;
+            if let Ok(mut guard) = self.wait_triggers.try_lock() {
+                for trigger_id in trigger_ids {
+                    if let Some(state) = guard.remove(&trigger_id) {
+                        state.abort_handle.abort();
+                    }
+                }
+            }
             for (_sub_id, task) in tasks {
                 task.handle.abort();
             }
@@ -2938,7 +3319,7 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
-    use tokio::task::JoinHandle;
+    use tokio::task::{yield_now, JoinHandle};
 
     pub(crate) struct MailboxTestGuard {
         _env_guard: MailboxEnvGuard,
@@ -2947,15 +3328,18 @@ pub(crate) mod tests {
     }
 
     struct MailboxEnvGuard {
-        key: &'static str,
+        keys: [&'static str; 2],
     }
 
     impl MailboxEnvGuard {
         fn new() -> Self {
             // SAFETY: test harness serializes access to this env var.
-            unsafe { std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1") };
+            unsafe {
+                std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+                std::env::set_var("CODEX_MAILBOX_OOB", "1");
+            }
             Self {
-                key: "CODEX_MAILBOX_OOB_FORCE",
+                keys: ["CODEX_MAILBOX_OOB_FORCE", "CODEX_MAILBOX_OOB"],
             }
         }
     }
@@ -2963,7 +3347,11 @@ pub(crate) mod tests {
     impl Drop for MailboxEnvGuard {
         fn drop(&mut self) {
             // SAFETY: test harness serializes access to this env var.
-            unsafe { std::env::remove_var(self.key) };
+            unsafe {
+                for key in self.keys {
+                    std::env::remove_var(key);
+                }
+            }
         }
     }
 
@@ -3288,6 +3676,181 @@ pub(crate) mod tests {
         assert_eq!(expected, got);
     }
 
+    #[tokio::test]
+    async fn wait_trigger_completion_injects_and_emits_mailbox() {
+        let _env_guard = MailboxEnvGuard::new();
+        assert!(crate::mailbox::mailbox_feature_enabled());
+        let (session, _tc, _rx) = make_session_and_context_with_rx();
+        {
+            let mut active = session.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+
+        let handle = session
+            .schedule_wait_trigger("sub-mail", "call-mail", WaitTriggerSpec::new("timer"))
+            .await
+            .expect("schedule wait trigger");
+
+        let completion = WaitTriggerCompletion::default().with_inputs(vec![
+            ResponseInputItem::FunctionCallOutput {
+                call_id: "call-mail".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "completed".to_string(),
+                    success: Some(true),
+                },
+            },
+        ]);
+
+        handle.complete(completion).await.expect("complete");
+
+        yield_now().await;
+        sleep(StdDuration::from_millis(20)).await;
+
+        #[cfg(test)]
+        {
+            let events = session.wait_trigger_mailbox_events.lock().await;
+            let failures = session.wait_trigger_mailbox_failures.lock().await;
+            assert_eq!(events.len() + failures.len(), 1);
+            if let Some(event) = events.first() {
+                assert_eq!(event.message.sender.role, MailboxSenderRole::Automation);
+            }
+            if let Some(err) = failures.first() {
+                assert!(matches!(
+                    err,
+                    MailboxEnqueueError::Closed
+                        | MailboxEnqueueError::Disabled
+                        | MailboxEnqueueError::Full { .. }
+                ));
+            }
+        }
+
+        let pending = session.get_pending_input().await;
+        assert_eq!(pending.len(), 1);
+        match &pending[0] {
+            ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "call-mail");
+                assert_eq!(output.content, "completed");
+            }
+            other => panic!("unexpected pending input: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_trigger_cancellation_clears_state() {
+        let (session, _tc, _rx) = make_session_and_context_with_rx();
+        {
+            let mut active = session.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+
+        let handle = session
+            .schedule_wait_trigger("sub-cancel", "call-cancel", WaitTriggerSpec::new("fs"))
+            .await
+            .expect("schedule wait trigger");
+
+        handle.cancel().await.expect("cancel wait trigger");
+        yield_now().await;
+
+        {
+            let guard = session.wait_triggers.lock().await;
+            assert!(guard.is_empty());
+        }
+
+        let active = session.active_turn.lock().await;
+        if let Some(at) = active.as_ref() {
+            let ts = at.turn_state.lock().await;
+            assert_eq!(ts.trigger_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_trigger_quota_is_enforced() {
+        let (session, _tc, _rx) = make_session_and_context_with_rx();
+        {
+            let mut active = session.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+
+        let mut handles = Vec::new();
+        for idx in 0..MAX_WAIT_TRIGGERS_PER_TURN {
+            let spec = WaitTriggerSpec::new(format!("timer-{idx}"));
+            let handle = session
+                .schedule_wait_trigger("sub-quota", &format!("call-{idx}"), spec)
+                .await
+                .expect("within quota");
+            handles.push(handle);
+        }
+
+        let result = session
+            .schedule_wait_trigger(
+                "sub-quota",
+                "call-over",
+                WaitTriggerSpec::new("overflow"),
+            )
+            .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(handle) => {
+                let _ = handle.cancel().await;
+                panic!("quota should be exceeded");
+            }
+        };
+        match err {
+            WaitTriggerError::QuotaExceeded { limit } => {
+                assert_eq!(limit, MAX_WAIT_TRIGGERS_PER_TURN);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        for handle in handles {
+            let _ = handle.cancel().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_trigger_persists_until_completion() {
+        let (session, _tc, _rx) = make_session_and_context_with_rx();
+        {
+            let mut active = session.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+
+        let handle = session
+            .schedule_wait_trigger("sub-persist", "call-persist", WaitTriggerSpec::new("shell"))
+            .await
+            .expect("schedule wait trigger");
+
+        let pending = session.get_pending_input().await;
+        assert!(pending.is_empty());
+
+        {
+            let active = session.active_turn.lock().await;
+            let at = active.as_ref().expect("active turn");
+            let ts = at.turn_state.lock().await;
+            assert_eq!(ts.trigger_count(), 1);
+        }
+
+        let completion = WaitTriggerCompletion::default().with_inputs(vec![
+            ResponseInputItem::FunctionCallOutput {
+                call_id: "call-persist".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "persist".to_string(),
+                    success: Some(true),
+                },
+            },
+        ]);
+
+        handle.complete(completion).await.expect("complete");
+        yield_now().await;
+
+        {
+            let active = session.active_turn.lock().await;
+            let at = active.as_ref().expect("active turn");
+            let ts = at.turn_state.lock().await;
+            assert_eq!(ts.trigger_count(), 0);
+        }
+    }
+
     fn text_block(s: &str) -> ContentBlock {
         ContentBlock::TextContent(TextContent {
             annotations: None,
@@ -3374,6 +3937,11 @@ pub(crate) mod tests {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             mailbox_tx,
+            #[cfg(test)]
+            wait_trigger_mailbox_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
+            wait_triggers: Mutex::new(HashMap::new()),
             mailbox_waiters: Mutex::new(HashMap::new()),
             session_source: SessionSource::Cli,
             mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
@@ -3454,6 +4022,11 @@ pub(crate) mod tests {
             services,
             next_internal_sub_id: AtomicU64::new(0),
             mailbox_tx,
+            #[cfg(test)]
+            wait_trigger_mailbox_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
+            wait_triggers: Mutex::new(HashMap::new()),
             mailbox_waiters: Mutex::new(HashMap::new()),
             session_source: SessionSource::Cli,
             mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),

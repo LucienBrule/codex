@@ -18,6 +18,7 @@ use crate::protocol::TurnAbortedEvent;
 use crate::state::ActiveTurn;
 use crate::state::RunningTask;
 use crate::state::TaskKind;
+use crate::tools::context::WaitTriggerCancelReason;
 
 pub(crate) use compact::CompactTask;
 pub(crate) use regular::RegularTask;
@@ -126,14 +127,21 @@ impl Session {
     }
 
     async fn take_all_running_tasks(&self) -> Vec<(String, RunningTask)> {
-        let mut active = self.active_turn.lock().await;
-        match active.take() {
-            Some(mut at) => {
-                at.clear_pending().await;
-                let tasks = at.drain_tasks();
-                tasks.into_iter().collect()
+        let maybe_turn = {
+            let mut active = self.active_turn.lock().await;
+            active.take()
+        };
+
+        if let Some(mut at) = maybe_turn {
+            let trigger_ids = at.clear_pending().await;
+            let tasks = at.drain_tasks();
+            for trigger_id in trigger_ids {
+                self.cancel_wait_trigger_internal(trigger_id, WaitTriggerCancelReason::TurnShutdown)
+                    .await;
             }
-            None => Vec::new(),
+            tasks.into_iter().collect()
+        } else {
+            Vec::new()
         }
     }
 
