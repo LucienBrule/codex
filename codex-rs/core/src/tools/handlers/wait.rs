@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -13,6 +13,7 @@ use crate::codex::TurnContext;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
 use crate::function_tool::FunctionCallError;
+use crate::config::{wait_policy_settings, WaitPolicySettings, WaitPredicateKind};
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -27,6 +28,59 @@ const MAX_TIMER_DURATION: Duration = Duration::from_secs(3600);
 const MAX_SHELL_INTERVAL: Duration = Duration::from_secs(30);
 const MIN_SHELL_INTERVAL: Duration = Duration::from_millis(100);
 
+static ACTIVE_WAIT_SLOTS: LazyLock<Mutex<HashMap<usize, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct WaitSlotGuard {
+    key: usize,
+}
+
+impl Drop for WaitSlotGuard {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = ACTIVE_WAIT_SLOTS.lock() {
+            if let Some(entry) = guard.get_mut(&self.key) {
+                *entry = entry.saturating_sub(1);
+                if *entry == 0 {
+                    guard.remove(&self.key);
+                }
+            }
+        }
+    }
+}
+
+fn acquire_wait_slot(
+    turn: &Arc<TurnContext>,
+    policy: &WaitPolicySettings,
+    predicate: Option<WaitPredicateKind>,
+) -> Result<WaitSlotGuard, FunctionCallError> {
+    let key = Arc::as_ptr(turn) as usize;
+    let mut guard = ACTIVE_WAIT_SLOTS
+        .lock()
+        .map_err(|_| FunctionCallError::Fatal("wait policy guard poisoned".to_string()))?;
+
+    let entry = guard.entry(key).or_insert(0);
+    if *entry >= policy.max_waits_per_turn() {
+        drop(guard);
+        if let Some(kind) = predicate {
+            crate::telemetry::record_wait_policy_violation(kind.as_str(), "concurrency_limit");
+        } else {
+            crate::telemetry::record_wait_policy_violation("unknown", "concurrency_limit");
+        }
+        return Err(FunctionCallError::RespondToModel(format!(
+            "wait policy limit exceeded: at most {} wait predicates may run concurrently in a turn",
+            policy.max_waits_per_turn()
+        )));
+    }
+    *entry += 1;
+    Ok(WaitSlotGuard { key })
+}
+
+fn policy_violation_error(kind: WaitPredicateKind, message: impl Into<String>) -> FunctionCallError {
+    let msg = message.into();
+    crate::telemetry::record_wait_policy_violation(kind.as_str(), "policy_violation");
+    FunctionCallError::RespondToModel(msg)
+}
+
 pub struct WaitHandler;
 
 #[derive(Clone)]
@@ -35,6 +89,7 @@ struct WaitContext {
     sub_id: String,
     call_id: String,
     tool_name: String,
+    policy: Arc<WaitPolicySettings>,
 }
 
 impl WaitContext {
@@ -43,12 +98,14 @@ impl WaitContext {
         sub_id: String,
         call_id: String,
         tool_name: String,
+        policy: Arc<WaitPolicySettings>,
     ) -> Self {
         Self {
             runtime,
             sub_id,
             call_id,
             tool_name,
+            policy,
         }
     }
 
@@ -72,6 +129,10 @@ impl WaitContext {
         self.runtime()
             .notify(self.sub_id(), message.into())
             .await;
+    }
+
+    fn policy(&self) -> &WaitPolicySettings {
+        self.policy.as_ref()
     }
 }
 
@@ -185,14 +246,27 @@ impl ToolHandler for WaitHandler {
             ))
         })?;
 
-        let timeout = parse_timeout(args.timeout_ms)?;
-        let limits = WaitLimits::new(timeout);
-
         let WaitArgs {
             predicate_type,
             predicate,
-            ..
+            timeout_ms,
         } = args;
+
+        let predicate_kind: WaitPredicateKind = predicate_type.into();
+        let policy = wait_policy_settings();
+
+        if !policy.is_allowed(predicate_kind) {
+            return Err(policy_violation_error(
+                predicate_kind,
+                format!(
+                    "wait predicate `{}` is disabled by configuration",
+                    predicate_kind.as_str()
+                ),
+            ));
+        }
+
+        let timeout = parse_timeout(timeout_ms, policy.max_duration())?;
+        let limits = WaitLimits::new(timeout);
 
         let ToolInvocation {
             session,
@@ -204,19 +278,29 @@ impl ToolHandler for WaitHandler {
             ..
         } = invocation;
 
+        let _slot_guard = acquire_wait_slot(&turn, &policy, Some(predicate_kind))?;
+
         let runtime = Arc::new(SessionRuntime::new(
             Arc::clone(&session),
             Arc::clone(&turn),
             Arc::clone(&tracker),
         ));
-        let ctx = WaitContext::new(runtime, sub_id, call_id, tool_name);
+        let ctx = WaitContext::new(
+            runtime,
+            sub_id,
+            call_id,
+            tool_name,
+            Arc::new(policy.clone()),
+        );
 
         ctx.notify(format!(
             "wait predicate {kind} started (timeout {seconds}s)",
-            kind = predicate_type.as_str(),
+            kind = predicate_kind.as_str(),
             seconds = timeout.as_secs()
         ))
         .await;
+
+        crate::telemetry::record_wait_started(predicate_kind.as_str());
 
         let started = Instant::now();
         let result = match predicate_type {
@@ -237,17 +321,22 @@ impl ToolHandler for WaitHandler {
         match result {
             Ok(outcome) => {
                 let elapsed = started.elapsed();
+                crate::telemetry::record_wait_completed(
+                    predicate_kind.as_str(),
+                    elapsed.as_secs_f64(),
+                );
+
                 ctx.notify(format!(
                     "wait predicate {kind} satisfied in {:.1}s",
                     elapsed.as_secs_f32(),
-                    kind = predicate_type.as_str()
+                    kind = predicate_kind.as_str()
                 ))
                 .await;
 
                 let mut response = serde_json::Map::new();
                 response.insert(
                     "predicate".to_string(),
-                    JsonValue::String(predicate_type.as_str().to_string()),
+                    JsonValue::String(predicate_kind.as_str().to_string()),
                 );
                 response.insert(
                     "elapsed_ms".to_string(),
@@ -265,9 +354,10 @@ impl ToolHandler for WaitHandler {
                 })
             }
             Err(err) => {
+                crate::telemetry::record_wait_failed(predicate_kind.as_str());
                 ctx.notify(format!(
                     "wait predicate {kind} failed: {err}",
-                    kind = predicate_type.as_str()
+                    kind = predicate_kind.as_str()
                 ))
                 .await;
                 Err(err)
@@ -276,7 +366,10 @@ impl ToolHandler for WaitHandler {
     }
 }
 
-fn parse_timeout(timeout_ms: Option<u64>) -> Result<Duration, FunctionCallError> {
+fn parse_timeout(
+    timeout_ms: Option<u64>,
+    max_allowed: Duration,
+) -> Result<Duration, FunctionCallError> {
     let timeout_ms = timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT.as_millis() as u64);
     if timeout_ms == 0 {
         return Err(FunctionCallError::RespondToModel(
@@ -285,10 +378,11 @@ fn parse_timeout(timeout_ms: Option<u64>) -> Result<Duration, FunctionCallError>
     }
 
     let timeout = Duration::from_millis(timeout_ms);
-    if timeout > MAX_WAIT_TIMEOUT {
+    let allowed = std::cmp::min(MAX_WAIT_TIMEOUT, max_allowed);
+    if timeout > allowed {
         return Err(FunctionCallError::RespondToModel(format!(
             "timeout_ms must be <= {}",
-            MAX_WAIT_TIMEOUT.as_millis()
+            allowed.as_millis()
         )));
     }
 
@@ -333,6 +427,16 @@ impl WaitPredicateType {
             WaitPredicateType::Timer => "timer",
             WaitPredicateType::Filesystem => "filesystem",
             WaitPredicateType::Shell => "shell",
+        }
+    }
+}
+
+impl From<WaitPredicateType> for WaitPredicateKind {
+    fn from(value: WaitPredicateType) -> Self {
+        match value {
+            WaitPredicateType::Timer => WaitPredicateKind::Timer,
+            WaitPredicateType::Filesystem => WaitPredicateKind::Filesystem,
+            WaitPredicateType::Shell => WaitPredicateKind::Shell,
         }
     }
 }
@@ -460,6 +564,25 @@ impl WaitPredicateStrategy for ShellStrategy {
             return Err(FunctionCallError::RespondToModel(
                 "command must not be empty".to_string(),
             ));
+        }
+
+        if ctx.policy().require_shell_approval() {
+            if !predicate.with_escalated_permissions.unwrap_or(false) {
+                return Err(policy_violation_error(
+                    WaitPredicateKind::Shell,
+                    "shell wait predicates require approval; set with_escalated_permissions=true",
+                ));
+            }
+            if predicate
+                .justification
+                .as_ref()
+                .map_or(true, |s| s.trim().is_empty())
+            {
+                return Err(policy_violation_error(
+                    WaitPredicateKind::Shell,
+                    "shell wait predicates with approval must include a non-empty justification",
+                ));
+            }
         }
 
         let runtime = ctx.runtime();
@@ -897,13 +1020,14 @@ mod wait_handler {
             "sub".to_string(),
             "call".to_string(),
             "codex.wait".to_string(),
+            Arc::new(WaitPolicySettings::default()),
         )
     }
 
     #[tokio::test]
     async fn parse_timeout_rejects_zero() {
         assert!(matches!(
-            parse_timeout(Some(0)),
+            parse_timeout(Some(0), Duration::from_secs(5)),
             Err(FunctionCallError::RespondToModel(_))
         ));
     }

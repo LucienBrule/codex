@@ -7,6 +7,10 @@ use codex_otel::metrics::record_mailbox_ack_total;
 use codex_otel::metrics::record_mailbox_delivery_latency;
 use codex_otel::metrics::record_mailbox_expiry_total;
 use codex_otel::metrics::record_mailbox_queue_depth;
+use codex_otel::metrics::record_wait_completed as record_wait_completed_metric;
+use codex_otel::metrics::record_wait_failed as record_wait_failed_metric;
+use codex_otel::metrics::record_wait_policy_violation as record_wait_policy_violation_metric;
+use codex_otel::metrics::record_wait_started as record_wait_started_metric;
 use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::mailbox::MailboxMessage;
 use codex_protocol::mailbox::MailboxPriority;
@@ -243,6 +247,22 @@ fn sender_role_to_str(role: &MailboxSenderRole) -> &'static str {
         MailboxSenderRole::Automation => "automation",
         MailboxSenderRole::System => "system",
     }
+}
+
+pub fn record_wait_started(kind: &str) {
+    record_wait_started_metric(kind);
+}
+
+pub fn record_wait_completed(kind: &str, duration_seconds: f64) {
+    record_wait_completed_metric(kind, duration_seconds);
+}
+
+pub fn record_wait_failed(kind: &str) {
+    record_wait_failed_metric(kind);
+}
+
+pub fn record_wait_policy_violation(kind: &str, reason: &str) {
+    record_wait_policy_violation_metric(kind, reason);
 }
 
 // ===== Summaries telemetry (Task CS-4) =====

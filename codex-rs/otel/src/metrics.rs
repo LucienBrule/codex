@@ -11,6 +11,7 @@ mod imp {
 
     const METER_NAME: &str = "codex.keepalive";
     const MAILBOX_METER_NAME: &str = "codex.mailbox";
+    const WAIT_METER_NAME: &str = "codex.wait";
 
     struct KeepaliveMetrics {
         heartbeat_total: Counter<u64>,
@@ -20,6 +21,7 @@ mod imp {
 
     static METRICS: OnceLock<KeepaliveMetrics> = OnceLock::new();
     static MAILBOX_METRICS: OnceLock<MailboxMetrics> = OnceLock::new();
+    static WAIT_METRICS: OnceLock<WaitMetrics> = OnceLock::new();
 
     impl KeepaliveMetrics {
         fn new() -> Self {
@@ -120,6 +122,46 @@ mod imp {
         MAILBOX_METRICS.get_or_init(MailboxMetrics::new)
     }
 
+    struct WaitMetrics {
+        started_total: Counter<u64>,
+        completed_duration: Histogram<f64>,
+        failed_total: Counter<u64>,
+        policy_violation_total: Counter<u64>,
+    }
+
+    impl WaitMetrics {
+        fn new() -> Self {
+            let meter = global::meter(WAIT_METER_NAME);
+            let started_total = meter
+                .u64_counter("codex_wait_started_total")
+                .with_description("Count of wait predicate invocations.")
+                .build();
+            let completed_duration = meter
+                .f64_histogram("codex_wait_duration_seconds")
+                .with_description("Observed wait predicate completion durations in seconds.")
+                .build();
+            let failed_total = meter
+                .u64_counter("codex_wait_failed_total")
+                .with_description("Count of wait predicates that ended with an error before completion.")
+                .build();
+            let policy_violation_total = meter
+                .u64_counter("codex_wait_policy_violation_total")
+                .with_description("Count of wait predicates rejected due to policy enforcement.")
+                .build();
+
+            Self {
+                started_total,
+                completed_duration,
+                failed_total,
+                policy_violation_total,
+            }
+        }
+    }
+
+    fn wait_metrics() -> &'static WaitMetrics {
+        WAIT_METRICS.get_or_init(WaitMetrics::new)
+    }
+
     fn mailbox_attrs(
         ingress: &str,
         priority: &str,
@@ -142,6 +184,17 @@ mod imp {
         [
             KeyValue::new("namespace", namespace.to_string()),
             KeyValue::new("error_kind", error_kind.to_string()),
+        ]
+    }
+
+    fn wait_attrs(kind: &str) -> [KeyValue; 1] {
+        [KeyValue::new("predicate", kind.to_string())]
+    }
+
+    fn wait_policy_attrs(kind: &str, reason: &str) -> [KeyValue; 2] {
+        [
+            KeyValue::new("predicate", kind.to_string()),
+            KeyValue::new("reason", reason.to_string()),
         ]
     }
 
@@ -224,6 +277,28 @@ mod imp {
         mailbox_metrics().errors_total.add(1, &attrs);
     }
 
+    pub fn record_wait_started(kind: &str) {
+        let attrs = wait_attrs(kind);
+        wait_metrics().started_total.add(1, &attrs);
+    }
+
+    pub fn record_wait_completed(kind: &str, duration_seconds: f64) {
+        let attrs = wait_attrs(kind);
+        wait_metrics()
+            .completed_duration
+            .record(duration_seconds, &attrs);
+    }
+
+    pub fn record_wait_failed(kind: &str) {
+        let attrs = wait_attrs(kind);
+        wait_metrics().failed_total.add(1, &attrs);
+    }
+
+    pub fn record_wait_policy_violation(kind: &str, reason: &str) {
+        let attrs = wait_policy_attrs(kind, reason);
+        wait_metrics().policy_violation_total.add(1, &attrs);
+    }
+
     // Maintain last-seen queue depth per namespace to drive an up/down counter as a gauge.
     static QUEUE_DEPTH_STATE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
 
@@ -275,6 +350,18 @@ mod imp {
 
     #[inline]
     pub fn update_mailbox_queue_depth_gauge(_: &str, _: u64) {}
+
+    #[inline]
+    pub fn record_wait_started(_: &str) {}
+
+    #[inline]
+    pub fn record_wait_completed(_: &str, _: f64) {}
+
+    #[inline]
+    pub fn record_wait_failed(_: &str) {}
+
+    #[inline]
+    pub fn record_wait_policy_violation(_: &str, _: &str) {}
 }
 
 pub use imp::record_heartbeat;
@@ -287,3 +374,7 @@ pub use imp::record_mailbox_accept_total;
 pub use imp::record_mailbox_error_total;
 pub use imp::update_mailbox_queue_depth_gauge;
 pub use imp::record_reconnect;
+pub use imp::record_wait_completed;
+pub use imp::record_wait_failed;
+pub use imp::record_wait_policy_violation;
+pub use imp::record_wait_started;

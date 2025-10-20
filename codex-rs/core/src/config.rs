@@ -35,12 +35,15 @@ use codex_protocol::config_types::Verbosity;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use dirs::home_dir;
 use serde::Deserialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::fmt;
+use std::str::FromStr;
+use std::sync::{OnceLock, RwLock};
 
 use tempfile::NamedTempFile;
 use toml::Value as TomlValue;
@@ -265,6 +268,9 @@ pub struct Config {
 
     /// Settings controlling background conversation summaries.
     pub summaries: SummariesSettings,
+
+    /// Wait predicate policy enforcement knobs.
+    pub wait: WaitPolicySettings,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +344,202 @@ impl SummariesSettings {
         if self.emit_interval < MIN_SUMMARIES_EMIT_INTERVAL {
             self.emit_interval = MIN_SUMMARIES_EMIT_INTERVAL;
         }
+    }
+}
+
+const DEFAULT_WAIT_MAX_DURATION: Duration = Duration::from_secs(3_600);
+const MAX_WAIT_DURATION_LIMIT: Duration = Duration::from_secs(86_400);
+const DEFAULT_MAX_WAITS_PER_TURN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WaitPredicateKind {
+    Timer,
+    Filesystem,
+    Shell,
+}
+
+impl WaitPredicateKind {
+    fn all() -> [Self; 3] {
+        [Self::Timer, Self::Filesystem, Self::Shell]
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timer => "timer",
+            Self::Filesystem => "filesystem",
+            Self::Shell => "shell",
+        }
+    }
+}
+
+impl fmt::Display for WaitPredicateKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WaitPredicateKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "timer" => Ok(Self::Timer),
+            "filesystem" => Ok(Self::Filesystem),
+            "shell" => Ok(Self::Shell),
+            other => Err(format!("invalid wait predicate `{other}`")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitPolicySettings {
+    pub allowed_predicates: BTreeSet<WaitPredicateKind>,
+    pub max_duration: Duration,
+    pub max_waits_per_turn: usize,
+    pub require_shell_approval: bool,
+}
+
+impl Default for WaitPolicySettings {
+    fn default() -> Self {
+        Self {
+            allowed_predicates: WaitPredicateKind::all().into_iter().collect(),
+            max_duration: DEFAULT_WAIT_MAX_DURATION,
+            max_waits_per_turn: DEFAULT_MAX_WAITS_PER_TURN,
+            require_shell_approval: false,
+        }
+    }
+}
+
+impl WaitPolicySettings {
+    fn parse_allowed(predicates: &[String]) -> Result<BTreeSet<WaitPredicateKind>, String> {
+        let mut set = BTreeSet::new();
+        for raw in predicates {
+            let parsed = WaitPredicateKind::from_str(raw)?;
+            set.insert(parsed);
+        }
+        Ok(set)
+    }
+
+    pub fn from_toml(toml: Option<&WaitPolicyToml>) -> Result<Self, String> {
+        let mut settings = Self::default();
+        if let Some(config) = toml {
+            settings = settings.apply_toml(config)?;
+        }
+        settings.normalize();
+        Ok(settings)
+    }
+
+    fn apply_toml(mut self, toml: &WaitPolicyToml) -> Result<Self, String> {
+        if let Some(predicates) = &toml.allowed_predicates {
+            let parsed = Self::parse_allowed(predicates)?;
+            self.allowed_predicates = parsed;
+        }
+        if let Some(seconds) = toml.max_duration_seconds {
+            if seconds == 0 {
+                return Err("wait.max_duration_seconds must be positive".to_string());
+            }
+            self.max_duration = Duration::from_secs(seconds);
+        }
+        if let Some(limit) = toml.max_waits_per_turn {
+            if limit == 0 {
+                return Err("wait.max_waits_per_turn must be >= 1".to_string());
+            }
+            self.max_waits_per_turn = limit;
+        }
+        if let Some(require) = toml.require_shell_approval {
+            self.require_shell_approval = require;
+        }
+        Ok(self)
+    }
+
+    pub fn apply_override(&mut self, overrides: &WaitPolicyOverrides) -> Result<(), String> {
+        if let Some(predicates) = &overrides.allowed_predicates {
+            self.allowed_predicates = predicates.iter().copied().collect();
+        }
+        if let Some(seconds) = overrides.max_duration_seconds {
+            if seconds == 0 {
+                return Err("wait policy override max_duration_seconds must be positive".to_string());
+            }
+            self.max_duration = Duration::from_secs(seconds);
+        }
+        if let Some(limit) = overrides.max_waits_per_turn {
+            if limit == 0 {
+                return Err("wait policy override max_waits_per_turn must be >= 1".to_string());
+            }
+            self.max_waits_per_turn = limit;
+        }
+        if let Some(require) = overrides.require_shell_approval {
+            self.require_shell_approval = require;
+        }
+        self.normalize();
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        if self.max_duration.is_zero() {
+            self.max_duration = DEFAULT_WAIT_MAX_DURATION;
+        }
+
+        if self.max_duration > MAX_WAIT_DURATION_LIMIT {
+            self.max_duration = MAX_WAIT_DURATION_LIMIT;
+        }
+
+        if self.max_waits_per_turn == 0 {
+            self.max_waits_per_turn = 1;
+        }
+    }
+
+    pub fn is_allowed(&self, kind: WaitPredicateKind) -> bool {
+        self.allowed_predicates.contains(&kind)
+    }
+
+    pub fn max_duration(&self) -> Duration {
+        self.max_duration
+    }
+
+    pub fn max_waits_per_turn(&self) -> usize {
+        self.max_waits_per_turn
+    }
+
+    pub fn require_shell_approval(&self) -> bool {
+        self.require_shell_approval
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct WaitPolicyToml {
+    pub allowed_predicates: Option<Vec<String>>,
+    #[serde(rename = "max_duration_seconds")]
+    pub max_duration_seconds: Option<u64>,
+    pub max_waits_per_turn: Option<usize>,
+    pub require_shell_approval: Option<bool>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct WaitPolicyOverrides {
+    pub allowed_predicates: Option<Vec<WaitPredicateKind>>,
+    pub max_duration_seconds: Option<u64>,
+    pub max_waits_per_turn: Option<usize>,
+    pub require_shell_approval: Option<bool>,
+}
+
+static WAIT_POLICY_GLOBAL: OnceLock<RwLock<WaitPolicySettings>> = OnceLock::new();
+
+fn wait_policy_slot() -> &'static RwLock<WaitPolicySettings> {
+    WAIT_POLICY_GLOBAL.get_or_init(|| RwLock::new(WaitPolicySettings::default()))
+}
+
+pub fn wait_policy_settings() -> WaitPolicySettings {
+    wait_policy_slot()
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| WaitPolicySettings::default())
+}
+
+fn update_wait_policy(settings: &WaitPolicySettings) {
+    if let Ok(mut guard) = wait_policy_slot().write() {
+        *guard = settings.clone();
     }
 }
 
@@ -864,6 +1066,12 @@ pub struct ConfigToml {
     #[serde(default)]
     pub mailbox_liveness: Option<MailboxLivenessToml>,
 
+    #[serde(default)]
+    pub wait: Option<WaitPolicyToml>,
+
+    #[serde(default)]
+    pub wait_profiles: HashMap<String, WaitPolicyToml>,
+
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
     pub hide_agent_reasoning: Option<bool>,
@@ -1111,6 +1319,7 @@ pub struct ConfigOverrides {
     pub include_view_image_tool: Option<bool>,
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
+    pub wait_policy: Option<WaitPolicyOverrides>,
 }
 
 impl Config {
@@ -1139,6 +1348,7 @@ impl Config {
             include_view_image_tool,
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
+            wait_policy: wait_policy_override,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -1216,6 +1426,26 @@ impl Config {
             .or(config_profile.model)
             .or(cfg.model)
             .unwrap_or_else(default_model);
+
+        let mut wait_settings = WaitPolicySettings::from_toml(cfg.wait.as_ref())
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+        if let Some(profile_name) = active_profile_name.as_ref() {
+            if let Some(profile_wait) = cfg.wait_profiles.get(profile_name) {
+                wait_settings = wait_settings
+                    .apply_toml(profile_wait)
+                    .map_err(|err| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, err)
+                    })?;
+                wait_settings.normalize();
+            }
+        }
+
+        if let Some(overrides) = wait_policy_override.as_ref() {
+            wait_settings
+                .apply_override(overrides)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        }
 
         let mut model_family =
             find_family_for_model(&model).unwrap_or_else(|| derive_default_model_family(&model));
@@ -1356,7 +1586,9 @@ impl Config {
             },
             summaries: SummariesSettings::from_toml(cfg.summaries.clone()),
             mailbox_liveness,
+            wait: wait_settings.clone(),
         };
+        update_wait_policy(&config.wait);
         Ok(config)
     }
 
@@ -1517,6 +1749,119 @@ persistence = "none"
         let tui = parsed.tui.expect("config should include tui section");
 
         assert_eq!(tui.notifications, Notifications::Enabled(false));
+    }
+
+    #[test]
+    fn wait_policy_defaults_apply() {
+        let settings = WaitPolicySettings::from_toml(None).expect("defaults");
+        assert!(settings.is_allowed(WaitPredicateKind::Timer));
+        assert!(settings.is_allowed(WaitPredicateKind::Filesystem));
+        assert!(settings.is_allowed(WaitPredicateKind::Shell));
+        assert_eq!(settings.max_waits_per_turn(), DEFAULT_MAX_WAITS_PER_TURN);
+        assert_eq!(settings.max_duration(), DEFAULT_WAIT_MAX_DURATION);
+        assert!(!settings.require_shell_approval());
+    }
+
+    #[test]
+    fn wait_policy_allows_disabling_all_predicates_via_config() {
+        let settings = WaitPolicySettings::from_toml(Some(&WaitPolicyToml {
+            allowed_predicates: Some(vec![]),
+            ..Default::default()
+        }))
+        .expect("empty allow-list should parse");
+
+        assert!(!settings.is_allowed(WaitPredicateKind::Timer));
+        assert!(!settings.is_allowed(WaitPredicateKind::Filesystem));
+        assert!(!settings.is_allowed(WaitPredicateKind::Shell));
+    }
+
+    #[test]
+    fn wait_policy_rejects_invalid_predicates() {
+        let result = WaitPolicySettings::from_toml(Some(&WaitPolicyToml {
+            allowed_predicates: Some(vec!["unknown".to_string()]),
+            ..Default::default()
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wait_policy_profile_override_applies() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = ConfigToml::default();
+        cfg.profile = Some("dev".to_string());
+        cfg.wait = Some(WaitPolicyToml {
+            allowed_predicates: Some(vec!["timer".to_string()]),
+            ..Default::default()
+        });
+        cfg.wait_profiles.insert(
+            "dev".to_string(),
+            WaitPolicyToml {
+                allowed_predicates: Some(vec!["shell".to_string()]),
+                max_waits_per_turn: Some(2),
+                require_shell_approval: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let overrides = ConfigOverrides {
+            config_profile: Some("dev".to_string()),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+            .expect("config");
+
+        assert!(config.wait.is_allowed(WaitPredicateKind::Shell));
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
+        assert_eq!(config.wait.max_waits_per_turn(), 2);
+        assert!(config.wait.require_shell_approval());
+    }
+
+    #[test]
+    fn wait_policy_cli_override_wins() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = ConfigToml::default();
+        cfg.wait = Some(WaitPolicyToml {
+            max_duration_seconds: Some(120),
+            ..Default::default()
+        });
+
+        let overrides = ConfigOverrides {
+            wait_policy: Some(WaitPolicyOverrides {
+                max_duration_seconds: Some(10),
+                allowed_predicates: Some(vec![WaitPredicateKind::Filesystem]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+            .expect("config");
+
+        assert_eq!(config.wait.max_duration(), Duration::from_secs(10));
+        assert!(config.wait.is_allowed(WaitPredicateKind::Filesystem));
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
+    }
+
+    #[test]
+    fn wait_policy_cli_override_can_disable_all_predicates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cfg = ConfigToml::default();
+
+        let overrides = ConfigOverrides {
+            wait_policy: Some(WaitPolicyOverrides {
+                allowed_predicates: Some(Vec::<WaitPredicateKind>::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+            .expect("config");
+
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Filesystem));
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Shell));
     }
 
     #[test]
@@ -2290,6 +2635,7 @@ model_verbosity = "high"
                 disable_paste_burst: false,
                 tui_notifications: Default::default(),
                 summaries: SummariesSettings::default(),
+                wait: WaitPolicySettings::default(),
                 otel: OtelConfig::default(),
             },
             o3_profile_config
@@ -2355,6 +2701,7 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             summaries: SummariesSettings::default(),
+            wait: WaitPolicySettings::default(),
             otel: OtelConfig::default(),
         };
 
@@ -2435,6 +2782,7 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             summaries: SummariesSettings::default(),
+            wait: WaitPolicySettings::default(),
             otel: OtelConfig::default(),
         };
 
@@ -2501,6 +2849,7 @@ model_verbosity = "high"
             disable_paste_burst: false,
             tui_notifications: Default::default(),
             summaries: SummariesSettings::default(),
+            wait: WaitPolicySettings::default(),
             otel: OtelConfig::default(),
         };
 
