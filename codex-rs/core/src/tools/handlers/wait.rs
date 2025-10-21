@@ -942,6 +942,7 @@ async fn wait_for_modified(_path: &Path) -> Result<(), FunctionCallError> {
 #[cfg(test)]
 mod wait_handler {
     use super::*;
+    use super::run_strategy;
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use std::time::{Duration, Instant};
@@ -1015,12 +1016,21 @@ mod wait_handler {
     }
 
     fn stub_context(runtime: Arc<StubRuntime>) -> WaitContext {
+        stub_context_with_policy(runtime, |_| {})
+    }
+
+    fn stub_context_with_policy(
+        runtime: Arc<StubRuntime>,
+        mutator: impl FnOnce(&mut WaitPolicySettings),
+    ) -> WaitContext {
+        let mut policy = WaitPolicySettings::default();
+        mutator(&mut policy);
         WaitContext::new(
             runtime,
             "sub".to_string(),
             "call".to_string(),
             "codex.wait".to_string(),
-            Arc::new(WaitPolicySettings::default()),
+            Arc::new(policy),
         )
     }
 
@@ -1074,5 +1084,155 @@ mod wait_handler {
             .expect("shell predicate should succeed");
         assert!(outcome.message.contains("succeeded"));
         assert_eq!(runtime.notifications().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn timer_strategy_rejects_large_duration() {
+        let strategy = TimerStrategy;
+        let runtime = StubRuntime::new();
+        let ctx = stub_context(runtime);
+        let err = strategy
+            .wait(
+                &ctx,
+                json!({
+                    "duration_ms": super::MAX_TIMER_DURATION.as_millis() as u64 + 1
+                }),
+                &WaitLimits::new(DEFAULT_WAIT_TIMEOUT),
+            )
+            .await
+            .expect_err("duration above max should fail");
+        if let FunctionCallError::RespondToModel(msg) = err {
+            assert!(msg.contains("duration_ms must be <="));
+        } else {
+            panic!("unexpected error variant: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn timer_strategy_obeys_run_strategy_timeout() {
+        let strategy = TimerStrategy;
+        let runtime = StubRuntime::new();
+        let ctx = stub_context(runtime);
+        let result = run_strategy(
+            &strategy,
+            &ctx,
+            json!({ "duration_ms": 200 }),
+            &WaitLimits::new(Duration::from_millis(25)),
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(FunctionCallError::RespondToModel(msg)) if msg.contains("timed out")
+        ));
+    }
+
+    fn exec_failure(exit_code: i32, output: &str) -> FunctionCallError {
+    let envelope = json!({
+        "output": output,
+        "metadata": {
+            "exit_code": exit_code,
+            "_duration_seconds": 0.05
+        }
+    })
+    .to_string();
+    FunctionCallError::RespondToModel(envelope)
+}
+
+    #[tokio::test]
+    async fn shell_strategy_accepts_configured_exit_codes() {
+        let strategy = ShellStrategy;
+        let runtime = StubRuntime::new();
+        runtime.with_shell_results(vec![Err(exec_failure(5, "pending retry"))]);
+        let ctx = stub_context(runtime);
+        let outcome = strategy
+            .wait(
+                &ctx,
+                json!({
+                    "command": ["echo", "ok"],
+                    "success_exit_codes": [0, 5]
+                }),
+                &WaitLimits::new(DEFAULT_WAIT_TIMEOUT),
+            )
+            .await
+            .expect("exit code 5 should satisfy predicate");
+        assert!(outcome.message.contains("exit code 5"));
+    }
+
+    #[tokio::test]
+    async fn shell_strategy_respects_max_attempts() {
+        let strategy = ShellStrategy;
+        let runtime = StubRuntime::new();
+        runtime.with_shell_results(vec![
+            Err(exec_failure(1, "first failure")),
+            Err(exec_failure(2, "second failure")),
+        ]);
+        let ctx = stub_context(runtime);
+        let err = strategy
+            .wait(
+                &ctx,
+                json!({
+                    "command": ["false"],
+                    "max_attempts": 2,
+                    "interval_ms": 100
+                }),
+                &WaitLimits::new(DEFAULT_WAIT_TIMEOUT),
+            )
+            .await
+            .expect_err("predicate should fail after exhausting attempts");
+        if let FunctionCallError::RespondToModel(msg) = err {
+            assert!(msg.contains("attempts exhausted"));
+        } else {
+            panic!("unexpected error variant: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_strategy_requires_approval_when_policy_demands() {
+        let strategy = ShellStrategy;
+        let runtime = StubRuntime::new();
+        let ctx = stub_context_with_policy(runtime, |policy| {
+            policy.require_shell_approval = true;
+        });
+        let err = strategy
+            .wait(
+                &ctx,
+                json!({
+                    "command": ["echo", "hi"]
+                }),
+                &WaitLimits::new(DEFAULT_WAIT_TIMEOUT),
+            )
+            .await
+            .expect_err("missing approval should fail");
+        if let FunctionCallError::RespondToModel(msg) = err {
+            assert!(msg.contains("require approval"));
+        } else {
+            panic!("unexpected error variant: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_strategy_requires_justification_with_approval() {
+        let strategy = ShellStrategy;
+        let runtime = StubRuntime::new();
+        let ctx = stub_context_with_policy(runtime, |policy| {
+            policy.require_shell_approval = true;
+        });
+        let err = strategy
+            .wait(
+                &ctx,
+                json!({
+                    "command": ["echo", "hi"],
+                    "with_escalated_permissions": true,
+                    "justification": "   "
+                }),
+                &WaitLimits::new(DEFAULT_WAIT_TIMEOUT),
+            )
+            .await
+            .expect_err("empty justification should fail");
+        if let FunctionCallError::RespondToModel(msg) = err {
+            assert!(msg.contains("must include a non-empty justification"));
+        } else {
+            panic!("unexpected error variant: {err:?}");
+        }
     }
 }
