@@ -1,5 +1,6 @@
 pub mod context;
 pub(crate) mod handlers;
+pub mod names;
 pub mod parallel;
 pub mod registry;
 pub mod router;
@@ -23,6 +24,7 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::ApplyPatchCommandContext;
 use crate::tools::context::ExecCommandContext;
 use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::names::normalize_tool_name;
 use codex_apply_patch::MaybeApplyPatchVerified;
 use codex_apply_patch::maybe_parse_apply_patch_verified;
 use codex_protocol::protocol::AskForApproval;
@@ -106,6 +108,8 @@ pub(crate) async fn handle_container_exec_with_params(
         params.command.clone()
     };
 
+    let canonical_tool_name = normalize_tool_name(tool_name);
+
     let exec_command_context = ExecCommandContext {
         sub_id: sub_id.clone(),
         call_id: call_id.clone(),
@@ -120,7 +124,7 @@ pub(crate) async fn handle_container_exec_with_params(
                 changes: convert_apply_patch_to_protocol(action),
             },
         ),
-        tool_name: tool_name.to_string(),
+        tool_name: canonical_tool_name.to_string(),
         otel_event_manager,
     };
 

@@ -8,6 +8,7 @@ use crate::function_tool::FunctionCallError;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
+use crate::tools::names::normalize_tool_name;
 use crate::tools::registry::ConfiguredToolSpec;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::spec::ToolsConfig;
@@ -67,7 +68,7 @@ impl ToolRouter {
             } => {
                 if let Some((server, tool)) = session.parse_mcp_tool_name(&name) {
                     Ok(Some(ToolCall {
-                        tool_name: name,
+                        tool_name: normalize_tool_name(&name).into_owned(),
                         call_id,
                         payload: ToolPayload::Mcp {
                             server,
@@ -82,7 +83,7 @@ impl ToolRouter {
                         ToolPayload::Function { arguments }
                     };
                     Ok(Some(ToolCall {
-                        tool_name: name,
+                        tool_name: normalize_tool_name(&name).into_owned(),
                         call_id,
                         payload,
                     }))
@@ -94,7 +95,7 @@ impl ToolRouter {
                 call_id,
                 ..
             } => Ok(Some(ToolCall {
-                tool_name: name,
+                tool_name: normalize_tool_name(&name).into_owned(),
                 call_id,
                 payload: ToolPayload::Custom { input },
             })),

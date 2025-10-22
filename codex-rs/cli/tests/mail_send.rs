@@ -194,14 +194,16 @@ fn mail_send_registry_json_mode_none_minimal_output() -> Result<()> {
     let sp = socket_path.clone();
     let listener = thread::spawn(move || -> Result<()> {
         let _ = fs::remove_file(&sp);
-        let listener = UnixListener::bind(&sp)
-            .with_context(|| format!("failed to bind {}", sp.display()))?;
+        let listener =
+            UnixListener::bind(&sp).with_context(|| format!("failed to bind {}", sp.display()))?;
         ready_tx.send(()).ok();
         // accept one connection and intentionally do not reply
         let _ = listener.accept();
         Ok(())
     });
-    ready_rx.recv().context("listener did not signal readiness")?;
+    ready_rx
+        .recv()
+        .context("listener did not signal readiness")?;
 
     // Act: send with ack-mode none and --json
     let mut cmd = codex_command(codex_home.path())?;

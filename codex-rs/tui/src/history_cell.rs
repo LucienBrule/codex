@@ -35,8 +35,8 @@ use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use image::DynamicImage;
-use image::ImageReader;
 use image::ImageFormat;
+use image::ImageReader;
 use mcp_types::EmbeddedResourceResource;
 use mcp_types::ResourceLink;
 use ratatui::prelude::*;
@@ -959,9 +959,7 @@ fn try_new_completed_mcp_tool_call_with_image_output(
                 // Prefer the declared MIME type when available; fall back to format guessing.
                 let reader = if image.mime_type.eq_ignore_ascii_case("image/png") {
                     ImageReader::with_format(Cursor::new(&raw_data), ImageFormat::Png)
-                } else if image
-                    .mime_type
-                    .eq_ignore_ascii_case("image/jpeg")
+                } else if image.mime_type.eq_ignore_ascii_case("image/jpeg")
                     || image.mime_type.eq_ignore_ascii_case("image/jpg")
                 {
                     ImageReader::with_format(Cursor::new(&raw_data), ImageFormat::Jpeg)
@@ -1417,8 +1415,8 @@ mod tests {
 
     use mcp_types::CallToolResult;
     use mcp_types::ContentBlock;
-    use mcp_types::TextContent;
     use mcp_types::ImageContent;
+    use mcp_types::TextContent;
 
     fn test_config() -> Config {
         Config::load_from_base_config_with_overrides(
@@ -2030,8 +2028,8 @@ mod tests {
         let raw = base64::engine::general_purpose::STANDARD
             .decode(&b64)
             .expect("base64 decode");
-        let _img = image::load_from_memory_with_format(&raw, image::ImageFormat::Png)
-            .expect("png decode");
+        let _img =
+            image::load_from_memory_with_format(&raw, image::ImageFormat::Png).expect("png decode");
 
         let result = Ok(CallToolResult {
             content: vec![
@@ -2052,7 +2050,10 @@ mod tests {
         });
 
         let cell = super::try_new_completed_mcp_tool_call_with_image_output(&result);
-        assert!(cell.is_some(), "expected image cell when image is not first block");
+        assert!(
+            cell.is_some(),
+            "expected image cell when image is not first block"
+        );
     }
 
     #[test]
@@ -2068,7 +2069,10 @@ mod tests {
         });
 
         let cell = super::try_new_completed_mcp_tool_call_with_image_output(&result);
-        assert!(cell.is_none(), "no image cell expected for text-only result");
+        assert!(
+            cell.is_none(),
+            "no image cell expected for text-only result"
+        );
     }
 
     #[test]

@@ -1,8 +1,9 @@
-use codex_core::config::{
-    load_global_mcp_servers, set_project_trusted, set_windows_wsl_setup_acknowledged,
-    write_global_mcp_servers,
-};
-use codex_core::config_types::{McpServerConfig, McpServerTransportConfig};
+use codex_core::config::load_global_mcp_servers;
+use codex_core::config::set_project_trusted;
+use codex_core::config::set_windows_wsl_setup_acknowledged;
+use codex_core::config::write_global_mcp_servers;
+use codex_core::config_types::McpServerConfig;
+use codex_core::config_types::McpServerTransportConfig;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tempfile::tempdir;

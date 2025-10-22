@@ -240,8 +240,9 @@ impl From<Vec<InputItem>> for ResponseInputItem {
     }
 }
 
-/// If the `name` of a `ResponseItem::FunctionCall` is either `container.exec`
-/// or shell`, the `arguments` field should deserialize to this struct.
+/// If the `name` of a `ResponseItem::FunctionCall` is `container_exec`
+/// (legacy alias `container.exec`) or `shell`, the `arguments` field should
+/// deserialize to this struct.
 #[derive(Deserialize, Debug, Clone, PartialEq, TS)]
 pub struct ShellToolCallParams {
     pub command: Vec<String>,

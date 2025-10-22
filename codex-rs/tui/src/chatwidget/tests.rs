@@ -1149,19 +1149,17 @@ fn exec_output_delta_streams_into_active_cell() {
     let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
 
     begin_exec(&mut chat, "call-stream", "printf 'hello'");
-    stream_exec(
-        &mut chat,
-        "call-stream",
-        ExecOutputStream::Stdout,
-        b"hello",
-    );
+    stream_exec(&mut chat, "call-stream", ExecOutputStream::Stdout, b"hello");
 
     let blob = active_blob(&chat);
-    assert!(blob.contains("hello"), "expected streamed text, got {blob}", blob = blob);
+    assert!(
+        blob.contains("hello"),
+        "expected streamed text, got {blob}",
+        blob = blob
+    );
     assert!(
         blob.contains("▹"),
-        "expected partial marker while awaiting newline, got {blob}"
-        ,
+        "expected partial marker while awaiting newline, got {blob}",
         blob = blob
     );
 
@@ -1185,8 +1183,7 @@ fn exec_output_delta_streams_into_active_cell() {
     );
     assert!(
         !blob.contains("▹"),
-        "partial marker should clear once newline received, blob: {blob}"
-        ,
+        "partial marker should clear once newline received, blob: {blob}",
         blob = blob
     );
 }
@@ -1197,12 +1194,7 @@ fn exec_output_delta_handles_split_multibyte_utf8() {
 
     begin_exec(&mut chat, "call-utf8", "printf 'hello €'");
 
-    stream_exec(
-        &mut chat,
-        "call-utf8",
-        ExecOutputStream::Stdout,
-        b"hello ",
-    );
+    stream_exec(&mut chat, "call-utf8", ExecOutputStream::Stdout, b"hello ");
     let blob = active_blob(&chat);
     assert!(
         blob.contains("hello "),
@@ -1215,12 +1207,7 @@ fn exec_output_delta_handles_split_multibyte_utf8() {
         blob = blob
     );
 
-    stream_exec(
-        &mut chat,
-        "call-utf8",
-        ExecOutputStream::Stdout,
-        &[0xE2],
-    );
+    stream_exec(&mut chat, "call-utf8", ExecOutputStream::Stdout, &[0xE2]);
     let blob = active_blob(&chat);
     assert!(
         !blob.contains('\u{FFFD}'),
@@ -1258,7 +1245,10 @@ fn exec_output_delta_buffers_until_begin() {
         b"buffered line\n",
     );
 
-    assert!(chat.active_cell.is_none(), "delta should not draw before begin");
+    assert!(
+        chat.active_cell.is_none(),
+        "delta should not draw before begin"
+    );
 
     begin_exec(&mut chat, "call-buffer", "echo buffered");
 

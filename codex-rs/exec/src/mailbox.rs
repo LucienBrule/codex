@@ -26,6 +26,7 @@ use codex_core::protocol::Submission;
 use codex_core::validate_mailbox_message;
 use codex_protocol::ConversationId;
 use codex_protocol::mailbox::MailboxMessage;
+use fs2::FileExt as _;
 use serde::Deserialize;
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -46,7 +47,6 @@ use tracing::error;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
-use fs2::FileExt as _;
 
 mod mailbox_spool;
 use mailbox_spool::MailboxSpoolWriter;
@@ -128,12 +128,7 @@ impl MailboxServer {
         let events = Arc::new(MailboxEventRegistry::default());
 
         // Initialize per-conversation spool writer (best-effort, non-fatal)
-        let spool = match MailboxSpoolWriter::new(
-            config.clone(),
-            &namespace,
-            conversation_id,
-        )
-        .await
+        let spool = match MailboxSpoolWriter::new(config.clone(), &namespace, conversation_id).await
         {
             Ok(writer) => Some(writer),
             Err(err) => {
@@ -212,7 +207,10 @@ impl MailboxServer {
 
         // Append mailbox delivery events to per-conversation spool (best-effort)
         if let EventMsg::MailboxDelivery(delivery) = &event.msg {
-            if matches!(delivery.state, MailboxDeliveryState::Enqueued | MailboxDeliveryState::Delivered) {
+            if matches!(
+                delivery.state,
+                MailboxDeliveryState::Enqueued | MailboxDeliveryState::Delivered
+            ) {
                 if let Some(spool) = &self.spool {
                     if let Err(err) = spool.append_delivery(delivery.clone()).await {
                         warn!(target: "codex::mailbox", event = "mailbox.spool.append_failed", ?err, "failed to append mailbox delivery to spool");
@@ -406,7 +404,7 @@ async fn process_envelope(
                 }
             }
             MailboxOutcome::Enqueued(submission_id, delivery)
-        },
+        }
         Ok(Ok(MailboxEventOutcome::QueueFull(capacity))) => MailboxOutcome::QueueFull(capacity),
         Ok(Ok(MailboxEventOutcome::Disabled)) => MailboxOutcome::Disabled,
         Ok(Ok(MailboxEventOutcome::DispatcherClosed)) => MailboxOutcome::DispatcherClosed,
@@ -921,8 +919,7 @@ fn acquire_registry_lock(registry_path: &Path) -> Result<File> {
         .file_name()
         .ok_or_else(|| anyhow!("registry path {} missing filename", registry_path.display()))?
         .to_string_lossy();
-    let lock_path = registry_path
-        .with_file_name(format!("{}.lock", file_name));
+    let lock_path = registry_path.with_file_name(format!("{}.lock", file_name));
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create lock parent {}", parent.display()))?;
@@ -1056,7 +1053,8 @@ mod tests {
         let dir = TempDir::new().context("create temp dir")?;
         let path = dir.path().join("registry.json");
 
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::Ordering;
         let running = Arc::new(AtomicBool::new(true));
 
         // Spawn continuous reader loop that attempts to parse JSON without taking locks.
@@ -1110,7 +1108,10 @@ mod tests {
         }
         running.store(false, Ordering::Relaxed);
         let ok_reads = reader.await.expect("join reader");
-        assert!(ok_reads > 0, "reader should have observed at least one parse");
+        assert!(
+            ok_reads > 0,
+            "reader should have observed at least one parse"
+        );
 
         // Ensure there are no leftover temp files from incomplete renames.
         for entry in std::fs::read_dir(dir.path())? {

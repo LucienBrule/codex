@@ -283,7 +283,10 @@ pub struct SummariesBatchTelemetry {
 
 impl SummariesBatchTelemetry {
     pub fn new(queue_depth: usize) -> Self {
-        Self { start: Instant::now(), queue_depth }
+        Self {
+            start: Instant::now(),
+            queue_depth,
+        }
     }
 
     pub fn finish(self, summary_text: &str) -> SummariesSnapshot {

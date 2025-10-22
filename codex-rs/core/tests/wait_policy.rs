@@ -10,7 +10,8 @@ fn wait_policy_from_toml_rejects_unknown_predicate() {
         allowed_predicates: Some(vec!["timer".into(), "bogus".into()]),
         ..WaitPolicyToml::default()
     };
-    let err = WaitPolicySettings::from_toml(Some(&toml)).expect_err("invalid predicate should fail");
+    let err =
+        WaitPolicySettings::from_toml(Some(&toml)).expect_err("invalid predicate should fail");
     assert!(
         err.contains("bogus"),
         "error should mention the offending predicate: {err}"

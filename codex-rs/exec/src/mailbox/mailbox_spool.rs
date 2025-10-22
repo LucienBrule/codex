@@ -1,5 +1,6 @@
 use std::io::Error as IoError;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -64,7 +65,11 @@ fn limits_from_env() -> (u64, u64, i64) {
 }
 
 fn inbox_dir(config: &Config, namespace: &str) -> PathBuf {
-    config.codex_home.join(namespace).join("mailbox").join("inbox")
+    config
+        .codex_home
+        .join(namespace)
+        .join("mailbox")
+        .join("inbox")
 }
 
 fn inbox_active_path(dir: &Path, conversation_id: &ConversationId) -> PathBuf {
@@ -104,7 +109,9 @@ async fn rotate_if_needed(path: &Path, max_bytes: u64, max_lines: u64) -> Result
         .and_then(|s| s.to_str())
         .unwrap_or("inbox.jsonl");
     // Derive conversation id from active file name prefix `inbox-<id>.jsonl`
-    let conv = file_name.trim_start_matches("inbox-").trim_end_matches(".jsonl");
+    let conv = file_name
+        .trim_start_matches("inbox-")
+        .trim_end_matches(".jsonl");
     let conv = conv.split('-').next().unwrap_or(conv);
     let ts = OffsetDateTime::now_utc();
     let rotated = rotated_filename(conv, ts)?;
@@ -114,12 +121,18 @@ async fn rotate_if_needed(path: &Path, max_bytes: u64, max_lines: u64) -> Result
 }
 
 async fn prune_old_files(dir: &Path, ttl_days: i64) -> Result<()> {
-    if ttl_days <= 0 { return Ok(()); }
+    if ttl_days <= 0 {
+        return Ok(());
+    }
     let cutoff = OffsetDateTime::now_utc() - time::Duration::days(ttl_days);
-    let mut rd = tokio::fs::read_dir(dir).await.with_context(|| format!("read_dir {}", dir.display()))?;
+    let mut rd = tokio::fs::read_dir(dir)
+        .await
+        .with_context(|| format!("read_dir {}", dir.display()))?;
     while let Ok(Some(ent)) = rd.next_entry().await {
         let path = ent.path();
-        if !path.is_file() { continue; }
+        if !path.is_file() {
+            continue;
+        }
         if let Ok(meta) = ent.metadata().await {
             if let Ok(modified) = meta.modified() {
                 if let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH) {
@@ -136,11 +149,21 @@ async fn prune_old_files(dir: &Path, ttl_days: i64) -> Result<()> {
 }
 
 impl MailboxSpoolWriter {
-    pub async fn new(config: Config, namespace: &str, conversation_id: ConversationId) -> Result<Self> {
+    pub async fn new(
+        config: Config,
+        namespace: &str,
+        conversation_id: ConversationId,
+    ) -> Result<Self> {
         let (tx, mut rx) = mpsc::channel::<Cmd>(1024);
-        let ns = if namespace.is_empty() { ns_from_env() } else { namespace.to_string() };
+        let ns = if namespace.is_empty() {
+            ns_from_env()
+        } else {
+            namespace.to_string()
+        };
         let dir = inbox_dir(&config, &ns);
-        tokio::fs::create_dir_all(&dir).await.with_context(|| format!("create inbox dir {}", dir.display()))?;
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .with_context(|| format!("create inbox dir {}", dir.display()))?;
 
         let active_path = inbox_active_path(&dir, &conversation_id);
         let (max_bytes, max_lines, ttl_days) = limits_from_env();
@@ -156,7 +179,9 @@ impl MailboxSpoolWriter {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = tokio::fs::set_permissions(&active_path, std::fs::Permissions::from_mode(0o600)).await;
+            let _ =
+                tokio::fs::set_permissions(&active_path, std::fs::Permissions::from_mode(0o600))
+                    .await;
         }
 
         // Announce readiness before spawning writer loop
@@ -167,22 +192,40 @@ impl MailboxSpoolWriter {
                 match cmd {
                     Cmd::Append(ev) => {
                         // rotate if needed (ignore errors)
-                        if let Err(err) = rotate_if_needed(&active_path, max_bytes, max_lines).await {
+                        if let Err(err) = rotate_if_needed(&active_path, max_bytes, max_lines).await
+                        {
                             warn!(target: "codex::mailbox", event = "mailbox.spool.rotate_failed", ?err, path = %active_path.display());
                         }
                         let role_str = match ev.message.sender.role {
-                            codex_protocol::mailbox::MailboxSenderRole::System => "system".to_string(),
-                            codex_protocol::mailbox::MailboxSenderRole::Orchestrator => "orchestrator".to_string(),
-                            codex_protocol::mailbox::MailboxSenderRole::Operator => "operator".to_string(),
-                            codex_protocol::mailbox::MailboxSenderRole::Automation => "automation".to_string(),
+                            codex_protocol::mailbox::MailboxSenderRole::System => {
+                                "system".to_string()
+                            }
+                            codex_protocol::mailbox::MailboxSenderRole::Orchestrator => {
+                                "orchestrator".to_string()
+                            }
+                            codex_protocol::mailbox::MailboxSenderRole::Operator => {
+                                "operator".to_string()
+                            }
+                            codex_protocol::mailbox::MailboxSenderRole::Automation => {
+                                "automation".to_string()
+                            }
                         };
                         let ct_str = match ev.message.body.content_type {
                             codex_protocol::mailbox::MailboxContentType::TextPlain => "text/plain",
-                            codex_protocol::mailbox::MailboxContentType::TextMarkdown => "text/markdown",
-                            codex_protocol::mailbox::MailboxContentType::ApplicationJson => "application/json",
+                            codex_protocol::mailbox::MailboxContentType::TextMarkdown => {
+                                "text/markdown"
+                            }
+                            codex_protocol::mailbox::MailboxContentType::ApplicationJson => {
+                                "application/json"
+                            }
                         };
                         let line = SpoolLine {
-                            r#type: match ev.state { codex_protocol::protocol::MailboxDeliveryState::Delivered => "delivered", _ => "enqueued" },
+                            r#type: match ev.state {
+                                codex_protocol::protocol::MailboxDeliveryState::Delivered => {
+                                    "delivered"
+                                }
+                                _ => "enqueued",
+                            },
                             message_id: ev.message.message_id,
                             from: &ev.message.sender.id,
                             role: role_str,

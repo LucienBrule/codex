@@ -35,25 +35,27 @@ use codex_protocol::config_types::Verbosity;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use dirs::home_dir;
 use serde::Deserialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::fmt;
 use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
-use std::time::Duration;
-use std::fmt;
 use std::str::FromStr;
-use std::sync::{OnceLock, RwLock};
+use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::time::Duration;
 
+use crate::config_edit::CONFIG_KEY_EFFORT;
+use crate::config_edit::CONFIG_KEY_MODEL;
+use crate::config_edit::persist_overrides_and_clear_if_none;
 use tempfile::NamedTempFile;
 use toml::Value as TomlValue;
 use toml_edit::Array as TomlArray;
 use toml_edit::DocumentMut;
 use toml_edit::Item as TomlItem;
 use toml_edit::Table as TomlTable;
-use crate::config_edit::{
-    persist_overrides_and_clear_if_none, CONFIG_KEY_EFFORT, CONFIG_KEY_MODEL,
-};
 
 #[cfg(target_os = "windows")]
 pub const OPENAI_DEFAULT_MODEL: &str = "gpt-5";
@@ -458,7 +460,9 @@ impl WaitPolicySettings {
         }
         if let Some(seconds) = overrides.max_duration_seconds {
             if seconds == 0 {
-                return Err("wait policy override max_duration_seconds must be positive".to_string());
+                return Err(
+                    "wait policy override max_duration_seconds must be positive".to_string()
+                );
             }
             self.max_duration = Duration::from_secs(seconds);
         }
@@ -1219,7 +1223,9 @@ pub fn summaries_base_dir_override() -> Option<PathBuf> {
     };
 
     #[derive(Deserialize)]
-    struct PartialConfig { summaries: Option<SummariesToml> }
+    struct PartialConfig {
+        summaries: Option<SummariesToml>,
+    }
 
     let cfg: PartialConfig = match toml::from_str(&contents) {
         Ok(v) => v,
@@ -1434,9 +1440,7 @@ impl Config {
             if let Some(profile_wait) = cfg.wait_profiles.get(profile_name) {
                 wait_settings = wait_settings
                     .apply_toml(profile_wait)
-                    .map_err(|err| {
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, err)
-                    })?;
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
                 wait_settings.normalize();
             }
         }
@@ -1788,6 +1792,8 @@ persistence = "none"
     fn wait_policy_profile_override_applies() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut cfg = ConfigToml::default();
+        cfg.profiles
+            .insert("dev".to_string(), ConfigProfile::default());
         cfg.profile = Some("dev".to_string());
         cfg.wait = Some(WaitPolicyToml {
             allowed_predicates: Some(vec!["timer".to_string()]),
@@ -1808,8 +1814,9 @@ persistence = "none"
             ..Default::default()
         };
 
-        let config = Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
-            .expect("config");
+        let config =
+            Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+                .expect("config");
 
         assert!(config.wait.is_allowed(WaitPredicateKind::Shell));
         assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
@@ -1835,8 +1842,9 @@ persistence = "none"
             ..Default::default()
         };
 
-        let config = Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
-            .expect("config");
+        let config =
+            Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+                .expect("config");
 
         assert_eq!(config.wait.max_duration(), Duration::from_secs(10));
         assert!(config.wait.is_allowed(WaitPredicateKind::Filesystem));
@@ -1856,8 +1864,9 @@ persistence = "none"
             ..Default::default()
         };
 
-        let config = Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
-            .expect("config");
+        let config =
+            Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+                .expect("config");
 
         assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
         assert!(!config.wait.is_allowed(WaitPredicateKind::Filesystem));

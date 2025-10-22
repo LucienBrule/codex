@@ -5,13 +5,13 @@ mod imp {
     use opentelemetry::metrics::Counter;
     use opentelemetry::metrics::Histogram;
     use opentelemetry::metrics::UpDownCounter;
-    use std::sync::OnceLock;
-    use std::sync::Mutex;
     use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
 
     const METER_NAME: &str = "codex.keepalive";
     const MAILBOX_METER_NAME: &str = "codex.mailbox";
-    const WAIT_METER_NAME: &str = "codex.wait";
+    const WAIT_METER_NAME: &str = "wait_with_predicate";
 
     struct KeepaliveMetrics {
         heartbeat_total: Counter<u64>,
@@ -104,7 +104,9 @@ mod imp {
             // New: queue depth gauge (implemented as up/down counter with deltas)
             let queue_depth_gauge = meter
                 .i64_up_down_counter("codex_mailbox_queue_depth_gauge")
-                .with_description("Current mailbox queue depth, per namespace (up/down counter-based gauge).")
+                .with_description(
+                    "Current mailbox queue depth, per namespace (up/down counter-based gauge).",
+                )
                 .build();
             Self {
                 queue_depth,
@@ -133,19 +135,21 @@ mod imp {
         fn new() -> Self {
             let meter = global::meter(WAIT_METER_NAME);
             let started_total = meter
-                .u64_counter("codex_wait_started_total")
+                .u64_counter("wait_with_predicate_started_total")
                 .with_description("Count of wait predicate invocations.")
                 .build();
             let completed_duration = meter
-                .f64_histogram("codex_wait_duration_seconds")
+                .f64_histogram("wait_with_predicate_duration_seconds")
                 .with_description("Observed wait predicate completion durations in seconds.")
                 .build();
             let failed_total = meter
-                .u64_counter("codex_wait_failed_total")
-                .with_description("Count of wait predicates that ended with an error before completion.")
+                .u64_counter("wait_with_predicate_failed_total")
+                .with_description(
+                    "Count of wait predicates that ended with an error before completion.",
+                )
                 .build();
             let policy_violation_total = meter
-                .u64_counter("codex_wait_policy_violation_total")
+                .u64_counter("wait_with_predicate_policy_violation_total")
                 .with_description("Count of wait predicates rejected due to policy enforcement.")
                 .build();
 
@@ -366,15 +370,15 @@ mod imp {
 
 pub use imp::record_heartbeat;
 pub use imp::record_idle_timeout;
+pub use imp::record_mailbox_accept_total;
 pub use imp::record_mailbox_ack_total;
 pub use imp::record_mailbox_delivery_latency;
+pub use imp::record_mailbox_error_total;
 pub use imp::record_mailbox_expiry_total;
 pub use imp::record_mailbox_queue_depth;
-pub use imp::record_mailbox_accept_total;
-pub use imp::record_mailbox_error_total;
-pub use imp::update_mailbox_queue_depth_gauge;
 pub use imp::record_reconnect;
 pub use imp::record_wait_completed;
 pub use imp::record_wait_failed;
 pub use imp::record_wait_policy_violation;
 pub use imp::record_wait_started;
+pub use imp::update_mailbox_queue_depth_gauge;

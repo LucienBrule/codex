@@ -85,10 +85,7 @@ impl TurnState {
     pub(crate) fn clear_pending(&mut self) -> Vec<Uuid> {
         self.pending_approvals.clear();
         self.pending_input.clear();
-        self.delayed_triggers
-            .drain(..)
-            .map(|(id, _)| id)
-            .collect()
+        self.delayed_triggers.drain(..).map(|(id, _)| id).collect()
     }
 
     pub(crate) fn push_pending_input(&mut self, input: ResponseInputItem) {

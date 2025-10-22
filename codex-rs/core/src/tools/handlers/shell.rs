@@ -10,6 +10,7 @@ use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::handle_container_exec_with_params;
+use crate::tools::names::normalize_tool_name;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 
@@ -61,8 +62,9 @@ impl ToolHandler for ShellHandler {
                         ))
                     })?;
                 let exec_params = Self::to_exec_params(params, turn.as_ref());
+                let canonical_name = normalize_tool_name(tool_name.as_str());
                 let content = handle_container_exec_with_params(
-                    tool_name.as_str(),
+                    canonical_name.as_ref(),
                     exec_params,
                     Arc::clone(&session),
                     Arc::clone(&turn),
@@ -78,8 +80,9 @@ impl ToolHandler for ShellHandler {
             }
             ToolPayload::LocalShell { params } => {
                 let exec_params = Self::to_exec_params(params, turn.as_ref());
+                let canonical_name = normalize_tool_name(tool_name.as_str());
                 let content = handle_container_exec_with_params(
-                    tool_name.as_str(),
+                    canonical_name.as_ref(),
                     exec_params,
                     Arc::clone(&session),
                     Arc::clone(&turn),

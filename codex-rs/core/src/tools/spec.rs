@@ -1,12 +1,19 @@
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
 use crate::model_family::ModelFamily;
-use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
 use crate::tools::handlers::MAILBOX_READ_TOOL_NAME;
+use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
 use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::apply_patch::ApplyPatchToolType;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
 use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
+use crate::tools::names::CONTAINER_EXEC_TOOL_NAME;
+use crate::tools::names::LEGACY_CODEX_WAIT_DOTTED_TOOL_NAME;
+use crate::tools::names::LEGACY_CODEX_WAIT_UNDERSCORE_TOOL_NAME;
+use crate::tools::names::LEGACY_CONTAINER_EXEC_TOOL_NAME;
+use crate::tools::names::LOCAL_SHELL_TOOL_NAME;
+use crate::tools::names::SHELL_TOOL_NAME;
+use crate::tools::names::WAIT_WITH_PREDICATE_TOOL_NAME;
 use crate::tools::registry::ToolRegistryBuilder;
 use serde::Deserialize;
 use serde::Serialize;
@@ -283,8 +290,7 @@ fn create_mailbox_send_tool() -> ToolSpec {
         "conversation_id".to_string(),
         JsonSchema::String {
             description: Some(
-                "Target conversation UUID. If provided, takes precedence over 'to'."
-                    .to_string(),
+                "Target conversation UUID. If provided, takes precedence over 'to'.".to_string(),
             ),
         },
     );
@@ -706,7 +712,7 @@ fn create_wait_tool() -> ToolSpec {
     );
 
     ToolSpec::Function(ResponsesApiTool {
-        name: "codex.wait".to_string(),
+        name: WAIT_WITH_PREDICATE_TOOL_NAME.to_string(),
         description: "Waits for a predicate to be satisfied without blocking the turn. Supports timer, filesystem, and shell predicates."
             .to_string(),
         strict: false,
@@ -1002,9 +1008,10 @@ pub(crate) fn build_specs(
     }
 
     // Always register shell aliases so older prompts remain compatible.
-    builder.register_handler("shell", shell_handler.clone());
-    builder.register_handler("container.exec", shell_handler.clone());
-    builder.register_handler("local_shell", shell_handler);
+    builder.register_handler(SHELL_TOOL_NAME, shell_handler.clone());
+    builder.register_handler(CONTAINER_EXEC_TOOL_NAME, shell_handler.clone());
+    builder.register_handler(LEGACY_CONTAINER_EXEC_TOOL_NAME, shell_handler.clone());
+    builder.register_handler(LOCAL_SHELL_TOOL_NAME, shell_handler);
 
     if config.plan_tool {
         builder.push_spec(PLAN_TOOL.clone());
@@ -1022,7 +1029,9 @@ pub(crate) fn build_specs(
     builder.register_handler(MAILBOX_READ_TOOL_NAME, mailbox_read_handler);
 
     builder.push_spec_with_parallel_support(create_wait_tool(), true);
-    builder.register_handler("codex.wait", wait_handler);
+    builder.register_handler(WAIT_WITH_PREDICATE_TOOL_NAME, wait_handler.clone());
+    builder.register_handler(LEGACY_CODEX_WAIT_UNDERSCORE_TOOL_NAME, wait_handler.clone());
+    builder.register_handler(LEGACY_CODEX_WAIT_DOTTED_TOOL_NAME, wait_handler);
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {
@@ -1174,7 +1183,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "web_search",
                 "view_image",
             ],
@@ -1203,7 +1212,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "web_search",
                 "view_image",
             ],
@@ -1323,16 +1332,17 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "web_search",
                 "view_image",
                 "test_server__do_something_cool",
             ],
         );
 
+        let tool = find_tool(&tools, "test_server__do_something_cool");
         assert_eq!(
-            tools[6].spec,
-            ToolSpec::Function(ResponsesApiTool {
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
                 name: "test_server__do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([
@@ -1445,7 +1455,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "view_image",
                 "test_server__cool",
                 "test_server__do",
@@ -1499,7 +1509,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1507,9 +1517,10 @@ mod tests {
             ],
         );
 
+        let tool = find_tool(&tools, "dash_search");
         assert_eq!(
-            tools[7].spec,
-            ToolSpec::Function(ResponsesApiTool {
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
                 name: "dash_search".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
@@ -1570,16 +1581,17 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
                 "web_search",
                 "view_image",
                 "dash_paginate",
             ],
         );
+        let tool = find_tool(&tools, "dash_paginate");
         assert_eq!(
-            tools[7].spec,
-            ToolSpec::Function(ResponsesApiTool {
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
                 name: "dash_paginate".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
@@ -1638,16 +1650,17 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
                 "web_search",
                 "view_image",
                 "dash_tags",
             ],
         );
+        let tool = find_tool(&tools, "dash_tags");
         assert_eq!(
-            tools[7].spec,
-            ToolSpec::Function(ResponsesApiTool {
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
                 name: "dash_tags".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
@@ -1709,16 +1722,17 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
                 "web_search",
                 "view_image",
                 "dash_value",
             ],
         );
+        let tool = find_tool(&tools, "dash_value");
         assert_eq!(
-            tools[7].spec,
-            ToolSpec::Function(ResponsesApiTool {
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
                 name: "dash_value".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
@@ -1874,7 +1888,7 @@ mod tests {
                 "mailbox_send",
                 "codex_mailbox_send",
                 "mailbox_read",
-                "codex.wait",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
                 "web_search",
                 "view_image",
@@ -1882,9 +1896,10 @@ mod tests {
             ],
         );
 
+        let tool = find_tool(&tools, "test_server__do_something_cool");
         assert_eq!(
-            tools[7].spec,
-            ToolSpec::Function(ResponsesApiTool {
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
                 name: "test_server__do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([

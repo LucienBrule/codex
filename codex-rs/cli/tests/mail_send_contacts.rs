@@ -168,7 +168,10 @@ fn mail_send_with_unknown_to_errors() -> Result<()> {
     let namespace = "codex";
     let ns_dir = codex_home.path().join(namespace);
     fs::create_dir_all(&ns_dir)?;
-    fs::write(ns_dir.join("contacts.toml"), "[contacts]\nknown.contact = \"550e8400-e29b-41d4-a716-446655440000\"\n")?;
+    fs::write(
+        ns_dir.join("contacts.toml"),
+        "[contacts]\nknown.contact = \"550e8400-e29b-41d4-a716-446655440000\"\n",
+    )?;
 
     let mut cmd = codex_command(codex_home.path())?;
     let output = cmd
@@ -194,4 +197,3 @@ fn mail_send_with_unknown_to_errors() -> Result<()> {
     assert!(stderr.contains("Contact 'missing.contact' not found"));
     Ok(())
 }
-

@@ -113,16 +113,22 @@ impl ToolHandler for MailboxSendHandler {
             }
         };
 
-        let MailboxSendArgs { mut message, to, conversation_id, timeout_seconds, wait_for_delivery } = args;
+        let MailboxSendArgs {
+            mut message,
+            to,
+            conversation_id,
+            timeout_seconds,
+            wait_for_delivery,
+        } = args;
 
         // Resolve explicit conversation_id (if provided) or via contacts when 'to' is set.
         let requested_id: Option<Uuid> = if let Some(cid) = conversation_id.as_ref() {
             match Uuid::parse_str(cid) {
                 Ok(id) => Some(id),
                 Err(_) => {
-                    return Err(FunctionCallError::RespondToModel(
-                        format!("invalid conversation_id UUID: {cid}"),
-                    ))
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "invalid conversation_id UUID: {cid}"
+                    )));
                 }
             }
         } else if let Some(name) = to.as_ref() {
@@ -213,7 +219,14 @@ impl ToolHandler for MailboxSendHandler {
 
         let output = MailboxSendJsonOutputNormalized {
             ok: true,
-            mode: Some(if wait_for_delivery { "wait" } else { "enqueue_only" }.to_string()),
+            mode: Some(
+                if wait_for_delivery {
+                    "wait"
+                } else {
+                    "enqueue_only"
+                }
+                .to_string(),
+            ),
             message_id: message.message_id,
             request_id: message.audit.request_id.clone(),
             conversation_id: session.get_conversation_id(),
@@ -315,7 +328,10 @@ mod tests {
 
         // Seed a temporary CODEX_HOME with contacts mapping to current session id
         let home = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("CODEX_HOME", home.path()); }
+        unsafe {
+            std::env::set_var("CODEX_HOME", home.path());
+            std::env::set_var("CODEX_NAMESPACE", "codex");
+        }
         let ns = "codex";
         let nsdir = home.path().join(ns);
         std::fs::create_dir_all(&nsdir).unwrap();
@@ -324,6 +340,10 @@ mod tests {
             session.get_conversation_id()
         );
         std::fs::write(nsdir.join("contacts.toml"), mapping).unwrap();
+        unsafe {
+            std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+            std::env::set_var("CODEX_MAILBOX_OOB", "1");
+        }
 
         let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let message = serde_json::json!({
@@ -346,11 +366,15 @@ mod tests {
             sub_id: "sub-contacts".to_string(),
             call_id: "call-contacts".to_string(),
             tool_name: MAILBOX_SEND_TOOL_NAME.to_string(),
-            payload: ToolPayload::Function { arguments: args.to_string() },
+            payload: ToolPayload::Function {
+                arguments: args.to_string(),
+            },
         };
 
         let output = handler.handle(invocation).await.expect("tool success");
-        let ToolOutput::Function { content, .. } = output else { panic!("expected function output") };
+        let ToolOutput::Function { content, .. } = output else {
+            panic!("expected function output")
+        };
         let parsed: MailboxSendJsonOutputNormalized = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.ok, true);
         assert_eq!(parsed.ack.as_deref(), Some("delivered"));
@@ -362,13 +386,20 @@ mod tests {
         let (_guard, session, turn_context, _submission_task) =
             spawn_test_mailbox_session().await.expect("spawn session");
         let home = tempfile::TempDir::new().unwrap();
-        unsafe { std::env::set_var("CODEX_HOME", home.path()); }
+        unsafe {
+            std::env::set_var("CODEX_HOME", home.path());
+            std::env::set_var("CODEX_NAMESPACE", "codex");
+        }
         let ns = "codex";
         let nsdir = home.path().join(ns);
         std::fs::create_dir_all(&nsdir).unwrap();
         let other_id = uuid::Uuid::now_v7();
         let mapping = format!("[contacts]\nother.session = \"{other_id}\"\n");
         std::fs::write(nsdir.join("contacts.toml"), mapping).unwrap();
+        unsafe {
+            std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+            std::env::set_var("CODEX_MAILBOX_OOB", "1");
+        }
 
         let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let message = serde_json::json!({
@@ -391,7 +422,9 @@ mod tests {
             sub_id: "sub-x".to_string(),
             call_id: "call-x".to_string(),
             tool_name: MAILBOX_SEND_TOOL_NAME.to_string(),
-            payload: ToolPayload::Function { arguments: args.to_string() },
+            payload: ToolPayload::Function {
+                arguments: args.to_string(),
+            },
         };
 
         let err = handler.handle(invocation).await.unwrap_err();
@@ -408,6 +441,11 @@ mod tests {
             spawn_test_mailbox_session().await.expect("spawn session");
 
         let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        unsafe {
+            std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+            std::env::set_var("CODEX_MAILBOX_OOB", "1");
+        }
 
         let message = json!({
             "sender": {

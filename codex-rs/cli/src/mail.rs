@@ -459,18 +459,24 @@ async fn run_send(
     } = args;
 
     // Load config early to resolve contacts if needed
-    let config =
-        load_config(cli_overrides.clone(), config_profile.clone(), cwd.clone(), codex_linux_sandbox_exe.clone()).await?;
+    let config = load_config(
+        cli_overrides.clone(),
+        config_profile.clone(),
+        cwd.clone(),
+        codex_linux_sandbox_exe.clone(),
+    )
+    .await?;
 
     // Resolve contact name to conversation id if provided
     let resolved_contact_id: Option<Uuid> = if let Some(name) = &to {
         let ns = resolve_namespace();
-        let contacts = codex_core::contacts::load_contacts(&config.codex_home, &ns)
-            .map_err(|e| anyhow!(e))?;
+        let contacts =
+            codex_core::contacts::load_contacts(&config.codex_home, &ns).map_err(|e| anyhow!(e))?;
         match contacts.resolve(name) {
             Some(id) => Some(id),
             None => {
-                let (primary, _global) = codex_core::contacts::contacts_paths(&config.codex_home, &ns);
+                let (primary, _global) =
+                    codex_core::contacts::contacts_paths(&config.codex_home, &ns);
                 return Err(anyhow::Error::new(MailboxCliError::io_failure(format!(
                     "Contact '{name}' not found in namespace '{ns}'. Check {} or run `codex_ctl mailbox sweep` if the mapping is stale.",
                     primary.display()
@@ -679,27 +685,25 @@ async fn send_via_registry(
 
     // Prefer registry entry when present, but fall back to a deterministic socket path
     // when the registry has no record for the provided conversation id.
-    let (socket_path, stored_socket_path, have_registry_entry) = match registry
-        .find(&conversation_id)
-        .cloned()
-    {
-        Some(entry) => {
-            let stored = entry.socket_path.clone();
-            let resolved = if stored.is_absolute() {
-                stored.clone()
-            } else {
-                mailbox_dir.join(&stored)
-            };
-            (resolved, stored, true)
-        }
-        None => {
-            let resolved = mailbox_dir.join(format!("{}.sock", conversation_id));
-            // Use the resolved path as a stand-in for stored_socket_path when no registry
-            // entry exists. We will avoid any registry mutation paths guarded by
-            // `have_registry_entry` later.
-            (resolved.clone(), resolved, false)
-        }
-    };
+    let (socket_path, stored_socket_path, have_registry_entry) =
+        match registry.find(&conversation_id).cloned() {
+            Some(entry) => {
+                let stored = entry.socket_path.clone();
+                let resolved = if stored.is_absolute() {
+                    stored.clone()
+                } else {
+                    mailbox_dir.join(&stored)
+                };
+                (resolved, stored, true)
+            }
+            None => {
+                let resolved = mailbox_dir.join(format!("{}.sock", conversation_id));
+                // Use the resolved path as a stand-in for stored_socket_path when no registry
+                // entry exists. We will avoid any registry mutation paths guarded by
+                // `have_registry_entry` later.
+                (resolved.clone(), resolved, false)
+            }
+        };
 
     let stream = match connect_with_retry(&socket_path).await {
         Ok(stream) => stream,
@@ -711,9 +715,9 @@ async fn send_via_registry(
         {
             if have_registry_entry {
                 // Treat unreachable sockets as stale: remove the entry to avoid replays
-                let removed =
-                    registry.remove_if_socket_matches(&conversation_id, &stored_socket_path)
-                        || registry.remove(&conversation_id);
+                let removed = registry
+                    .remove_if_socket_matches(&conversation_id, &stored_socket_path)
+                    || registry.remove(&conversation_id);
                 if removed {
                     if let Err(save_err) = registry.save() {
                         return Err(MailboxCliError::io_failure(format!(
@@ -762,13 +766,17 @@ Ensure the worker is online; the socket appears at this path when connected.",
         payload.push(b'\n');
         use tokio::io::AsyncWriteExt;
         if let Err(err) = stream.write_all(&payload).await {
-            if err.kind() != io::ErrorKind::BrokenPipe && err.kind() != io::ErrorKind::ConnectionReset {
+            if err.kind() != io::ErrorKind::BrokenPipe
+                && err.kind() != io::ErrorKind::ConnectionReset
+            {
                 return Err(MailboxCliError::io_failure(format!(
                     "failed to send mailbox payload: {err}"
                 )));
             }
         } else if let Err(err) = stream.flush().await {
-            if err.kind() != io::ErrorKind::BrokenPipe && err.kind() != io::ErrorKind::ConnectionReset {
+            if err.kind() != io::ErrorKind::BrokenPipe
+                && err.kind() != io::ErrorKind::ConnectionReset
+            {
                 return Err(MailboxCliError::io_failure(format!(
                     "failed to flush mailbox payload: {err}"
                 )));

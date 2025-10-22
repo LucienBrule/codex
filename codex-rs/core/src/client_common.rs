@@ -3,6 +3,9 @@ use crate::error::Result;
 use crate::model_family::ModelFamily;
 use crate::protocol::RateLimitSnapshot;
 use crate::protocol::TokenUsage;
+use crate::tools::names::CONTAINER_EXEC_TOOL_NAME;
+use crate::tools::names::LEGACY_CONTAINER_EXEC_TOOL_NAME;
+use crate::tools::names::SHELL_TOOL_NAME;
 use codex_apply_patch::APPLY_PATCH_TOOL_INSTRUCTIONS;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -132,7 +135,10 @@ fn reserialize_shell_outputs(items: &mut [ResponseItem]) {
 }
 
 fn is_shell_tool_name(name: &str) -> bool {
-    matches!(name, "shell" | "container.exec")
+    matches!(
+        name,
+        SHELL_TOOL_NAME | CONTAINER_EXEC_TOOL_NAME | LEGACY_CONTAINER_EXEC_TOOL_NAME
+    )
 }
 
 #[derive(Deserialize)]

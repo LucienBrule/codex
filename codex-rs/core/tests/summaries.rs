@@ -20,7 +20,11 @@ mod summaries {
     }
 
     fn trim_window<T: Clone>(items: &[T], keep: usize) -> Vec<T> {
-        if items.len() <= keep { items.to_vec() } else { items[items.len() - keep..].to_vec() }
+        if items.len() <= keep {
+            items.to_vec()
+        } else {
+            items[items.len() - keep..].to_vec()
+        }
     }
 
     #[test]
@@ -44,12 +48,15 @@ mod summaries {
         let user: Vec<String> = (1..=20).map(|i| format!("user-{i}")).collect();
         let assistant: Vec<String> = (1..=10).map(|i| format!("assistant-{i}")).collect();
 
-        let kept_user = trim_window(&user, 8);       // keep 8 recent user lines
+        let kept_user = trim_window(&user, 8); // keep 8 recent user lines
         let kept_assistant = trim_window(&assistant, 3); // keep 3 recent assistant lines
 
         assert_eq!(kept_user.first().unwrap(), "user-13"); // 20-8+1 = 13
         assert_eq!(kept_user.last().unwrap(), "user-20");
-        assert_eq!(kept_assistant, vec!["assistant-8", "assistant-9", "assistant-10"]);
+        assert_eq!(
+            kept_assistant,
+            vec!["assistant-8", "assistant-9", "assistant-10"]
+        );
 
         // Build a bridge that includes only the trimmed windows.
         let bridge = make_bridge(&kept_user.join("\n"), &[]);
@@ -57,4 +64,3 @@ mod summaries {
         assert!(!bridge.contains("user-12")); // dropped outside of window
     }
 }
-

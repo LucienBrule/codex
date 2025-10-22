@@ -5,12 +5,15 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 
-use crate::codex::INITIAL_SUBMIT_ID;
-use crate::config::SummariesSettings;
-use crate::protocol::{Event, EventMsg, SummaryUpdatedEvent};
 use super::SummariesState;
-use crate::telemetry::{record_summaries_batch, SummariesBatchTelemetry};
+use crate::codex::INITIAL_SUBMIT_ID;
 use crate::codex::compact::collect_user_messages;
+use crate::config::SummariesSettings;
+use crate::protocol::Event;
+use crate::protocol::EventMsg;
+use crate::protocol::SummaryUpdatedEvent;
+use crate::telemetry::SummariesBatchTelemetry;
+use crate::telemetry::record_summaries_batch;
 use std::time::Instant;
 
 /// Background service that periodically emits running conversation summaries.
@@ -97,7 +100,9 @@ impl SummariesService {
 
                 let event = Event {
                     id: INITIAL_SUBMIT_ID.to_string(),
-                    msg: EventMsg::SummaryUpdated(SummaryUpdatedEvent { summary: new_summary }),
+                    msg: EventMsg::SummaryUpdated(SummaryUpdatedEvent {
+                        summary: new_summary,
+                    }),
                 };
                 // Use the session's event path so rollout/event history sees it.
                 sess.send_event(event).await;

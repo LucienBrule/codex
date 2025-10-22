@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
+use std::str;
 use std::time::Duration;
 use std::time::Instant;
-use std::str;
 
 use codex_core::protocol::ExecOutputStream;
 use codex_protocol::parse_command::ParsedCommand;

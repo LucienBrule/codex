@@ -2,6 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use anyhow::Result;
+use codex_core::WAIT_WITH_PREDICATE_TOOL_NAME;
 use codex_core::protocol::AskForApproval;
 use codex_core::protocol::EventMsg;
 use codex_core::protocol::InputItem;
@@ -19,8 +20,8 @@ use core_test_support::skip_if_no_network;
 use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::test_codex;
 use core_test_support::wait_for_event;
-use serde_json::json;
 use serde_json::Value;
+use serde_json::json;
 
 async fn submit_turn(
     test: &TestCodex,
@@ -45,7 +46,10 @@ async fn submit_turn(
         })
         .await?;
 
-    wait_for_event(&test.codex, |event| matches!(event, EventMsg::TaskComplete(_))).await;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TaskComplete(_))
+    })
+    .await;
 
     Ok(())
 }
@@ -78,7 +82,7 @@ async fn wait_timer_predicate_completes() -> Result<()> {
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_function_call(call_id, "codex.wait", &args),
+            ev_function_call(call_id, WAIT_WITH_PREDICATE_TOOL_NAME, &args),
             ev_completed("resp-1"),
         ]),
     )
@@ -132,7 +136,7 @@ async fn wait_timer_respects_timeout() -> Result<()> {
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_function_call(call_id, "codex.wait", &args),
+            ev_function_call(call_id, WAIT_WITH_PREDICATE_TOOL_NAME, &args),
             ev_completed("resp-1"),
         ]),
     )
@@ -186,7 +190,7 @@ async fn wait_filesystem_invalid_schema_returns_error() -> Result<()> {
         &server,
         sse(vec![
             ev_response_created("resp-1"),
-            ev_function_call(call_id, "codex.wait", &args),
+            ev_function_call(call_id, WAIT_WITH_PREDICATE_TOOL_NAME, &args),
             ev_completed("resp-1"),
         ]),
     )

@@ -93,21 +93,40 @@ async fn model_selects_expected_tools() {
     let codex_tools = collect_tool_identifiers_for_model("codex-mini-latest").await;
     assert_eq!(
         codex_tools,
-        vec!["local_shell".to_string()],
-        "codex-mini-latest should expose the local shell tool",
+        vec![
+            "local_shell".to_string(),
+            "mailbox_send".to_string(),
+            "codex_mailbox_send".to_string(),
+            "mailbox_read".to_string(),
+            "wait_with_predicate".to_string(),
+        ],
+        "codex-mini-latest should expose local shell, mailbox, and wait tools",
     );
 
     let o3_tools = collect_tool_identifiers_for_model("o3").await;
     assert_eq!(
         o3_tools,
-        vec!["shell".to_string()],
-        "o3 should expose the generic shell tool",
+        vec![
+            "shell".to_string(),
+            "mailbox_send".to_string(),
+            "codex_mailbox_send".to_string(),
+            "mailbox_read".to_string(),
+            "wait_with_predicate".to_string(),
+        ],
+        "o3 should expose shell, mailbox, and wait tools",
     );
 
     let gpt5_codex_tools = collect_tool_identifiers_for_model("gpt-5-codex").await;
     assert_eq!(
         gpt5_codex_tools,
-        vec!["shell".to_string(), "apply_patch".to_string(),],
-        "gpt-5-codex should expose the apply_patch tool",
+        vec![
+            "shell".to_string(),
+            "mailbox_send".to_string(),
+            "codex_mailbox_send".to_string(),
+            "mailbox_read".to_string(),
+            "wait_with_predicate".to_string(),
+            "apply_patch".to_string(),
+        ],
+        "gpt-5-codex should expose shell, mailbox, wait, and apply_patch tools",
     );
 }

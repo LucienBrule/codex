@@ -1,7 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use codex_protocol::ConversationId;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 use time::OffsetDateTime;
 
 /// Default runtime summaries directory.
@@ -157,10 +159,9 @@ pub(crate) async fn read_summary_checkpoint_with_base(
     let (final_path, _tmp_path) = checkpoint_paths_for_base(base, conversation_id);
     match tokio::fs::read(&final_path).await {
         Ok(bytes) => {
-            let checkpoint: SummaryCheckpoint = serde_json::from_slice(&bytes)
-                .map_err(|e| std::io::Error::other(format!(
-                    "failed to parse summary checkpoint: {e}"
-                )))?;
+            let checkpoint: SummaryCheckpoint = serde_json::from_slice(&bytes).map_err(|e| {
+                std::io::Error::other(format!("failed to parse summary checkpoint: {e}"))
+            })?;
             Ok(Some(checkpoint.summary))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -171,8 +172,8 @@ pub(crate) async fn read_summary_checkpoint_with_base(
 #[cfg(test)]
 mod summaries_checkpoint {
     use super::*;
-    use tempfile::tempdir;
     use serial_test::serial;
+    use tempfile::tempdir;
 
     #[tokio::test]
     async fn path_builder() {
@@ -200,10 +201,16 @@ mod summaries_checkpoint {
     #[serial(summaries_checkpoint)]
     fn default_checkpoint_path_is_namespaced_under_cx() {
         // Ensure no explicit override interferes
-        unsafe { std::env::remove_var("CODEX_SUMMARIES_BASE_DIR"); }
+        unsafe {
+            std::env::remove_var("CODEX_SUMMARIES_BASE_DIR");
+        }
         // Force deterministic runtime dir
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000"); }
-        unsafe { std::env::set_var("CODEX_NAMESPACE", "purple"); }
+        unsafe {
+            std::env::set_var("XDG_RUNTIME_DIR", "/run/user/1000");
+        }
+        unsafe {
+            std::env::set_var("CODEX_NAMESPACE", "purple");
+        }
         let id = ConversationId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
         let p = checkpoint_path(&id);
         let expected = PathBuf::from("/run/user/1000/cx/purple/summaries")
@@ -216,13 +223,19 @@ mod summaries_checkpoint {
     #[serial(summaries_checkpoint)]
     fn env_override_wins() {
         let tmp = tempdir().unwrap();
-        unsafe { std::env::set_var("CODEX_SUMMARIES_BASE_DIR", tmp.path()); }
-        unsafe { std::env::set_var("CODEX_NAMESPACE", "ignored"); } // should be ignored when override is set
+        unsafe {
+            std::env::set_var("CODEX_SUMMARIES_BASE_DIR", tmp.path());
+        }
+        unsafe {
+            std::env::set_var("CODEX_NAMESPACE", "ignored");
+        } // should be ignored when override is set
         let id = ConversationId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
         let p = checkpoint_path(&id);
         assert!(p.starts_with(tmp.path()));
         assert!(p.ends_with("67e55044-10b1-426f-9247-bb680e5fe0c8/summary.json"));
-        unsafe { std::env::remove_var("CODEX_SUMMARIES_BASE_DIR"); }
+        unsafe {
+            std::env::remove_var("CODEX_SUMMARIES_BASE_DIR");
+        }
     }
 
     #[test]
@@ -237,9 +250,15 @@ mod summaries_checkpoint {
             format!("[summaries]\nbase_dir = \"{}\"\n", base.path().display()),
         )
         .unwrap();
-        unsafe { std::env::set_var("CODEX_HOME", home.path()); }
-        unsafe { std::env::remove_var("CODEX_SUMMARIES_BASE_DIR"); }
-        unsafe { std::env::set_var("CODEX_NAMESPACE", "ignored"); }
+        unsafe {
+            std::env::set_var("CODEX_HOME", home.path());
+        }
+        unsafe {
+            std::env::remove_var("CODEX_SUMMARIES_BASE_DIR");
+        }
+        unsafe {
+            std::env::set_var("CODEX_NAMESPACE", "ignored");
+        }
 
         let id = ConversationId::from_string("67e55044-10b1-426f-9247-bb680e5fe0c8").unwrap();
         let p = checkpoint_path(&id);

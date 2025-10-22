@@ -29,7 +29,6 @@ use unicode_width::UnicodeWidthStr;
 
 use super::model::LiveExecOutputSnapshotLine;
 
-
 pub(crate) const TOOL_CALL_MAX_LINES: usize = 5;
 
 pub(crate) struct OutputLinesParams {
@@ -456,11 +455,13 @@ impl ExecCell {
                 }
             }
 
-            let trimmed_output = Self::truncate_lines_middle(&raw_output_lines, layout.output_max_lines);
+            let trimmed_output =
+                Self::truncate_lines_middle(&raw_output_lines, layout.output_max_lines);
 
             let mut wrapped_output: Vec<Line<'static>> = Vec::new();
             let output_wrap_width = layout.output_block.wrap_width(width);
-            let output_opts = RtOptions::new(output_wrap_width).word_splitter(WordSplitter::NoHyphenation);
+            let output_opts =
+                RtOptions::new(output_wrap_width).word_splitter(WordSplitter::NoHyphenation);
             for line in trimmed_output {
                 push_owned_lines(
                     &word_wrap_line(&line, output_opts.clone()),

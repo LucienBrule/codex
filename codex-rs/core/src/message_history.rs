@@ -21,7 +21,8 @@ use std::io::Result;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -389,7 +390,9 @@ fn enforce_max_bytes_locked(file: &mut File, path: &Path, max_bytes: usize) -> R
 #[cfg(test)]
 mod history_max_bytes {
     use super::*;
-    use crate::config::{Config, ConfigOverrides, ConfigToml};
+    use crate::config::Config;
+    use crate::config::ConfigOverrides;
+    use crate::config::ConfigToml;
     use crate::config_types::History;
     use tempfile::TempDir;
 
@@ -452,7 +455,11 @@ mod history_max_bytes {
         // Seed with a corrupted prefix that does not end on a newline plus some valid lines.
         let mut seed = b"{not-json".to_vec();
         for i in 0..50u32 {
-            let entry = HistoryEntry { session_id: "s".into(), ts: 1, text: format!("seed-{i}") };
+            let entry = HistoryEntry {
+                session_id: "s".into(),
+                ts: 1,
+                text: format!("seed-{i}"),
+            };
             let mut line = serde_json::to_vec(&entry).unwrap();
             line.push(b'\n');
             seed.extend_from_slice(&line);

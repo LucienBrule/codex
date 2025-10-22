@@ -1,4 +1,5 @@
-use codex_protocol::models::{ContentItem, ResponseItem};
+use codex_protocol::models::ContentItem;
+use codex_protocol::models::ResponseItem;
 
 use crate::codex::compact::is_session_prefix_message;
 
@@ -127,6 +128,10 @@ mod tests {
                 if s.is_empty() { None } else { Some(s) }
             })
             .collect();
-        assert!(text_blocks.iter().any(|t| t.contains("<conversation_summary>") && t.contains("PRIOR SUMMARY")));
+        assert!(
+            text_blocks
+                .iter()
+                .any(|t| t.contains("<conversation_summary>") && t.contains("PRIOR SUMMARY"))
+        );
     }
 }

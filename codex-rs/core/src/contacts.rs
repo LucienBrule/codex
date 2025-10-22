@@ -2,7 +2,8 @@ use regex_lite::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -61,7 +62,10 @@ pub fn load_contacts(codex_home: &Path, namespace: &str) -> anyhow::Result<Conta
             load_table_into_map_flat(&mut map, &root.contacts, &key_re)?;
             effective_paths.push(p);
         }
-        return Ok(Contacts { map, effective_paths });
+        return Ok(Contacts {
+            map,
+            effective_paths,
+        });
     }
 
     let (primary, global) = contacts_paths(codex_home, namespace);
@@ -81,7 +85,10 @@ pub fn load_contacts(codex_home: &Path, namespace: &str) -> anyhow::Result<Conta
         effective_paths.push(primary.clone());
     }
 
-    Ok(Contacts { map, effective_paths })
+    Ok(Contacts {
+        map,
+        effective_paths,
+    })
 }
 
 fn load_into_map(
@@ -91,9 +98,7 @@ fn load_into_map(
 ) -> anyhow::Result<()> {
     for (key, value) in contacts.iter() {
         if !key_re.is_match(key) {
-            anyhow::bail!(
-                "invalid contact key '{key}': must match ^[a-z0-9][a-z0-9.-]{{2,100}}$"
-            );
+            anyhow::bail!("invalid contact key '{key}': must match ^[a-z0-9][a-z0-9.-]{{2,100}}$");
         }
         match value {
             toml::Value::String(uuid_str) => {
@@ -103,7 +108,8 @@ fn load_into_map(
             }
             toml::Value::Table(tbl) => {
                 // Convert table into struct for validation
-                let entry: ContactEntryTable = ContactEntryTable::deserialize(toml::Value::Table(tbl.clone()))?;
+                let entry: ContactEntryTable =
+                    ContactEntryTable::deserialize(toml::Value::Table(tbl.clone()))?;
                 let id = Uuid::parse_str(&entry.conversation_id).map_err(|_| {
                     anyhow::anyhow!("invalid UUID for contact '{key}' in table 'conversation_id'")
                 })?;
@@ -185,7 +191,11 @@ fn load_table_into_map_flat(
                     Ok(())
                 } else {
                     for (k, v) in tbl.iter() {
-                        let new_prefix = if prefix.is_empty() { k.clone() } else { format!("{prefix}.{k}") };
+                        let new_prefix = if prefix.is_empty() {
+                            k.clone()
+                        } else {
+                            format!("{prefix}.{k}")
+                        };
                         visit(out, key_re, &new_prefix, v)?;
                     }
                     Ok(())
@@ -249,10 +259,7 @@ impl.codex.search = "11111111-1111-4111-8111-111111111111"
 
         let contacts = load_contacts(home, ns).unwrap();
         assert_eq!(
-            contacts
-                .resolve("impl.codex.search")
-                .unwrap()
-                .to_string(),
+            contacts.resolve("impl.codex.search").unwrap().to_string(),
             "11111111-1111-4111-8111-111111111111"
         );
         assert_eq!(

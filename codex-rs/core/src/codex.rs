@@ -18,7 +18,9 @@ use async_channel::Receiver;
 use async_channel::Sender;
 use codex_apply_patch::ApplyPatchAction;
 use codex_protocol::ConversationId;
-use codex_protocol::mailbox::{MailboxContentType, MailboxMessage, MailboxSenderRole};
+use codex_protocol::mailbox::MailboxContentType;
+use codex_protocol::mailbox::MailboxMessage;
+use codex_protocol::mailbox::MailboxSenderRole;
 use codex_protocol::protocol::ConversationPathResponseEvent;
 use codex_protocol::protocol::ExitedReviewModeEvent;
 use codex_protocol::protocol::HeartbeatEvent;
@@ -68,15 +70,15 @@ use crate::exec_command::WriteStdinParams;
 use crate::executor::Executor;
 use crate::executor::ExecutorConfig;
 use crate::executor::normalize_exec_result;
-use crate::mailbox::apply_mailbox_defaults;
-use crate::mailbox::mailbox_channel;
-use crate::mailbox::mailbox_feature_enabled;
-use crate::mailbox::validate_mailbox_message;
+use crate::mailbox::MAILBOX_QUEUE_CAPACITY;
 use crate::mailbox::MailboxEnvelope;
 use crate::mailbox::MailboxReceiver;
 use crate::mailbox::MailboxSender;
 use crate::mailbox::TryEnqueueError;
-use crate::mailbox::MAILBOX_QUEUE_CAPACITY;
+use crate::mailbox::apply_mailbox_defaults;
+use crate::mailbox::mailbox_channel;
+use crate::mailbox::mailbox_feature_enabled;
+use crate::mailbox::validate_mailbox_message;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_family::find_family_for_model;
@@ -119,10 +121,10 @@ use crate::rollout::RolloutRecorderParams;
 use crate::shell;
 use crate::state::ActiveTurn;
 use crate::state::SessionServices;
-use crate::tasks::CompactTask;
 use crate::summaries;
-use crate::summaries::build_prompt as build_sliding_window_prompt;
 use crate::summaries::SummariesState as SlidingSummariesState;
+use crate::summaries::build_prompt as build_sliding_window_prompt;
+use crate::tasks::CompactTask;
 use crate::tasks::RegularTask;
 use crate::tasks::ReviewTask;
 use crate::telemetry::MailboxDeliveryTelemetry;
@@ -137,6 +139,7 @@ use crate::tools::context::WaitTriggerError;
 use crate::tools::context::WaitTriggerHandle;
 use crate::tools::context::WaitTriggerSpec;
 use crate::tools::format_exec_output_str;
+use crate::tools::names::WAIT_WITH_PREDICATE_TOOL_NAME;
 use crate::tools::parallel::ToolCallRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::UnifiedExecSessionManager;
@@ -415,12 +418,9 @@ impl WaitTriggerState {
 
     fn default_mailbox_message(&self, summary: &str) -> MailboxMessage {
         let mut message = MailboxMessage::default();
-        message.sender.id = "codex.wait".to_string();
+        message.sender.id = WAIT_WITH_PREDICATE_TOOL_NAME.to_string();
         message.sender.role = MailboxSenderRole::Automation;
-        message.body.subject = Some(format!(
-            "Wait trigger completed for call {}",
-            self.call_id
-        ));
+        message.body.subject = Some(format!("Wait trigger completed for call {}", self.call_id));
         message.body.content = summary.to_string();
         message.body.content_type = MailboxContentType::TextPlain;
         message.audit.request_id = Some(self.request_id.clone());
@@ -783,7 +783,9 @@ impl Session {
         let mut rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
 
         // For background summary updates, also persist a durable snapshot and write a checkpoint.
-        if let EventMsg::SummaryUpdated(crate::protocol::SummaryUpdatedEvent { summary }) = &event.msg {
+        if let EventMsg::SummaryUpdated(crate::protocol::SummaryUpdatedEvent { summary }) =
+            &event.msg
+        {
             rollout_items.push(RolloutItem::SummarySnapshot(
                 crate::protocol::SummarySnapshotItem {
                     summary: summary.clone(),
@@ -794,7 +796,8 @@ impl Session {
             let cid = self.conversation_id;
             let summary_for_write = summary.clone();
             tokio::spawn(async move {
-                if let Err(e) = summaries::write_summary_checkpoint(&cid, &summary_for_write).await {
+                if let Err(e) = summaries::write_summary_checkpoint(&cid, &summary_for_write).await
+                {
                     tracing::warn!("failed to write summary checkpoint: {e}");
                 }
             });
@@ -1661,8 +1664,7 @@ impl Session {
                         );
                         #[cfg(test)]
                         {
-                            let mut guard =
-                                self.wait_trigger_mailbox_failures.lock().await;
+                            let mut guard = self.wait_trigger_mailbox_failures.lock().await;
                             guard.push(err);
                         }
                     }
@@ -3319,7 +3321,8 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
-    use tokio::task::{yield_now, JoinHandle};
+    use tokio::task::JoinHandle;
+    use tokio::task::yield_now;
 
     pub(crate) struct MailboxTestGuard {
         _env_guard: MailboxEnvGuard,
@@ -3782,11 +3785,7 @@ pub(crate) mod tests {
         }
 
         let result = session
-            .schedule_wait_trigger(
-                "sub-quota",
-                "call-over",
-                WaitTriggerSpec::new("overflow"),
-            )
+            .schedule_wait_trigger("sub-quota", "call-over", WaitTriggerSpec::new("overflow"))
             .await;
         let err = match result {
             Err(err) => err,

@@ -1,24 +1,35 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, Instant};
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
+use serde_json::json;
 use tokio::time;
 
 use crate::codex::Session;
 use crate::codex::TurnContext;
+use crate::config::WaitPolicySettings;
+use crate::config::WaitPredicateKind;
+use crate::config::wait_policy_settings;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
 use crate::function_tool::FunctionCallError;
-use crate::config::{wait_policy_settings, WaitPolicySettings, WaitPredicateKind};
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
 use crate::tools::context::ToolPayload;
 use crate::tools::handle_container_exec_with_params;
+use crate::tools::names::LEGACY_CODEX_WAIT_DOTTED_TOOL_NAME;
+use crate::tools::names::LEGACY_CODEX_WAIT_UNDERSCORE_TOOL_NAME;
+use crate::tools::names::WAIT_WITH_PREDICATE_TOOL_NAME;
+use crate::tools::names::normalize_tool_name;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 
@@ -75,7 +86,10 @@ fn acquire_wait_slot(
     Ok(WaitSlotGuard { key })
 }
 
-fn policy_violation_error(kind: WaitPredicateKind, message: impl Into<String>) -> FunctionCallError {
+fn policy_violation_error(
+    kind: WaitPredicateKind,
+    message: impl Into<String>,
+) -> FunctionCallError {
     let msg = message.into();
     crate::telemetry::record_wait_policy_violation(kind.as_str(), "policy_violation");
     FunctionCallError::RespondToModel(msg)
@@ -126,9 +140,7 @@ impl WaitContext {
     }
 
     async fn notify(&self, message: impl Into<String>) {
-        self.runtime()
-            .notify(self.sub_id(), message.into())
-            .await;
+        self.runtime().notify(self.sub_id(), message.into()).await;
     }
 
     fn policy(&self) -> &WaitPolicySettings {
@@ -173,11 +185,7 @@ struct SessionRuntime {
 }
 
 impl SessionRuntime {
-    fn new(
-        session: Arc<Session>,
-        turn: Arc<TurnContext>,
-        tracker: SharedTurnDiffTracker,
-    ) -> Self {
+    fn new(session: Arc<Session>, turn: Arc<TurnContext>, tracker: SharedTurnDiffTracker) -> Self {
         Self {
             session,
             turn,
@@ -234,15 +242,15 @@ impl ToolHandler for WaitHandler {
         let arguments = match &invocation.payload {
             ToolPayload::Function { arguments } => arguments.clone(),
             _ => {
-                return Err(FunctionCallError::RespondToModel(
-                    "codex.wait only accepts function payloads".to_string(),
-                ))
+                return Err(FunctionCallError::RespondToModel(format!(
+                    "{WAIT_WITH_PREDICATE_TOOL_NAME} only accepts function payloads (legacy aliases {LEGACY_CODEX_WAIT_UNDERSCORE_TOOL_NAME} and {LEGACY_CODEX_WAIT_DOTTED_TOOL_NAME})"
+                )));
             }
         };
 
         let args: WaitArgs = serde_json::from_str(&arguments).map_err(|err| {
             FunctionCallError::RespondToModel(format!(
-                "failed to parse codex.wait arguments: {err}"
+                "failed to parse {WAIT_WITH_PREDICATE_TOOL_NAME} arguments (legacy aliases {LEGACY_CODEX_WAIT_UNDERSCORE_TOOL_NAME} and {LEGACY_CODEX_WAIT_DOTTED_TOOL_NAME}): {err}"
             ))
         })?;
 
@@ -278,6 +286,8 @@ impl ToolHandler for WaitHandler {
             ..
         } = invocation;
 
+        let canonical_tool_name = normalize_tool_name(&tool_name).into_owned();
+
         let _slot_guard = acquire_wait_slot(&turn, &policy, Some(predicate_kind))?;
 
         let runtime = Arc::new(SessionRuntime::new(
@@ -289,7 +299,7 @@ impl ToolHandler for WaitHandler {
             runtime,
             sub_id,
             call_id,
-            tool_name,
+            canonical_tool_name,
             Arc::new(policy.clone()),
         );
 
@@ -340,11 +350,12 @@ impl ToolHandler for WaitHandler {
                 );
                 response.insert(
                     "elapsed_ms".to_string(),
-                    JsonValue::Number(serde_json::Number::from(
-                        elapsed.as_millis() as u64,
-                    )),
+                    JsonValue::Number(serde_json::Number::from(elapsed.as_millis() as u64)),
                 );
-                response.insert("status".to_string(), JsonValue::String("completed".to_string()));
+                response.insert(
+                    "status".to_string(),
+                    JsonValue::String("completed".to_string()),
+                );
                 response.insert("message".to_string(), JsonValue::String(outcome.message));
                 response.insert("details".to_string(), outcome.details);
 
@@ -473,9 +484,7 @@ impl WaitPredicateStrategy for TimerStrategy {
         _limits: &WaitLimits,
     ) -> Result<WaitOutcome, FunctionCallError> {
         let predicate: TimerPredicate = serde_json::from_value(predicate).map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "invalid timer predicate payload: {err}"
-            ))
+            FunctionCallError::RespondToModel(format!("invalid timer predicate payload: {err}"))
         })?;
 
         if predicate.duration_ms == 0 {
@@ -553,9 +562,7 @@ impl WaitPredicateStrategy for ShellStrategy {
         _limits: &WaitLimits,
     ) -> Result<WaitOutcome, FunctionCallError> {
         let predicate: ShellPredicate = serde_json::from_value(predicate).map_err(|err| {
-            FunctionCallError::RespondToModel(format!(
-                "invalid shell predicate payload: {err}"
-            ))
+            FunctionCallError::RespondToModel(format!("invalid shell predicate payload: {err}"))
         })?;
 
         let max_attempts = predicate.max_attempts;
@@ -656,9 +663,13 @@ impl WaitPredicateStrategy for ShellStrategy {
                         let exit_code = envelope.metadata.exit_code;
                         let output = truncate_output(&envelope.output);
                         if max_attempts.is_some() {
-                            last_failure_summary = Some(format!("last exit_code={exit_code}, output={output}"));
+                            last_failure_summary =
+                                Some(format!("last exit_code={exit_code}, output={output}"));
                         }
-                        ctx.notify(format!("shell predicate attempt #{attempts} exited with {exit_code}")).await;
+                        ctx.notify(format!(
+                            "shell predicate attempt #{attempts} exited with {exit_code}"
+                        ))
+                        .await;
                     } else {
                         return Err(FunctionCallError::RespondToModel(payload));
                     }
@@ -740,12 +751,11 @@ impl WaitPredicateStrategy for FilesystemStrategy {
         predicate: JsonValue,
         _limits: &WaitLimits,
     ) -> Result<WaitOutcome, FunctionCallError> {
-        let predicate: FilesystemPredicate =
-            serde_json::from_value(predicate).map_err(|err| {
-                FunctionCallError::RespondToModel(format!(
-                    "invalid filesystem predicate payload: {err}"
-                ))
-            })?;
+        let predicate: FilesystemPredicate = serde_json::from_value(predicate).map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "invalid filesystem predicate payload: {err}"
+            ))
+        })?;
 
         let path = PathBuf::from(&predicate.path);
         if !path.is_absolute() {
@@ -782,10 +792,13 @@ impl WaitPredicateStrategy for FilesystemStrategy {
 
 #[cfg(target_family = "unix")]
 async fn wait_for_exists(path: &Path) -> Result<(), FunctionCallError> {
+    use notify::Config;
+    use notify::RecommendedWatcher;
+    use notify::RecursiveMode;
+    use notify::Watcher;
     use notify::event::DataChange;
     use notify::event::EventKind;
     use notify::event::ModifyKind;
-    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
     use tracing::warn;
 
     if path.exists() {
@@ -803,9 +816,7 @@ async fn wait_for_exists(path: &Path) -> Result<(), FunctionCallError> {
         Config::default(),
     )
     .map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to initialize filesystem watcher: {err}"
-        ))
+        FunctionCallError::RespondToModel(format!("failed to initialize filesystem watcher: {err}"))
     })?;
 
     watcher
@@ -858,9 +869,12 @@ async fn wait_for_exists(_path: &Path) -> Result<(), FunctionCallError> {
 
 #[cfg(target_family = "unix")]
 async fn wait_for_modified(path: &Path) -> Result<(), FunctionCallError> {
+    use notify::Config;
+    use notify::RecommendedWatcher;
+    use notify::RecursiveMode;
+    use notify::Watcher;
     use notify::event::EventKind;
     use notify::event::ModifyKind;
-    use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
     use tracing::warn;
 
     if !path.exists() {
@@ -886,9 +900,7 @@ async fn wait_for_modified(path: &Path) -> Result<(), FunctionCallError> {
         Config::default(),
     )
     .map_err(|err| {
-        FunctionCallError::RespondToModel(format!(
-            "failed to initialize filesystem watcher: {err}"
-        ))
+        FunctionCallError::RespondToModel(format!("failed to initialize filesystem watcher: {err}"))
     })?;
 
     watcher
@@ -941,11 +953,12 @@ async fn wait_for_modified(_path: &Path) -> Result<(), FunctionCallError> {
 
 #[cfg(test)]
 mod wait_handler {
-    use super::*;
     use super::run_strategy;
+    use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+    use std::time::Instant;
 
     #[derive(Default)]
     struct StubRuntime {
@@ -1029,7 +1042,7 @@ mod wait_handler {
             runtime,
             "sub".to_string(),
             "call".to_string(),
-            "codex.wait".to_string(),
+            WAIT_WITH_PREDICATE_TOOL_NAME.to_string(),
             Arc::new(policy),
         )
     }
@@ -1049,7 +1062,11 @@ mod wait_handler {
         let ctx = stub_context(runtime);
         let start = Instant::now();
         let outcome = strategy
-            .wait(&ctx, json!({ "duration_ms": 20 }), &WaitLimits::new(DEFAULT_WAIT_TIMEOUT))
+            .wait(
+                &ctx,
+                json!({ "duration_ms": 20 }),
+                &WaitLimits::new(DEFAULT_WAIT_TIMEOUT),
+            )
             .await
             .expect("timer should succeed");
         assert!(start.elapsed() >= Duration::from_millis(20));
@@ -1062,7 +1079,11 @@ mod wait_handler {
         let runtime = StubRuntime::new();
         let ctx = stub_context(runtime);
         let err = strategy
-            .wait(&ctx, json!({ "command": [] }), &WaitLimits::new(DEFAULT_WAIT_TIMEOUT))
+            .wait(
+                &ctx,
+                json!({ "command": [] }),
+                &WaitLimits::new(DEFAULT_WAIT_TIMEOUT),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, FunctionCallError::RespondToModel(_)));
@@ -1127,16 +1148,16 @@ mod wait_handler {
     }
 
     fn exec_failure(exit_code: i32, output: &str) -> FunctionCallError {
-    let envelope = json!({
-        "output": output,
-        "metadata": {
-            "exit_code": exit_code,
-            "_duration_seconds": 0.05
-        }
-    })
-    .to_string();
-    FunctionCallError::RespondToModel(envelope)
-}
+        let envelope = json!({
+            "output": output,
+            "metadata": {
+                "exit_code": exit_code,
+                "_duration_seconds": 0.05
+            }
+        })
+        .to_string();
+        FunctionCallError::RespondToModel(envelope)
+    }
 
     #[tokio::test]
     async fn shell_strategy_accepts_configured_exit_codes() {

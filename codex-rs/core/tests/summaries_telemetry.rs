@@ -1,8 +1,9 @@
 mod summaries_telemetry {
     use std::time::Duration;
 
-    use codex_core::telemetry::{SummariesBatchTelemetry, SummariesSnapshot};
     use codex_core::protocol::EventMsg;
+    use codex_core::telemetry::SummariesBatchTelemetry;
+    use codex_core::telemetry::SummariesSnapshot;
     use wiremock::MockServer;
 
     use core_test_support::test_codex::test_codex;
@@ -30,7 +31,12 @@ mod summaries_telemetry {
         let test = builder.build(&server).await.expect("build codex");
 
         // Wait up to ~2 seconds for a SummaryUpdated event from the background task.
-        let msg = wait_for_event_with_timeout(&test.codex, |m| matches!(m, EventMsg::SummaryUpdated(_)), Duration::from_secs(2)).await;
+        let msg = wait_for_event_with_timeout(
+            &test.codex,
+            |m| matches!(m, EventMsg::SummaryUpdated(_)),
+            Duration::from_secs(2),
+        )
+        .await;
         match msg {
             EventMsg::SummaryUpdated(ev) => {
                 assert!(ev.summary.contains("summary"));

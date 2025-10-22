@@ -136,8 +136,11 @@ impl Session {
             let trigger_ids = at.clear_pending().await;
             let tasks = at.drain_tasks();
             for trigger_id in trigger_ids {
-                self.cancel_wait_trigger_internal(trigger_id, WaitTriggerCancelReason::TurnShutdown)
-                    .await;
+                self.cancel_wait_trigger_internal(
+                    trigger_id,
+                    WaitTriggerCancelReason::TurnShutdown,
+                )
+                .await;
             }
             tasks.into_iter().collect()
         } else {

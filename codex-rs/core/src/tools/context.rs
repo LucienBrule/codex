@@ -15,10 +15,12 @@ use mcp_types::CallToolResult;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
+use std::sync::Weak;
 use thiserror::Error;
 use time::OffsetDateTime;
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::Mutex;
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
@@ -237,12 +239,13 @@ impl WaitTriggerHandle {
         self.inner.trigger_id
     }
 
-    pub async fn complete(&self, completion: WaitTriggerCompletion) -> Result<(), WaitTriggerError> {
+    pub async fn complete(
+        &self,
+        completion: WaitTriggerCompletion,
+    ) -> Result<(), WaitTriggerError> {
         let sender = {
             let mut guard = self.inner.completion_tx.lock().await;
-            guard
-                .take()
-                .ok_or(WaitTriggerError::AlreadyCompleted)?
+            guard.take().ok_or(WaitTriggerError::AlreadyCompleted)?
         };
         sender
             .send(completion)
