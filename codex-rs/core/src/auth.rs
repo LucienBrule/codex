@@ -5,6 +5,7 @@ use serde::Serialize;
 use std::env;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
@@ -245,6 +246,9 @@ fn load_auth(
     let client = crate::default_client::create_client();
     let auth_dot_json = match try_read_auth_json(&auth_file) {
         Ok(auth) => auth,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return Ok(None);
+        }
         Err(e) => {
             return Err(e);
         }

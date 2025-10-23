@@ -1668,17 +1668,25 @@ fn default_review_model() -> String {
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
 /// `~/.codex`.
 ///
-/// - If `CODEX_HOME` is set, the value will be canonicalized and this
-///   function will Err if the path does not exist.
-/// - If `CODEX_HOME` is not set, this function does not verify that the
-///   directory exists.
+/// This helper ensures the directory exists before returning. When
+/// `CODEX_HOME` is provided, the directory will be created on-demand (to
+/// restore the historical behaviour where new installs worked with no manual
+/// setup) and the resulting path is canonicalized when possible.
 pub fn find_codex_home() -> std::io::Result<PathBuf> {
     // Honor the `CODEX_HOME` environment variable when it is set to allow users
     // (and tests) to override the default location.
     if let Ok(val) = std::env::var("CODEX_HOME")
         && !val.is_empty()
     {
-        return PathBuf::from(val).canonicalize();
+        let path = PathBuf::from(val);
+        std::fs::create_dir_all(&path)?;
+        return path.canonicalize().or_else(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Ok(path)
+            } else {
+                Err(err)
+            }
+        });
     }
 
     let mut p = home_dir().ok_or_else(|| {
@@ -1688,6 +1696,7 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
         )
     })?;
     p.push(".codex");
+    std::fs::create_dir_all(&p)?;
     Ok(p)
 }
 
@@ -1707,8 +1716,71 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    use serial_test::serial;
+    use std::ffi::OsString;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_os(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: tests serialize access to these env vars via the
+            // serial_test attribute, so we can mutate process-global state.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: see comment in set_os.
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn find_codex_home_creates_default_directory() {
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home_guard = EnvVarGuard::set_os("HOME", temp_home.path().as_os_str());
+        let _codex_guard = EnvVarGuard::unset("CODEX_HOME");
+
+        let codex_home = find_codex_home().expect("find codex home");
+        assert_eq!(codex_home, temp_home.path().join(".codex"));
+        assert!(codex_home.is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn find_codex_home_creates_env_override_directory() {
+        let temp_home = TempDir::new().expect("tempdir");
+        let override_dir = temp_home.path().join("custom-codex-home");
+        let _home_guard = EnvVarGuard::set_os("HOME", temp_home.path().as_os_str());
+        let _codex_guard = EnvVarGuard::set_os("CODEX_HOME", override_dir.as_os_str());
+
+        let codex_home = find_codex_home().expect("find codex home");
+        assert_eq!(
+            codex_home,
+            override_dir
+                .canonicalize()
+                .expect("canonical override exists"),
+        );
+        assert!(codex_home.is_dir());
+    }
 
     #[test]
     fn test_toml_parsing() {
