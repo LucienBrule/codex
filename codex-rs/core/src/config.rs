@@ -358,11 +358,12 @@ pub enum WaitPredicateKind {
     Timer,
     Filesystem,
     Shell,
+    Mailbox,
 }
 
 impl WaitPredicateKind {
-    fn all() -> [Self; 3] {
-        [Self::Timer, Self::Filesystem, Self::Shell]
+    fn all() -> [Self; 4] {
+        [Self::Timer, Self::Filesystem, Self::Shell, Self::Mailbox]
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -370,6 +371,7 @@ impl WaitPredicateKind {
             Self::Timer => "timer",
             Self::Filesystem => "filesystem",
             Self::Shell => "shell",
+            Self::Mailbox => "mailbox",
         }
     }
 }
@@ -388,6 +390,7 @@ impl FromStr for WaitPredicateKind {
             "timer" => Ok(Self::Timer),
             "filesystem" => Ok(Self::Filesystem),
             "shell" => Ok(Self::Shell),
+            "mailbox" => Ok(Self::Mailbox),
             other => Err(format!("invalid wait predicate `{other}`")),
         }
     }

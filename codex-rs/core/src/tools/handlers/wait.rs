@@ -1,3 +1,6 @@
+use codex_protocol::protocol::MailboxDeliveryEvent;
+use codex_protocol::protocol::MailboxDeliveryIngress;
+use codex_protocol::protocol::MailboxDeliveryState;
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
@@ -11,16 +14,22 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use serde_json::json;
+use tokio::sync::oneshot;
 use tokio::time;
+use uuid::Uuid;
 
 use crate::codex::Session;
 use crate::codex::TurnContext;
 use crate::config::WaitPolicySettings;
 use crate::config::WaitPredicateKind;
 use crate::config::wait_policy_settings;
+use crate::contacts;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
 use crate::function_tool::FunctionCallError;
+use crate::mailbox::MailboxWaitFilter;
+use crate::mailbox::SubjectMatcher;
+use crate::mailbox::mailbox_feature_enabled;
 use crate::tools::context::SharedTurnDiffTracker;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolOutput;
@@ -176,6 +185,13 @@ trait WaitRuntime: Send + Sync {
         sub_id: String,
         call_id: String,
     ) -> Result<String, FunctionCallError>;
+
+    async fn register_mailbox_waiter(
+        &self,
+        filter: MailboxWaitFilter,
+    ) -> Result<(Uuid, oneshot::Receiver<MailboxDeliveryEvent>), FunctionCallError>;
+
+    async fn cancel_mailbox_waiter(&self, waiter_id: Uuid);
 }
 
 struct SessionRuntime {
@@ -229,6 +245,19 @@ impl WaitRuntime for SessionRuntime {
             call_id,
         )
         .await
+    }
+
+    async fn register_mailbox_waiter(
+        &self,
+        filter: MailboxWaitFilter,
+    ) -> Result<(Uuid, oneshot::Receiver<MailboxDeliveryEvent>), FunctionCallError> {
+        Ok(self.session.register_mailbox_predicate_waiter(filter).await)
+    }
+
+    async fn cancel_mailbox_waiter(&self, waiter_id: Uuid) {
+        self.session
+            .cancel_mailbox_predicate_waiter(waiter_id)
+            .await;
     }
 }
 
@@ -324,6 +353,10 @@ impl ToolHandler for WaitHandler {
             }
             WaitPredicateType::Shell => {
                 let strategy = ShellStrategy;
+                run_strategy(&strategy, &ctx, predicate, &limits).await
+            }
+            WaitPredicateType::Mailbox => {
+                let strategy = MailboxStrategy;
                 run_strategy(&strategy, &ctx, predicate, &limits).await
             }
         };
@@ -430,6 +463,7 @@ enum WaitPredicateType {
     Timer,
     Filesystem,
     Shell,
+    Mailbox,
 }
 
 impl WaitPredicateType {
@@ -438,6 +472,7 @@ impl WaitPredicateType {
             WaitPredicateType::Timer => "timer",
             WaitPredicateType::Filesystem => "filesystem",
             WaitPredicateType::Shell => "shell",
+            WaitPredicateType::Mailbox => "mailbox",
         }
     }
 }
@@ -448,6 +483,7 @@ impl From<WaitPredicateType> for WaitPredicateKind {
             WaitPredicateType::Timer => WaitPredicateKind::Timer,
             WaitPredicateType::Filesystem => WaitPredicateKind::Filesystem,
             WaitPredicateType::Shell => WaitPredicateKind::Shell,
+            WaitPredicateType::Mailbox => WaitPredicateKind::Mailbox,
         }
     }
 }
@@ -709,6 +745,224 @@ fn truncate_output(output: &str) -> String {
         output.to_string()
     } else {
         format!("{}…", &output[..MAX_LEN])
+    }
+}
+
+struct MailboxStrategy;
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct MailboxPredicate {
+    expected_subject: Option<String>,
+    subject_contains: Option<String>,
+    case_sensitive: Option<bool>,
+    from_handle: Option<String>,
+    sender_id: Option<String>,
+    request_id: Option<String>,
+    message_id: Option<Uuid>,
+    states: Option<Vec<MailboxDeliveryState>>,
+    ingress: Option<Vec<MailboxDeliveryIngress>>,
+}
+
+impl MailboxPredicate {
+    fn into_filter(self) -> Result<MailboxWaitFilter, FunctionCallError> {
+        let MailboxPredicate {
+            expected_subject,
+            subject_contains,
+            case_sensitive,
+            from_handle,
+            sender_id,
+            request_id,
+            message_id,
+            states,
+            ingress,
+        } = self;
+
+        let mut filter = MailboxWaitFilter::default();
+        let case_sensitive = case_sensitive.unwrap_or(false);
+
+        if let Some(subject) = expected_subject {
+            let trimmed = subject.trim();
+            if trimmed.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "expected_subject must not be empty".to_string(),
+                ));
+            }
+            filter.subject_equals =
+                Some(SubjectMatcher::equals(trimmed.to_string(), case_sensitive));
+        }
+
+        if let Some(substring) = subject_contains {
+            let trimmed = substring.trim();
+            if trimmed.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "subject_contains must not be empty".to_string(),
+                ));
+            }
+            filter.subject_contains = Some(SubjectMatcher::contains(
+                trimmed.to_string(),
+                case_sensitive,
+            ));
+        }
+
+        if let Some(sender) = sender_id {
+            let trimmed = sender.trim();
+            if trimmed.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "sender_id must not be empty".to_string(),
+                ));
+            }
+            let value = trimmed.to_string();
+            if !filter.sender_ids.contains(&value) {
+                filter.sender_ids.push(value);
+            }
+        }
+
+        if let Some(handle) = from_handle {
+            let trimmed = handle.trim();
+            if trimmed.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "from_handle must not be empty".to_string(),
+                ));
+            }
+            let normalized = trimmed.to_string();
+            if !filter.sender_ids.contains(&normalized) {
+                filter.sender_ids.push(normalized.clone());
+            }
+
+            let (home, ns) = contacts::get_runtime_home_and_namespace();
+            match contacts::load_contacts(&home, &ns) {
+                Ok(book) => {
+                    if let Some(conversation_id) = book.resolve(&normalized) {
+                        if !filter
+                            .sender_conversation_ids
+                            .iter()
+                            .any(|id| *id == conversation_id)
+                        {
+                            filter.sender_conversation_ids.push(conversation_id);
+                        }
+                        let conversation_id_str = conversation_id.to_string();
+                        if !filter.sender_ids.contains(&conversation_id_str) {
+                            filter.sender_ids.push(conversation_id_str);
+                        }
+                    }
+                }
+                Err(err) => {
+                    return Err(FunctionCallError::RespondToModel(format!(
+                        "failed to load contacts: {err}"
+                    )));
+                }
+            }
+        }
+
+        if let Some(request_id) = request_id {
+            let trimmed = request_id.trim();
+            if trimmed.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "request_id must not be empty".to_string(),
+                ));
+            }
+            filter.request_ids.push(trimmed.to_string());
+        }
+
+        if let Some(message_id) = message_id {
+            filter.message_ids.push(message_id);
+        }
+
+        if let Some(states_vec) = states {
+            if states_vec.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "states must not be empty when provided".to_string(),
+                ));
+            }
+            filter.states = Some(states_vec);
+        }
+
+        if let Some(ingress_vec) = ingress {
+            if ingress_vec.is_empty() {
+                return Err(FunctionCallError::RespondToModel(
+                    "ingress must not be empty when provided".to_string(),
+                ));
+            }
+            filter.ingress = Some(ingress_vec);
+        }
+
+        Ok(filter)
+    }
+}
+
+#[async_trait]
+impl WaitPredicateStrategy for MailboxStrategy {
+    async fn wait(
+        &self,
+        ctx: &WaitContext,
+        predicate: JsonValue,
+        limits: &WaitLimits,
+    ) -> Result<WaitOutcome, FunctionCallError> {
+        if !mailbox_feature_enabled() {
+            return Err(FunctionCallError::RespondToModel(
+                "mailbox wait predicates require CODEX_MAILBOX_OOB=1".to_string(),
+            ));
+        }
+
+        let predicate: MailboxPredicate = serde_json::from_value(predicate).map_err(|err| {
+            FunctionCallError::RespondToModel(format!("invalid mailbox predicate payload: {err}"))
+        })?;
+
+        let filter = predicate.into_filter()?;
+
+        let runtime = ctx.runtime();
+        let (waiter_id, receiver) = runtime.register_mailbox_waiter(filter).await?;
+
+        let timeout = limits.timeout();
+        let result = time::timeout(timeout, receiver).await;
+
+        match result {
+            Ok(Ok(event)) => {
+                runtime.cancel_mailbox_waiter(waiter_id).await;
+
+                let subject = event
+                    .message
+                    .body
+                    .subject
+                    .clone()
+                    .unwrap_or_else(|| "(no subject)".to_string());
+                let sender = event.message.sender.id.clone();
+                let state_str = match event.state {
+                    MailboxDeliveryState::Enqueued => "enqueued",
+                    MailboxDeliveryState::Delivered => "delivered",
+                };
+
+                Ok(WaitOutcome {
+                    message: format!(
+                        "mailbox message `{subject}` from `{sender}` observed ({state_str})"
+                    ),
+                    details: json!({
+                        "message_id": event.message.message_id,
+                        "subject": event.message.body.subject,
+                        "state": event.state,
+                        "sender_id": event.message.sender.id,
+                        "request_id": event.message.audit.request_id,
+                        "ingress": event.ingress,
+                        "queue_depth": event.queue_depth,
+                        "correlation_id": event.correlation_id,
+                    }),
+                })
+            }
+            Ok(Err(_)) => {
+                runtime.cancel_mailbox_waiter(waiter_id).await;
+                Err(FunctionCallError::RespondToModel(
+                    "mailbox wait cancelled by runtime".to_string(),
+                ))
+            }
+            Err(_) => {
+                runtime.cancel_mailbox_waiter(waiter_id).await;
+                Err(FunctionCallError::RespondToModel(format!(
+                    "mailbox wait timed out after {}ms",
+                    timeout.as_millis()
+                )))
+            }
+        }
     }
 }
 
@@ -1026,6 +1280,17 @@ mod wait_handler {
                 .pop_front()
                 .unwrap_or_else(|| Err(FunctionCallError::RespondToModel("empty".to_string())))
         }
+
+        async fn register_mailbox_waiter(
+            &self,
+            _filter: MailboxWaitFilter,
+        ) -> Result<(Uuid, oneshot::Receiver<MailboxDeliveryEvent>), FunctionCallError> {
+            Err(FunctionCallError::RespondToModel(
+                "mailbox wait not supported in stub runtime".to_string(),
+            ))
+        }
+
+        async fn cancel_mailbox_waiter(&self, _waiter_id: Uuid) {}
     }
 
     fn stub_context(runtime: Arc<StubRuntime>) -> WaitContext {
@@ -1255,5 +1520,137 @@ mod wait_handler {
         } else {
             panic!("unexpected error variant: {err:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codex::tests::spawn_test_mailbox_session;
+    use crate::mailbox::apply_mailbox_defaults;
+    use crate::turn_diff_tracker::TurnDiffTracker;
+    use ::time::OffsetDateTime;
+    use codex_protocol::mailbox::MailboxContentType;
+    use codex_protocol::mailbox::MailboxMessage;
+    use codex_protocol::mailbox::MailboxSenderRole;
+    use codex_protocol::protocol::MailboxDeliveryEvent;
+    use codex_protocol::protocol::MailboxDeliveryIngress;
+    use codex_protocol::protocol::MailboxDeliveryState;
+    use serde_json::Value as JsonValue;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn mailbox_wait_predicate_completes_on_enqueued_event() {
+        let (_guard, session, turn_context, submission_task) =
+            spawn_test_mailbox_session().await.expect("spawn session");
+        unsafe {
+            std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+            std::env::set_var("CODEX_MAILBOX_OOB", "1");
+        }
+        let tracker: SharedTurnDiffTracker =
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+
+        let handler = WaitHandler;
+        let args = json!({
+            "type": "mailbox",
+            "predicate": {
+                "expected_subject": "PING",
+                "sender_id": "worker.alpha"
+            },
+            "timeout_ms": 1000
+        })
+        .to_string();
+
+        let invocation = ToolInvocation {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn_context),
+            tracker,
+            sub_id: "sub-mailbox".to_string(),
+            call_id: "call-mailbox".to_string(),
+            tool_name: "mailbox_wait".to_string(),
+            payload: ToolPayload::Function { arguments: args },
+        };
+
+        let wait_future = handler.handle(invocation);
+        let session_clone = Arc::clone(&session);
+        let sender_task = tokio::spawn(async move {
+            time::sleep(Duration::from_millis(50)).await;
+            let mut message = MailboxMessage::default();
+            message.sender.id = "worker.alpha".to_string();
+            message.sender.role = MailboxSenderRole::Automation;
+            message.body.subject = Some("PING".to_string());
+            message.body.content = "payload".to_string();
+            message.body.content_type = MailboxContentType::TextPlain;
+            message.audit.request_id = Some("REQ-123".to_string());
+            apply_mailbox_defaults(&mut message);
+
+            let event = MailboxDeliveryEvent {
+                message,
+                state: MailboxDeliveryState::Enqueued,
+                queue_depth: Some(0),
+                observed_at: Some(OffsetDateTime::now_utc()),
+                correlation_id: Some("manual/test".to_string()),
+                ingress: Some(MailboxDeliveryIngress::Mcp),
+                delivery_latency_ms: None,
+            };
+            session_clone.notify_mailbox_predicate_waiters(&event).await;
+        });
+
+        let output = wait_future.await.expect("wait tool success");
+        if let ToolOutput::Function { content, .. } = output {
+            let parsed: JsonValue = serde_json::from_str(&content).expect("parse output");
+            assert_eq!(parsed["predicate"], "mailbox");
+            assert_eq!(parsed["status"], "completed");
+            assert_eq!(parsed["details"]["state"], "enqueued");
+            assert_eq!(parsed["details"]["subject"], "PING");
+        } else {
+            panic!("expected function output");
+        }
+
+        sender_task.await.expect("sender task should complete");
+        submission_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mailbox_wait_predicate_times_out_without_event() {
+        let (_guard, session, turn_context, submission_task) =
+            spawn_test_mailbox_session().await.expect("spawn session");
+        unsafe {
+            std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+            std::env::set_var("CODEX_MAILBOX_OOB", "1");
+        }
+        let tracker: SharedTurnDiffTracker =
+            Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+
+        let handler = WaitHandler;
+        let args = json!({
+            "type": "mailbox",
+            "predicate": {
+                "expected_subject": "NEVER"
+            },
+            "timeout_ms": 50
+        })
+        .to_string();
+
+        let invocation = ToolInvocation {
+            session,
+            turn: turn_context,
+            tracker,
+            sub_id: "sub-timeout".to_string(),
+            call_id: "call-timeout".to_string(),
+            tool_name: "mailbox_wait".to_string(),
+            payload: ToolPayload::Function { arguments: args },
+        };
+
+        let result = handler.handle(invocation).await;
+        match result {
+            Err(FunctionCallError::RespondToModel(message)) => {
+                assert!(message.contains("timed out"));
+            }
+            other => panic!("unexpected wait result: {other:?}"),
+        }
+
+        submission_task.abort();
     }
 }

@@ -3,6 +3,7 @@ use crate::client_common::tools::ToolSpec;
 use crate::model_family::ModelFamily;
 use crate::tools::handlers::MAILBOX_READ_TOOL_NAME;
 use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
+use crate::tools::handlers::MAILBOX_WAIT_TOOL_NAME;
 use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::apply_patch::ApplyPatchToolType;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
@@ -295,6 +296,41 @@ fn create_mailbox_send_tool() -> ToolSpec {
         },
     );
     properties.insert(
+        "ack_mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Acknowledgement policy override (`none`, `passive`, or `required`). \
+                 Defaults to the message payload when omitted."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_deadline".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "RFC3339 deadline for acknowledgements when ack_mode is provided.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_auto_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Auto-acknowledge after N seconds (valid when ack_mode is passive).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_escalation_ticket".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Escalation ticket identifier, required for required ACKs at high/critical priority."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
         "timeout_seconds".to_string(),
         JsonSchema::Number {
             description: Some(
@@ -314,7 +350,8 @@ fn create_mailbox_send_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: MAILBOX_SEND_TOOL_NAME.to_string(),
-        description: "Enqueue a mailbox message for the active Codex session.".to_string(),
+        description: "Enqueue a mailbox message for any Codex contact or conversation ID."
+            .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -333,6 +370,58 @@ fn create_mailbox_send_alias_tool() -> ToolSpec {
             properties: BTreeMap::new(),
             required: None,
             additional_properties: Some(true.into()),
+        },
+    );
+    properties.insert(
+        "to".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Logical contact name to target (resolved via codex_home/<ns>/contacts.toml)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "conversation_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Target conversation UUID. If provided, takes precedence over 'to'.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Acknowledgement policy override (`none`, `passive`, or `required`). \
+                 Defaults to the message payload when omitted."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_deadline".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "RFC3339 deadline for acknowledgements when ack_mode is provided.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_auto_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Auto-acknowledge after N seconds (valid when ack_mode is passive).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_escalation_ticket".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Escalation ticket identifier, required for required ACKs at high/critical priority."
+                    .to_string(),
+            ),
         },
     );
     properties.insert(
@@ -360,6 +449,101 @@ fn create_mailbox_send_alias_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["message".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_mailbox_wait_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum overall wait duration in milliseconds (default 30_000).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "expected_subject".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Match mailbox subject exactly (case-insensitive by default).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "subject_contains".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Match mailbox subject containing the provided substring.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "case_sensitive".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "Set to true to perform case-sensitive subject matching.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "from_handle".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Restrict to messages sent by the specified contact handle.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "sender_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Restrict to messages whose sender.id matches this value.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "request_id".to_string(),
+        JsonSchema::String {
+            description: Some("Restrict to messages with a matching audit.request_id.".to_string()),
+        },
+    );
+    properties.insert(
+        "message_id".to_string(),
+        JsonSchema::String {
+            description: Some("Restrict to a specific mailbox message UUID.".to_string()),
+        },
+    );
+    properties.insert(
+        "states".to_string(),
+        JsonSchema::Array {
+            description: Some(
+                "Optional allowed mailbox delivery states (e.g., ['enqueued', 'delivered'])."
+                    .to_string(),
+            ),
+            items: Box::new(JsonSchema::String { description: None }),
+        },
+    );
+    properties.insert(
+        "ingress".to_string(),
+        JsonSchema::Array {
+            description: Some(
+                "Optional allowed ingress sources (e.g., ['mcp', 'cli']).".to_string(),
+            ),
+            items: Box::new(JsonSchema::String { description: None }),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: MAILBOX_WAIT_TOOL_NAME.to_string(),
+        description: "Waits for a mailbox delivery that matches subject and sender filters."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
             additional_properties: Some(false.into()),
         },
     })
@@ -959,7 +1143,9 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::GrepFilesHandler;
     use crate::tools::handlers::ListDirHandler;
     use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
+    use crate::tools::handlers::MAILBOX_WAIT_TOOL_NAME;
     use crate::tools::handlers::MailboxSendHandler;
+    use crate::tools::handlers::MailboxWaitHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::PlanHandler;
     use crate::tools::handlers::ReadFileHandler;
@@ -980,6 +1166,7 @@ pub(crate) fn build_specs(
     let view_image_handler = Arc::new(ViewImageHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mailbox_send_handler = Arc::new(MailboxSendHandler);
+    let mailbox_wait_handler = Arc::new(MailboxWaitHandler);
     let mailbox_read_handler = Arc::new(crate::tools::handlers::MailboxReadHandler);
     let wait_handler = Arc::new(WaitHandler);
 
@@ -1023,6 +1210,9 @@ pub(crate) fn build_specs(
     builder.push_spec(create_mailbox_send_alias_tool());
     builder.register_handler(MAILBOX_SEND_TOOL_NAME, mailbox_send_handler.clone());
     builder.register_handler("codex_mailbox_send", mailbox_send_handler);
+
+    builder.push_spec_with_parallel_support(create_mailbox_wait_tool(), true);
+    builder.register_handler(MAILBOX_WAIT_TOOL_NAME, mailbox_wait_handler.clone());
 
     // New mailbox_read tool
     builder.push_spec(create_mailbox_read_tool());
@@ -1182,6 +1372,7 @@ mod tests {
                 "update_plan",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "web_search",
@@ -1211,6 +1402,7 @@ mod tests {
                 "update_plan",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "web_search",
@@ -1331,6 +1523,7 @@ mod tests {
                 "unified_exec",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "web_search",
@@ -1454,6 +1647,7 @@ mod tests {
                 "unified_exec",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "view_image",
@@ -1508,6 +1702,7 @@ mod tests {
                 "unified_exec",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
@@ -1580,6 +1775,7 @@ mod tests {
                 "unified_exec",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
@@ -1649,6 +1845,7 @@ mod tests {
                 "unified_exec",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
@@ -1721,6 +1918,7 @@ mod tests {
                 "unified_exec",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",
@@ -1887,6 +2085,7 @@ mod tests {
                 "unified_exec",
                 "mailbox_send",
                 "codex_mailbox_send",
+                "mailbox_wait",
                 "mailbox_read",
                 WAIT_WITH_PREDICATE_TOOL_NAME,
                 "apply_patch",

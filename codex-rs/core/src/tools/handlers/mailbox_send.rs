@@ -1,12 +1,15 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use codex_protocol::mailbox::MailboxAckMode;
+use codex_protocol::mailbox::MailboxAudience;
 use codex_protocol::mailbox::MailboxMessage;
 use codex_protocol::protocol::MailboxDeliveryEvent;
 use codex_protocol::protocol::MailboxDeliveryIngress;
 use codex_protocol::protocol::MailboxDeliveryState;
 use serde::Deserialize;
 use serde::Serialize;
+use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::time::timeout;
 use uuid::Uuid;
@@ -37,6 +40,14 @@ struct MailboxSendArgs {
     to: Option<String>,
     #[serde(default)]
     conversation_id: Option<String>,
+    #[serde(default)]
+    ack_mode: Option<String>,
+    #[serde(default)]
+    ack_deadline: Option<String>,
+    #[serde(default)]
+    ack_auto_seconds: Option<u64>,
+    #[serde(default)]
+    ack_escalation_ticket: Option<String>,
     #[serde(default = "default_timeout_seconds")]
     timeout_seconds: u64,
     #[serde(default = "default_wait_for_delivery")]
@@ -56,6 +67,8 @@ struct MailboxSendJsonOutputNormalized {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ack_mode: Option<String>,
     message_id: Uuid,
     request_id: Option<String>,
     conversation_id: codex_protocol::ConversationId,
@@ -117,6 +130,10 @@ impl ToolHandler for MailboxSendHandler {
             mut message,
             to,
             conversation_id,
+            ack_mode,
+            ack_deadline,
+            ack_auto_seconds,
+            ack_escalation_ticket,
             timeout_seconds,
             wait_for_delivery,
         } = args;
@@ -153,16 +170,20 @@ impl ToolHandler for MailboxSendHandler {
             None
         };
 
-        // Phase 1 behavior: only current session supported for MCP
-        if let Some(id) = requested_id {
-            let current_uuid = uuid::Uuid::parse_str(&session.get_conversation_id().to_string())
-                .unwrap_or_else(|_| uuid::Uuid::nil());
-            if id != current_uuid {
-                return Err(FunctionCallError::RespondToModel(
-                    "cross-session mailbox send not yet supported via MCP; use CLI 'codex mail send --conversation-id …'".to_string(),
-                ));
-            }
+        let session_uuid = Uuid::parse_str(&session.get_conversation_id().to_string())
+            .unwrap_or_else(|_| Uuid::nil());
+        let target_conversation_uuid = requested_id.unwrap_or(session_uuid);
+        if let Some(target_id) = requested_id {
+            apply_conversation_audience(&mut message, target_id);
         }
+
+        apply_ack_overrides(
+            &mut message,
+            ack_mode.as_deref(),
+            ack_deadline.as_deref(),
+            ack_auto_seconds,
+            ack_escalation_ticket.as_deref(),
+        )?;
 
         apply_mailbox_defaults(&mut message);
         validate_mailbox_message(&message)
@@ -227,9 +248,13 @@ impl ToolHandler for MailboxSendHandler {
                 }
                 .to_string(),
             ),
+            ack_mode: Some(ack_mode_label(&message.ack_policy.mode).to_string()),
             message_id: message.message_id,
             request_id: message.audit.request_id.clone(),
-            conversation_id: session.get_conversation_id(),
+            conversation_id: codex_protocol::ConversationId::from_string(
+                &target_conversation_uuid.to_string(),
+            )
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?,
             ack,
             queue_depth,
             correlation_id,
@@ -259,6 +284,75 @@ fn map_enqueue_error(err: MailboxEnqueueError) -> FunctionCallError {
         MailboxEnqueueError::Closed => "Mailbox dispatcher unavailable".to_string(),
     };
     FunctionCallError::RespondToModel(message)
+}
+
+fn apply_conversation_audience(message: &mut MailboxMessage, conversation_id: Uuid) {
+    match &mut message.audience {
+        Some(audience) => {
+            if audience.conversation_id.is_none() {
+                audience.conversation_id = Some(conversation_id);
+            }
+        }
+        None => {
+            message.audience = Some(MailboxAudience {
+                conversation_id: Some(conversation_id),
+                worker_id: None,
+                scopes: None,
+                allow_broadcast: false,
+            });
+        }
+    }
+}
+
+fn apply_ack_overrides(
+    message: &mut MailboxMessage,
+    ack_mode: Option<&str>,
+    ack_deadline: Option<&str>,
+    ack_auto_seconds: Option<u64>,
+    ack_escalation_ticket: Option<&str>,
+) -> Result<(), FunctionCallError> {
+    if let Some(mode_str) = ack_mode {
+        let mode = parse_ack_mode(mode_str).map_err(FunctionCallError::RespondToModel)?;
+        message.ack_policy.mode = mode;
+    }
+
+    if let Some(deadline_str) = ack_deadline {
+        let deadline = OffsetDateTime::parse(deadline_str, &Rfc3339)
+            .map_err(|err| FunctionCallError::RespondToModel(err.to_string()))?;
+        message.ack_policy.deadline = Some(deadline);
+    }
+
+    if let Some(auto_secs) = ack_auto_seconds {
+        message.ack_policy.auto_ack_seconds = Some(auto_secs);
+    }
+
+    if let Some(ticket) = ack_escalation_ticket {
+        let trimmed = ticket.trim();
+        message.ack_policy.escalation_ticket = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        };
+    }
+
+    Ok(())
+}
+
+fn parse_ack_mode(raw: &str) -> Result<MailboxAckMode, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "none" => Ok(MailboxAckMode::None),
+        "passive" => Ok(MailboxAckMode::Passive),
+        "required" => Ok(MailboxAckMode::Required),
+        other => Err(format!("invalid ack_mode value: {other}")),
+    }
+}
+
+fn ack_mode_label(mode: &MailboxAckMode) -> &'static str {
+    match mode {
+        MailboxAckMode::None => "none",
+        MailboxAckMode::Passive => "passive",
+        MailboxAckMode::Required => "required",
+    }
 }
 
 async fn wait_for_delivery_event(
@@ -378,12 +472,18 @@ mod tests {
         let parsed: MailboxSendJsonOutputNormalized = serde_json::from_str(&content).unwrap();
         assert_eq!(parsed.ok, true);
         assert_eq!(parsed.ack.as_deref(), Some("delivered"));
+        assert_eq!(
+            parsed.conversation_id.to_string(),
+            session.get_conversation_id().to_string()
+        );
+        assert_eq!(parsed.ack_mode.as_deref(), Some("none"));
+        assert_eq!(parsed.mode.as_deref(), Some("wait"));
         submission_task.abort();
     }
 
     #[tokio::test]
-    async fn mailbox_send_handler_cross_session_rejected() {
-        let (_guard, session, turn_context, _submission_task) =
+    async fn mailbox_send_handler_cross_session_alias_allowed() {
+        let (_guard, session, turn_context, submission_task) =
             spawn_test_mailbox_session().await.expect("spawn session");
         let home = tempfile::TempDir::new().unwrap();
         unsafe {
@@ -410,8 +510,8 @@ mod tests {
         let args = serde_json::json!({
             "message": message,
             "to": "other.session",
-            "timeout_seconds": 2,
-            "wait_for_delivery": false
+            "timeout_seconds": 5,
+            "wait_for_delivery": true
         });
 
         let handler = MailboxSendHandler;
@@ -427,13 +527,17 @@ mod tests {
             },
         };
 
-        let err = handler.handle(invocation).await.unwrap_err();
-        match err {
-            FunctionCallError::RespondToModel(msg) => {
-                assert!(msg.contains("cross-session mailbox send not yet supported"));
-            }
-            other => panic!("unexpected error: {other:?}"),
-        }
+        let output = handler.handle(invocation).await.expect("tool success");
+        let ToolOutput::Function { content, .. } = output else {
+            panic!("expected function output")
+        };
+        let parsed: MailboxSendJsonOutputNormalized = serde_json::from_str(&content).unwrap();
+        assert_eq!(parsed.ok, true);
+        assert_eq!(parsed.ack.as_deref(), Some("delivered"));
+        assert_eq!(parsed.ack_mode.as_deref(), Some("none"));
+        assert_eq!(parsed.mode.as_deref(), Some("wait"));
+        assert_eq!(parsed.conversation_id.to_string(), other_id.to_string());
+        submission_task.abort();
     }
     #[tokio::test]
     async fn mailbox_send_handler_enqueues_and_waits_for_delivery() {
@@ -497,6 +601,71 @@ mod tests {
         assert_eq!(parsed.ok, true);
         assert_eq!(parsed.ack.as_deref(), Some("delivered"));
 
+        submission_task.abort();
+    }
+
+    #[tokio::test]
+    async fn mailbox_send_handler_applies_ack_overrides() {
+        let (_guard, session, turn_context, submission_task) =
+            spawn_test_mailbox_session().await.expect("spawn session");
+
+        let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+
+        unsafe {
+            std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+            std::env::set_var("CODEX_MAILBOX_OOB", "1");
+        }
+
+        let message = json!({
+            "sender": {
+                "id": "system.test",
+                "role": "system"
+            },
+            "body": {
+                "content": "ack override",
+                "content_type": "text/plain"
+            },
+            "audit": {
+                "request_id": "REQ-ack",
+                "justification": "test"
+            },
+            "priority": "normal"
+        });
+
+        let args = json!({
+            "message": message,
+            "ack_mode": "required",
+            "ack_deadline": "2025-10-23T12:00:00Z",
+            "wait_for_delivery": false
+        });
+
+        let handler = MailboxSendHandler;
+        let invocation = ToolInvocation {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn_context),
+            tracker,
+            sub_id: "sub-ack".to_string(),
+            call_id: "call-ack".to_string(),
+            tool_name: MAILBOX_SEND_TOOL_NAME.to_string(),
+            payload: ToolPayload::Function {
+                arguments: args.to_string(),
+            },
+        };
+
+        let output = handler
+            .handle(invocation)
+            .await
+            .expect("tool should succeed");
+
+        let ToolOutput::Function { content, .. } = output else {
+            panic!("expected function output");
+        };
+
+        let parsed: MailboxSendJsonOutputNormalized =
+            serde_json::from_str(&content).expect("parse result");
+        assert_eq!(parsed.ok, true);
+        assert_eq!(parsed.ack.as_deref(), Some("enqueued"));
+        assert_eq!(parsed.ack_mode.as_deref(), Some("required"));
         submission_task.abort();
     }
 }

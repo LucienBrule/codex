@@ -12,6 +12,9 @@ use codex_protocol::mailbox::MailboxPriority;
 use codex_protocol::mailbox::MailboxRateLimitHint;
 use codex_protocol::mailbox::MailboxRateLimitScope;
 use codex_protocol::mailbox::MailboxSenderRole;
+use codex_protocol::protocol::MailboxDeliveryEvent;
+use codex_protocol::protocol::MailboxDeliveryIngress;
+use codex_protocol::protocol::MailboxDeliveryState;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -36,6 +39,171 @@ pub(crate) fn mailbox_feature_enabled() -> bool {
         };
     }
     *CODEX_MAILBOX_OOB
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct MailboxWaitFilter {
+    pub subject_equals: Option<SubjectMatcher>,
+    pub subject_contains: Option<SubjectMatcher>,
+    pub sender_ids: Vec<String>,
+    pub sender_conversation_ids: Vec<Uuid>,
+    pub request_ids: Vec<String>,
+    pub message_ids: Vec<Uuid>,
+    pub states: Option<Vec<MailboxDeliveryState>>,
+    pub ingress: Option<Vec<MailboxDeliveryIngress>>,
+}
+
+impl MailboxWaitFilter {
+    pub fn matches(&self, event: &MailboxDeliveryEvent) -> bool {
+        if let Some(states) = &self.states {
+            if !states.iter().any(|state| state == &event.state) {
+                return false;
+            }
+        }
+
+        if let Some(subject_equals) = &self.subject_equals {
+            match event.message.body.subject.as_deref() {
+                Some(subject) if subject_equals.matches(subject) => {}
+                _ => return false,
+            }
+        }
+
+        if let Some(subject_contains) = &self.subject_contains {
+            match event.message.body.subject.as_deref() {
+                Some(subject) if subject_contains.matches_contains(subject) => {}
+                _ => return false,
+            }
+        }
+
+        if !self.sender_ids.is_empty()
+            && !self
+                .sender_ids
+                .iter()
+                .any(|expected| expected == &event.message.sender.id)
+        {
+            return false;
+        }
+
+        if !self.sender_conversation_ids.is_empty() {
+            match extract_sender_conversation_id(event) {
+                Some(conversation_id)
+                    if self
+                        .sender_conversation_ids
+                        .iter()
+                        .any(|expected| expected == &conversation_id) => {}
+                _ => return false,
+            }
+        }
+
+        if !self.request_ids.is_empty() {
+            match event.message.audit.request_id.as_deref() {
+                Some(request_id)
+                    if self
+                        .request_ids
+                        .iter()
+                        .any(|expected| expected == request_id) => {}
+                _ => return false,
+            }
+        }
+
+        if !self.message_ids.is_empty()
+            && !self
+                .message_ids
+                .iter()
+                .any(|expected| expected == &event.message.message_id)
+        {
+            return false;
+        }
+
+        if let Some(ingress) = &self.ingress {
+            match event.ingress.as_ref() {
+                Some(event_ingress) if ingress.iter().any(|allowed| allowed == event_ingress) => {}
+                _ => return false,
+            }
+        }
+
+        true
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SubjectMatcher {
+    raw: String,
+    normalized: String,
+    case_sensitive: bool,
+}
+
+impl SubjectMatcher {
+    pub fn equals(value: String, case_sensitive: bool) -> Self {
+        let normalized = if case_sensitive {
+            value.clone()
+        } else {
+            value.to_lowercase()
+        };
+        Self {
+            raw: value,
+            normalized,
+            case_sensitive,
+        }
+    }
+
+    pub fn contains(value: String, case_sensitive: bool) -> Self {
+        let normalized = if case_sensitive {
+            value.clone()
+        } else {
+            value.to_lowercase()
+        };
+        Self {
+            raw: value,
+            normalized,
+            case_sensitive,
+        }
+    }
+
+    pub fn matches(&self, candidate: &str) -> bool {
+        if self.case_sensitive {
+            candidate == self.raw
+        } else {
+            candidate.to_lowercase() == self.normalized
+        }
+    }
+
+    pub fn matches_contains(&self, candidate: &str) -> bool {
+        if self.case_sensitive {
+            candidate.contains(&self.raw)
+        } else {
+            candidate.to_lowercase().contains(&self.normalized)
+        }
+    }
+}
+
+fn extract_sender_conversation_id(event: &MailboxDeliveryEvent) -> Option<Uuid> {
+    use serde_json::Value;
+
+    let metadata = &event.message.metadata;
+    let candidate_keys = [
+        "sender_conversation_id",
+        "senderConversationId",
+        "sender.conversation_id",
+    ];
+
+    for key in candidate_keys {
+        if let Some(Value::String(value)) = metadata.get(key) {
+            if let Ok(uuid) = Uuid::parse_str(value) {
+                return Some(uuid);
+            }
+        }
+    }
+
+    if let Some(Value::Object(sender)) = metadata.get("sender") {
+        if let Some(Value::String(value)) = sender.get("conversation_id") {
+            if let Ok(uuid) = Uuid::parse_str(value) {
+                return Some(uuid);
+            }
+        }
+    }
+
+    None
 }
 
 /// Envelope stored in the runtime mailbox queue. Keeps track of the originating

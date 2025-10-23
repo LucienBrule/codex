@@ -74,6 +74,7 @@ use crate::mailbox::MAILBOX_QUEUE_CAPACITY;
 use crate::mailbox::MailboxEnvelope;
 use crate::mailbox::MailboxReceiver;
 use crate::mailbox::MailboxSender;
+use crate::mailbox::MailboxWaitFilter;
 use crate::mailbox::TryEnqueueError;
 use crate::mailbox::apply_mailbox_defaults;
 use crate::mailbox::mailbox_channel;
@@ -303,6 +304,7 @@ pub(crate) struct Session {
     wait_trigger_mailbox_failures: Mutex<Vec<MailboxEnqueueError>>,
     wait_triggers: Mutex<HashMap<Uuid, WaitTriggerState>>,
     mailbox_waiters: Mutex<HashMap<Uuid, Vec<oneshot::Sender<MailboxDeliveryEvent>>>>,
+    mailbox_predicate_waiters: Mutex<Vec<MailboxPredicateWaiter>>,
     session_source: SessionSource,
     mailbox_metrics: Mutex<MailboxDeliveryTelemetry>,
     mailbox_liveness: Option<Mutex<MailboxLivenessTelemetry>>,
@@ -316,6 +318,12 @@ pub enum MailboxEnqueueError {
     Full { capacity: usize },
     #[error("mailbox dispatcher unavailable")]
     Closed,
+}
+
+struct MailboxPredicateWaiter {
+    id: Uuid,
+    filter: MailboxWaitFilter,
+    tx: oneshot::Sender<MailboxDeliveryEvent>,
 }
 
 struct WaitTriggerState {
@@ -691,6 +699,7 @@ impl Session {
             wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
             wait_triggers: Mutex::new(HashMap::new()),
             mailbox_waiters: Mutex::new(HashMap::new()),
+            mailbox_predicate_waiters: Mutex::new(Vec::new()),
             session_source,
             mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
             mailbox_liveness,
@@ -893,6 +902,7 @@ impl Session {
                     msg: EventMsg::MailboxDelivery(enqueued_event.clone()),
                 };
                 self.send_event(event).await;
+                self.notify_mailbox_predicate_waiters(&enqueued_event).await;
                 Ok(enqueued_event)
             }
             Err(TryEnqueueError::Full { capacity, .. }) => {
@@ -955,6 +965,42 @@ impl Session {
     pub(crate) async fn cancel_mailbox_delivery_listener(&self, message_id: Uuid) {
         let mut waiters = self.mailbox_waiters.lock().await;
         waiters.remove(&message_id);
+    }
+
+    pub(crate) async fn register_mailbox_predicate_waiter(
+        &self,
+        filter: MailboxWaitFilter,
+    ) -> (Uuid, oneshot::Receiver<MailboxDeliveryEvent>) {
+        let id = Uuid::now_v7();
+        let (tx, rx) = oneshot::channel();
+        let mut waiters = self.mailbox_predicate_waiters.lock().await;
+        waiters.retain(|waiter| !waiter.tx.is_closed());
+        waiters.push(MailboxPredicateWaiter { id, filter, tx });
+        (id, rx)
+    }
+
+    pub(crate) async fn cancel_mailbox_predicate_waiter(&self, waiter_id: Uuid) {
+        let mut waiters = self.mailbox_predicate_waiters.lock().await;
+        waiters.retain(|waiter| waiter.id != waiter_id && !waiter.tx.is_closed());
+    }
+
+    pub(crate) async fn notify_mailbox_predicate_waiters(&self, event: &MailboxDeliveryEvent) {
+        let mut waiters = self.mailbox_predicate_waiters.lock().await;
+        let mut idx = 0;
+        while idx < waiters.len() {
+            if waiters[idx].tx.is_closed() {
+                waiters.swap_remove(idx);
+                continue;
+            }
+
+            if waiters[idx].filter.matches(event) {
+                let waiter = waiters.swap_remove(idx);
+                let _ = waiter.tx.send(event.clone());
+                continue;
+            }
+
+            idx += 1;
+        }
     }
 
     async fn notify_mailbox_delivery_listeners(&self, delivery: &MailboxDeliveryEvent) {
@@ -2328,6 +2374,7 @@ async fn handle_mailbox_delivery(
     sess.send_event(event).await;
     sess.notify_mailbox_delivery_listeners(&delivery_event)
         .await;
+    sess.notify_mailbox_predicate_waiters(&delivery_event).await;
 }
 
 /// Spawn a review thread using the given prompt.
@@ -3942,6 +3989,7 @@ pub(crate) mod tests {
             wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
             wait_triggers: Mutex::new(HashMap::new()),
             mailbox_waiters: Mutex::new(HashMap::new()),
+            mailbox_predicate_waiters: Mutex::new(Vec::new()),
             session_source: SessionSource::Cli,
             mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
             mailbox_liveness: None,
@@ -4027,6 +4075,7 @@ pub(crate) mod tests {
             wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
             wait_triggers: Mutex::new(HashMap::new()),
             mailbox_waiters: Mutex::new(HashMap::new()),
+            mailbox_predicate_waiters: Mutex::new(Vec::new()),
             session_source: SessionSource::Cli,
             mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
             mailbox_liveness: None,
