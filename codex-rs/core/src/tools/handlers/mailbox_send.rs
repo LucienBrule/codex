@@ -12,10 +12,13 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::time::timeout;
+use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::codex::MailboxEnqueueError;
 use crate::function_tool::FunctionCallError;
+use crate::mailbox::ROUTING_MODE_METADATA_KEY;
 use crate::mailbox::apply_mailbox_defaults;
 use crate::mailbox::mailbox_feature_enabled;
 use crate::mailbox::validate_mailbox_message;
@@ -29,6 +32,10 @@ use crate::tools::registry::ToolKind;
 pub const MAILBOX_SEND_TOOL_NAME: &str = "mailbox_send";
 // Back-compat alias retained for older prompts/tests
 pub const MAILBOX_SEND_TOOL_ALIAS: &str = "codex_mailbox_send";
+pub const MAILBOX_SEND_STORY_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../mcp/prompts/mailbox_send_story.json"
+));
 
 pub struct MailboxSendHandler;
 
@@ -128,8 +135,8 @@ impl ToolHandler for MailboxSendHandler {
 
         let MailboxSendArgs {
             mut message,
-            to,
-            conversation_id,
+            mut to,
+            mut conversation_id,
             ack_mode,
             ack_deadline,
             ack_auto_seconds,
@@ -137,6 +144,24 @@ impl ToolHandler for MailboxSendHandler {
             timeout_seconds,
             wait_for_delivery,
         } = args;
+
+        to = to.and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
+
+        conversation_id = conversation_id.and_then(|raw| {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        });
 
         // Resolve explicit conversation_id (if provided) or via contacts when 'to' is set.
         let requested_id: Option<Uuid> = if let Some(cid) = conversation_id.as_ref() {
@@ -170,12 +195,77 @@ impl ToolHandler for MailboxSendHandler {
             None
         };
 
+        if to.is_none() && conversation_id.is_none() {
+            warn!(
+                tool = MAILBOX_SEND_TOOL_NAME,
+                "mailbox_send missing routing target: set 'to' or 'conversation_id'"
+            );
+            return Err(FunctionCallError::RespondToModel(
+                "mailbox_send requires either 'to' or 'conversation_id' to route the message"
+                    .to_string(),
+            ));
+        }
+
         let session_uuid = Uuid::parse_str(&session.get_conversation_id().to_string())
             .unwrap_or_else(|_| Uuid::nil());
-        let target_conversation_uuid = requested_id.unwrap_or(session_uuid);
-        if let Some(target_id) = requested_id {
-            apply_conversation_audience(&mut message, target_id);
+
+        let target_conversation_uuid = match requested_id {
+            Some(target_id) if target_id == session_uuid => {
+                warn!(
+                    tool = MAILBOX_SEND_TOOL_NAME,
+                    %target_id,
+                    %session_uuid,
+                    "mailbox_send attempted self-loop; refusing to enqueue"
+                );
+                return Err(FunctionCallError::RespondToModel(
+                    "mailbox_send cannot target the current session; choose a different recipient"
+                        .to_string(),
+                ));
+            }
+            Some(target_id) => {
+                apply_conversation_audience(&mut message, target_id);
+                target_id
+            }
+            None => {
+                warn!(
+                    tool = MAILBOX_SEND_TOOL_NAME,
+                    "mailbox_send missing routing target after resolution"
+                );
+                return Err(FunctionCallError::RespondToModel(
+                    "mailbox_send requires either 'to' or 'conversation_id' to route the message"
+                        .to_string(),
+                ));
+            }
+        };
+
+        let routing_mode = if to.is_some() {
+            "contact"
+        } else {
+            "conversation_id"
+        };
+
+        if message
+            .metadata
+            .get(ROUTING_MODE_METADATA_KEY)
+            .and_then(|value| value.as_str())
+            .is_none()
+        {
+            message.metadata.insert(
+                ROUTING_MODE_METADATA_KEY.to_string(),
+                serde_json::Value::String(routing_mode.to_string()),
+            );
         }
+        info!(
+            target: "codex::mailbox",
+            tool = MAILBOX_SEND_TOOL_NAME,
+            routing_mode,
+            to = to.as_deref(),
+            %target_conversation_uuid,
+            message_id = %message.message_id,
+            request_id = message.audit.request_id.as_deref().unwrap_or(""),
+            wait_for_delivery,
+            "mailbox_send routing resolved"
+        );
 
         apply_ack_overrides(
             &mut message,
@@ -411,45 +501,107 @@ mod tests {
     use crate::tools::context::ToolOutput;
     use crate::tools::context::ToolPayload;
     use crate::turn_diff_tracker::TurnDiffTracker;
+    use serde_json::Value;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.original {
+                    Some(value) => std::env::set_var(self.key, value),
+                    None => std::env::remove_var(self.key),
+                }
+            };
+        }
+    }
+
+    #[test]
+    fn story_template_matches_mailbox_schema() {
+        let template: Value =
+            serde_json::from_str(MAILBOX_SEND_STORY_TEMPLATE).expect("template JSON must parse");
+        let tool_name = template
+            .get("tool_name")
+            .and_then(Value::as_str)
+            .expect("template must set tool_name");
+        assert_eq!(tool_name, MAILBOX_SEND_TOOL_NAME);
+
+        let arguments = template
+            .get("arguments")
+            .cloned()
+            .expect("template must include arguments");
+        let arguments_json =
+            serde_json::to_string(&arguments).expect("arguments must be serializable");
+        let parsed: MailboxSendArgs =
+            serde_json::from_str(&arguments_json).expect("arguments must match Mailbox schema");
+
+        assert!(
+            parsed.to.is_some() || parsed.conversation_id.is_some(),
+            "template must set routing information",
+        );
+        assert!(
+            parsed
+                .message
+                .body
+                .subject
+                .as_ref()
+                .is_some_and(|subject| !subject.trim().is_empty()),
+            "template must set a non-empty subject",
+        );
+        assert!(
+            !parsed.message.body.content.trim().is_empty(),
+            "template must set non-empty content",
+        );
+    }
+
     #[tokio::test]
-    async fn mailbox_send_handler_resolves_to_same_session_via_contacts() {
+    #[serial_test::serial]
+    async fn mailbox_send_handler_rejects_self_routing_via_contacts() {
         let (_guard, session, turn_context, submission_task) =
             spawn_test_mailbox_session().await.expect("spawn session");
 
-        // Seed a temporary CODEX_HOME with contacts mapping to current session id
-        let home = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("CODEX_HOME", home.path());
-            std::env::set_var("CODEX_NAMESPACE", "codex");
-        }
-        let ns = "codex";
-        let nsdir = home.path().join(ns);
-        std::fs::create_dir_all(&nsdir).unwrap();
+        // Seed a temporary contacts file mapping to the current session id
+        let contacts_dir = tempfile::TempDir::new().unwrap();
+        let contacts_path = contacts_dir.path().join("contacts.toml");
         let mapping = format!(
             "[contacts]\nself.session = \"{}\"\n",
             session.get_conversation_id()
         );
-        std::fs::write(nsdir.join("contacts.toml"), mapping).unwrap();
+        std::fs::write(&contacts_path, mapping).unwrap();
+        let _contacts_guard = EnvVarGuard::set_path("CODEX_CONTACTS_FILE", &contacts_path);
         unsafe {
             std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
             std::env::set_var("CODEX_MAILBOX_OOB", "1");
         }
+        let loaded_contacts =
+            crate::contacts::load_contacts(std::path::Path::new("."), "codex").unwrap();
+        assert!(loaded_contacts.resolve("self.session").is_some());
 
         let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let message = serde_json::json!({
             "sender": {"id": "system.test", "role": "system"},
-            "body": {"content": "mcp contacts test", "content_type": "text/plain"},
+            "body": {"subject": "Contacts", "content": "mcp contacts test", "content_type": "text/plain"},
             "audit": {"request_id": "REQ-ct", "justification": "test"}
         });
         let args = serde_json::json!({
             "message": message,
             "to": "self.session",
             "timeout_seconds": 5,
-            "wait_for_delivery": true
+            "wait_for_delivery": false
         });
 
         let handler = MailboxSendHandler;
@@ -465,37 +617,24 @@ mod tests {
             },
         };
 
-        let output = handler.handle(invocation).await.expect("tool success");
-        let ToolOutput::Function { content, .. } = output else {
-            panic!("expected function output")
-        };
-        let parsed: MailboxSendJsonOutputNormalized = serde_json::from_str(&content).unwrap();
-        assert_eq!(parsed.ok, true);
-        assert_eq!(parsed.ack.as_deref(), Some("delivered"));
-        assert_eq!(
-            parsed.conversation_id.to_string(),
-            session.get_conversation_id().to_string()
-        );
-        assert_eq!(parsed.ack_mode.as_deref(), Some("none"));
-        assert_eq!(parsed.mode.as_deref(), Some("wait"));
+        let err = handler
+            .handle(invocation)
+            .await
+            .expect_err("expected self-loop rejection");
+        match err {
+            FunctionCallError::RespondToModel(message) => {
+                assert!(message.contains("cannot target the current session"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
         submission_task.abort();
     }
 
     #[tokio::test]
-    async fn mailbox_send_handler_cross_session_alias_allowed() {
+    async fn mailbox_send_handler_requires_explicit_routing() {
         let (_guard, session, turn_context, submission_task) =
             spawn_test_mailbox_session().await.expect("spawn session");
-        let home = tempfile::TempDir::new().unwrap();
-        unsafe {
-            std::env::set_var("CODEX_HOME", home.path());
-            std::env::set_var("CODEX_NAMESPACE", "codex");
-        }
-        let ns = "codex";
-        let nsdir = home.path().join(ns);
-        std::fs::create_dir_all(&nsdir).unwrap();
-        let other_id = uuid::Uuid::now_v7();
-        let mapping = format!("[contacts]\nother.session = \"{other_id}\"\n");
-        std::fs::write(nsdir.join("contacts.toml"), mapping).unwrap();
+
         unsafe {
             std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
             std::env::set_var("CODEX_MAILBOX_OOB", "1");
@@ -504,7 +643,64 @@ mod tests {
         let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
         let message = serde_json::json!({
             "sender": {"id": "system.test", "role": "system"},
-            "body": {"content": "mcp cross test", "content_type": "text/plain"},
+            "body": {"subject": "Missing routing", "content": "mcp routing test", "content_type": "text/plain"},
+            "audit": {"request_id": "REQ-route", "justification": "test"}
+        });
+        let args = serde_json::json!({
+            "message": message,
+            "timeout_seconds": 5,
+            "wait_for_delivery": false
+        });
+
+        let handler = MailboxSendHandler;
+        let invocation = ToolInvocation {
+            session: Arc::clone(&session),
+            turn: Arc::clone(&turn_context),
+            tracker,
+            sub_id: "sub-route".to_string(),
+            call_id: "call-route".to_string(),
+            tool_name: MAILBOX_SEND_TOOL_NAME.to_string(),
+            payload: ToolPayload::Function {
+                arguments: args.to_string(),
+            },
+        };
+
+        let err = handler
+            .handle(invocation)
+            .await
+            .expect_err("expected routing validation error");
+        match err {
+            FunctionCallError::RespondToModel(message) => {
+                assert!(message.contains("requires either 'to' or 'conversation_id'"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+        submission_task.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn mailbox_send_handler_cross_session_alias_allowed() {
+        let (_guard, session, turn_context, submission_task) =
+            spawn_test_mailbox_session().await.expect("spawn session");
+        let contacts_dir = tempfile::TempDir::new().unwrap();
+        let contacts_path = contacts_dir.path().join("contacts.toml");
+        let other_id = uuid::Uuid::now_v7();
+        let mapping = format!("[contacts]\nother.session = \"{other_id}\"\n");
+        std::fs::write(&contacts_path, mapping).unwrap();
+        let _contacts_guard = EnvVarGuard::set_path("CODEX_CONTACTS_FILE", &contacts_path);
+        unsafe {
+            std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+            std::env::set_var("CODEX_MAILBOX_OOB", "1");
+        }
+        let loaded_contacts =
+            crate::contacts::load_contacts(std::path::Path::new("."), "codex").unwrap();
+        assert!(loaded_contacts.resolve("other.session").is_some());
+
+        let tracker: SharedTurnDiffTracker = Arc::new(Mutex::new(TurnDiffTracker::new()));
+        let message = serde_json::json!({
+            "sender": {"id": "system.test", "role": "system"},
+            "body": {"subject": "Cross session", "content": "mcp cross test", "content_type": "text/plain"},
             "audit": {"request_id": "REQ-x", "justification": "test"}
         });
         let args = serde_json::json!({
@@ -540,7 +736,7 @@ mod tests {
         submission_task.abort();
     }
     #[tokio::test]
-    async fn mailbox_send_handler_enqueues_and_waits_for_delivery() {
+    async fn mailbox_send_handler_enqueues_without_waiting() {
         let (_guard, session, turn_context, submission_task) =
             spawn_test_mailbox_session().await.expect("spawn session");
 
@@ -557,6 +753,7 @@ mod tests {
                 "role": "system"
             },
             "body": {
+                "subject": "Delivery",
                 "content": "integration test",
                 "content_type": "text/plain"
             },
@@ -568,10 +765,12 @@ mod tests {
             "priority": "high"
         });
 
+        let target_id = uuid::Uuid::now_v7();
         let args = json!({
             "message": message,
+            "conversation_id": target_id.to_string(),
             "timeout_seconds": 5,
-            "wait_for_delivery": true
+            "wait_for_delivery": false
         });
 
         let handler = MailboxSendHandler;
@@ -599,7 +798,9 @@ mod tests {
         let parsed: MailboxSendJsonOutputNormalized =
             serde_json::from_str(&content).expect("parse result");
         assert_eq!(parsed.ok, true);
-        assert_eq!(parsed.ack.as_deref(), Some("delivered"));
+        assert_eq!(parsed.ack.as_deref(), Some("enqueued"));
+        assert_eq!(parsed.mode.as_deref(), Some("enqueue_only"));
+        assert_eq!(parsed.conversation_id.to_string(), target_id.to_string());
 
         submission_task.abort();
     }
@@ -622,6 +823,7 @@ mod tests {
                 "role": "system"
             },
             "body": {
+                "subject": "Ack overrides",
                 "content": "ack override",
                 "content_type": "text/plain"
             },
@@ -632,10 +834,12 @@ mod tests {
             "priority": "normal"
         });
 
+        let target_id = uuid::Uuid::now_v7();
         let args = json!({
             "message": message,
             "ack_mode": "required",
             "ack_deadline": "2025-10-23T12:00:00Z",
+            "conversation_id": target_id.to_string(),
             "wait_for_delivery": false
         });
 
@@ -666,6 +870,7 @@ mod tests {
         assert_eq!(parsed.ok, true);
         assert_eq!(parsed.ack.as_deref(), Some("enqueued"));
         assert_eq!(parsed.ack_mode.as_deref(), Some("required"));
+        assert_eq!(parsed.conversation_id.to_string(), target_id.to_string());
         submission_task.abort();
     }
 }

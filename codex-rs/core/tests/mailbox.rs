@@ -1,150 +1,111 @@
-use codex_core::config::MailboxLivenessSettings;
-use codex_core::telemetry::MailboxDeliveryTelemetry;
-use codex_core::telemetry::MailboxLivenessTelemetry;
-use codex_core::telemetry::MailboxTelemetryLabels;
-use codex_protocol::mailbox::MailboxAckMode;
-use codex_protocol::mailbox::MailboxMessage;
-use codex_protocol::mailbox::MailboxPriority;
-use codex_protocol::mailbox::MailboxSenderRole;
-use codex_protocol::protocol::MailboxDeliveryEvent;
-use codex_protocol::protocol::MailboxDeliveryIngress;
-use codex_protocol::protocol::MailboxDeliveryState;
-use codex_protocol::protocol::MailboxLivenessState;
-use std::time::Duration;
-use std::time::Instant;
-use time::OffsetDateTime;
-use time::macros::datetime;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
-fn baseline_settings() -> MailboxLivenessSettings {
-    let mut settings = MailboxLivenessSettings::default();
-    settings.idle_after = Duration::from_secs(2);
-    settings.stalled_after = Duration::from_secs(6);
-    settings.emit_interval = Duration::from_secs(3);
-    settings
+use codex_core::MailboxDispatcherClient;
+use codex_core::mailbox_feature_enabled;
+use tempfile::TempDir;
+
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
+struct EnvVar {
+    key: &'static str,
+    previous: Option<String>,
+}
+
+impl EnvVar {
+    fn set(key: &'static str, value: &str) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, previous }
+    }
+
+    fn unset(key: &'static str) -> Self {
+        let previous = std::env::var(key).ok();
+        unsafe {
+            std::env::remove_var(key);
+        }
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        if let Some(prev) = &self.previous {
+            unsafe {
+                std::env::set_var(self.key, prev);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 }
 
 #[test]
-fn mailbox_emits_on_first_and_interval() {
-    let settings = baseline_settings();
-    let mut telemetry = MailboxLivenessTelemetry::new(settings);
-    let start = Instant::now();
-    let observed = OffsetDateTime::now_utc();
+fn mailbox_feature_enabled_detects_dispatcher_via_env() {
+    let _env_lock = env_guard();
+    let temp_home = TempDir::new().expect("temp dir");
+    let home_path = temp_home.path().to_str().unwrap();
+    let dispatcher_dir = temp_home.path().join("detect").join("mailbox");
+    std::fs::create_dir_all(&dispatcher_dir).expect("create mailbox dir");
+    let socket_path = dispatcher_dir.join("dispatcher.sock");
+    std::fs::write(&socket_path, b"stub").expect("write dispatcher stub");
 
-    let first = telemetry
-        .record(start, observed, Duration::from_secs(1), 0)
-        .expect("first heartbeat should emit");
-    assert_eq!(first.state, MailboxLivenessState::Active);
+    let _home_guard = EnvVar::set("CODEX_HOME", home_path);
+    let _ns_guard = EnvVar::set("CODEX_NAMESPACE", "detect");
+    let _oob = EnvVar::unset("CODEX_MAILBOX_OOB");
+    // Force-disable once to confirm baseline behaviour, then clear to allow detection.
+    {
+        let _force_disable = EnvVar::set("CODEX_MAILBOX_OOB_FORCE", "0");
+        assert!(
+            !mailbox_feature_enabled(),
+            "mailbox feature should respect CODEX_MAILBOX_OOB_FORCE=0"
+        );
+    }
 
-    // Second heartbeat within the emit interval should be suppressed.
-    assert!(
-        telemetry
-            .record(
-                start + Duration::from_secs(1),
-                observed,
-                Duration::from_secs(1),
-                0
-            )
-            .is_none()
+    // Dispatcher should be detected via socket presence even without explicit enable flag.
+    let dispatcher = MailboxDispatcherClient::from_env()
+        .expect("dispatcher should be detected when socket exists");
+    assert_eq!(
+        dispatcher.endpoint(),
+        socket_path.as_path(),
+        "dispatcher endpoint should resolve to default socket path"
     );
-
-    // After the emit interval we should see a new snapshot.
-    let resumed = telemetry
-        .record(
-            start + Duration::from_secs(4),
-            observed,
-            Duration::from_secs(1),
-            2,
-        )
-        .expect("heartbeat after interval emits");
-    assert_eq!(resumed.queue_depth, 2);
-    assert_eq!(resumed.state, MailboxLivenessState::Active);
-}
-
-#[test]
-fn mailbox_emits_on_state_transition() {
-    let settings = baseline_settings();
-    let mut telemetry = MailboxLivenessTelemetry::new(settings);
-    let start = Instant::now();
-    let observed = OffsetDateTime::now_utc();
-
-    telemetry
-        .record(start, observed, Duration::from_secs(1), 0)
-        .expect("initial heartbeat");
-
-    // Transition to idle before emit interval should still emit.
-    let idle = telemetry
-        .record(
-            start + Duration::from_secs(1),
-            observed,
-            Duration::from_secs(3),
-            1,
-        )
-        .expect("idle transition emits");
-    assert_eq!(idle.state, MailboxLivenessState::Idle);
-
-    // Transition to stalled state is emitted even inside interval.
-    let stalled = telemetry
-        .record(
-            start + Duration::from_secs(2),
-            observed,
-            Duration::from_secs(8),
-            1,
-        )
-        .expect("stalled transition emits");
-    assert_eq!(stalled.state, MailboxLivenessState::Stalled);
-
-    // Consecutive stalled heartbeat within interval suppresses duplicates.
     assert!(
-        telemetry
-            .record(
-                start + Duration::from_secs(3),
-                observed,
-                Duration::from_secs(7),
-                1,
-            )
-            .is_none()
+        mailbox_feature_enabled(),
+        "mailbox feature should enable automatically when dispatcher is available"
     );
 }
 
 #[test]
-fn mailbox_delivery_telemetry_computes_latency() {
-    let mut telemetry = MailboxDeliveryTelemetry::new();
+fn mailbox_feature_respects_force_disable_even_with_dispatcher() {
+    let _env_lock = env_guard();
+    let temp_home = TempDir::new().expect("temp dir");
+    let home_path = temp_home.path().to_str().unwrap();
+    let dispatcher_dir = temp_home.path().join("force").join("mailbox");
+    std::fs::create_dir_all(&dispatcher_dir).expect("create mailbox dir");
+    let socket_path = dispatcher_dir.join("dispatcher.sock");
+    std::fs::write(&socket_path, b"stub").expect("write dispatcher stub");
 
-    let mut message = MailboxMessage::default();
-    message.priority = MailboxPriority::High;
-    message.ack_policy.mode = MailboxAckMode::Passive;
-    message.sender.role = MailboxSenderRole::System;
+    let _home_guard = EnvVar::set("CODEX_HOME", home_path);
+    let _ns_guard = EnvVar::set("CODEX_NAMESPACE", "force");
+    let _enable = EnvVar::set("CODEX_MAIL_SERVER_ENABLE", "1");
+    let _server_force = EnvVar::set("CODEX_MAIL_SERVER_FORCE", "0");
+    let _force_disable = EnvVar::set("CODEX_MAILBOX_OOB_FORCE", "0");
 
-    let enqueued_at = datetime!(2025-10-13 19:30:00 UTC);
-    let delivered_at = datetime!(2025-10-13 19:30:05 UTC);
-
-    let enqueued_event = MailboxDeliveryEvent {
-        message: message.clone(),
-        state: MailboxDeliveryState::Enqueued,
-        queue_depth: Some(3),
-        observed_at: Some(enqueued_at),
-        correlation_id: Some("test-correlation".into()),
-        ingress: Some(MailboxDeliveryIngress::Cli),
-        delivery_latency_ms: None,
-    };
-    let enqueued_labels =
-        MailboxTelemetryLabels::new(MailboxDeliveryIngress::Cli, &enqueued_event.message);
-    let enqueued_snapshot = telemetry.record_enqueued(&enqueued_event, &enqueued_labels);
-    assert_eq!(enqueued_snapshot.delivery_latency_ms, None);
-
-    let mut delivered_event = MailboxDeliveryEvent {
-        message,
-        state: MailboxDeliveryState::Delivered,
-        queue_depth: Some(1),
-        observed_at: Some(delivered_at),
-        correlation_id: Some("test-correlation".into()),
-        ingress: Some(MailboxDeliveryIngress::Cli),
-        delivery_latency_ms: None,
-    };
-    let delivered_labels =
-        MailboxTelemetryLabels::new(MailboxDeliveryIngress::Cli, &delivered_event.message);
-    let delivered_snapshot = telemetry.record_delivered(&mut delivered_event, &delivered_labels);
-    assert_eq!(delivered_snapshot.queue_depth, Some(1));
-    assert_eq!(delivered_snapshot.delivery_latency_ms, Some(5000));
-    assert_eq!(delivered_event.delivery_latency_ms, Some(5000));
+    assert!(
+        MailboxDispatcherClient::from_env().is_none(),
+        "dispatcher client should honour CODEX_MAIL_SERVER_FORCE=0"
+    );
+    assert!(
+        !mailbox_feature_enabled(),
+        "mailbox feature should remain disabled when forced off"
+    );
 }

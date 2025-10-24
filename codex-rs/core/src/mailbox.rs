@@ -1,4 +1,5 @@
 use crate::flags::CODEX_MAILBOX_OOB;
+use crate::mailbox_dispatcher::MailboxDispatcherClient;
 
 use anyhow::Result;
 use anyhow::bail;
@@ -23,13 +24,14 @@ pub const DEFAULT_CRITICAL_MAILBOX_CAPACITY: u32 = 6;
 pub const DEFAULT_CRITICAL_MAILBOX_INTERVAL_SECONDS: u32 = 300;
 
 const MAILBOX_FORCE_ENV: &str = "CODEX_MAILBOX_OOB_FORCE";
+pub const ROUTING_MODE_METADATA_KEY: &str = "codex.routing_mode";
 
 /// Returns whether the mailbox dispatcher is enabled for the current process.
 ///
 /// The `CODEX_MAILBOX_OOB` flag is lazily evaluated once via `env_flags`. Tests
 /// and local tooling can override the runtime value at any point by exporting
 /// `CODEX_MAILBOX_OOB_FORCE` to `true/false` (case-insensitive) or `1/0`.
-pub(crate) fn mailbox_feature_enabled() -> bool {
+pub fn mailbox_feature_enabled() -> bool {
     if let Ok(raw) = std::env::var(MAILBOX_FORCE_ENV) {
         let lowered = raw.trim().to_ascii_lowercase();
         return match lowered.as_str() {
@@ -38,7 +40,12 @@ pub(crate) fn mailbox_feature_enabled() -> bool {
             _ => *CODEX_MAILBOX_OOB,
         };
     }
-    *CODEX_MAILBOX_OOB
+
+    if *CODEX_MAILBOX_OOB {
+        return true;
+    }
+
+    MailboxDispatcherClient::from_env().is_some()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -322,6 +329,19 @@ pub fn validate_mailbox_message(message: &MailboxMessage) -> Result<()> {
         MailboxSenderRole::System => {}
     }
 
+    let subject = message
+        .body
+        .subject
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("message.body.subject is required"))?;
+
+    ensure!(
+        subject.len() <= 200,
+        "message.body.subject must be 200 characters or fewer"
+    );
+
     if message.body.content.trim().is_empty() {
         bail!("message.body.content must not be empty");
     }
@@ -492,6 +512,7 @@ mod tests {
                 ..Default::default()
             },
             body: codex_protocol::mailbox::MailboxBody {
+                subject: Some("Defaults".into()),
                 content: "test".into(),
                 ..Default::default()
             },
@@ -531,6 +552,7 @@ mod tests {
                 ..Default::default()
             },
             body: codex_protocol::mailbox::MailboxBody {
+                subject: Some("Missing justification".into()),
                 content: "needs justification".into(),
                 ..Default::default()
             },
@@ -560,6 +582,7 @@ mod tests {
                 ..Default::default()
             },
             body: codex_protocol::mailbox::MailboxBody {
+                subject: Some("Normal".into()),
                 content: "all good".into(),
                 ..Default::default()
             },
@@ -573,5 +596,30 @@ mod tests {
 
         validate_mailbox_message(&message)
             .expect("normal priority payload should validate successfully");
+    }
+
+    #[test]
+    fn validation_rejects_missing_subject() {
+        let mut message = MailboxMessage {
+            priority: MailboxPriority::Normal,
+            sender: codex_protocol::mailbox::MailboxSender {
+                id: "orchestrator.test".into(),
+                role: MailboxSenderRole::Orchestrator,
+                ..Default::default()
+            },
+            body: codex_protocol::mailbox::MailboxBody {
+                content: "no subject".into(),
+                ..Default::default()
+            },
+            audit: codex_protocol::mailbox::MailboxAuditTrail {
+                request_id: Some("REQ-4".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        apply_mailbox_defaults(&mut message);
+
+        let err = validate_mailbox_message(&message).unwrap_err();
+        assert!(err.to_string().contains("message.body.subject is required"));
     }
 }

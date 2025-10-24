@@ -21,7 +21,11 @@ use codex_core::AuthManager;
 use codex_core::ConversationManager;
 use codex_core::DEFAULT_CRITICAL_MAILBOX_CAPACITY;
 use codex_core::DEFAULT_CRITICAL_MAILBOX_INTERVAL_SECONDS;
+use codex_core::MailDispatcherStatus;
+use codex_core::MailboxDispatcherClient;
+use codex_core::MailboxDispatcherError;
 use codex_core::NewConversation;
+use codex_core::ROUTING_MODE_METADATA_KEY;
 use codex_core::apply_mailbox_defaults;
 use codex_core::config::Config;
 use codex_core::config::ConfigOverrides;
@@ -57,6 +61,8 @@ use tokio::net::UnixStream;
 use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
+use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 mod registry;
@@ -110,6 +116,11 @@ impl std::fmt::Display for MailboxCliError {
 }
 
 impl std::error::Error for MailboxCliError {}
+
+#[derive(Debug)]
+struct DispatcherAck {
+    queue_depth: Option<u64>,
+}
 
 #[derive(Debug, Parser)]
 pub struct MailCli {
@@ -604,10 +615,35 @@ async fn run_send(
     apply_mailbox_defaults(&mut message);
     validate_mailbox_message(&message)?;
 
+    let routing_mode = if to.is_some() {
+        "contact"
+    } else {
+        "conversation_id"
+    };
+
+    if message
+        .metadata
+        .get(ROUTING_MODE_METADATA_KEY)
+        .and_then(|value| value.as_str())
+        .is_none()
+    {
+        message.metadata.insert(
+            ROUTING_MODE_METADATA_KEY.to_string(),
+            JsonValue::String(routing_mode.to_string()),
+        );
+    }
+
     if let Some(target_conversation_id) = target_conversation_id {
-        send_via_registry(message, target_conversation_id, &config, wait_timeout, json)
-            .await
-            .map_err(|err| anyhow::Error::new(err))?;
+        send_via_registry(
+            message,
+            target_conversation_id,
+            routing_mode,
+            &config,
+            wait_timeout,
+            json,
+        )
+        .await
+        .map_err(|err| anyhow::Error::new(err))?;
         return Ok(());
     }
 
@@ -634,27 +670,30 @@ async fn run_send(
             "message_id": message.message_id,
             "request_id": message.audit.request_id,
             "priority": format!("{:?}", message.priority).to_lowercase(),
+            "routing_mode": routing_mode,
             "enqueued": event_snapshot(&enqueued_event),
             "delivered": event_snapshot(&delivered_event),
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
     } else {
         println!(
-            "Mailbox message {} enqueued (queue_depth={}, observed_at={})",
+            "Mailbox message {} enqueued (queue_depth={}, observed_at={}, routing={})",
             message.message_id,
             enqueued_event.queue_depth.unwrap_or_default(),
             enqueued_event
                 .observed_at
                 .map(|t| t.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()))
                 .unwrap_or_else(|| "<unknown>".into()),
+            routing_mode,
         );
         println!(
-            "Delivery confirmed (queue_depth={}, observed_at={})",
+            "Delivery confirmed (queue_depth={}, observed_at={}, routing={})",
             delivered_event.queue_depth.unwrap_or_default(),
             delivered_event
                 .observed_at
                 .map(|t| t.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()))
                 .unwrap_or_else(|| "<unknown>".into()),
+            routing_mode,
         );
         if let Some(req) = &message.audit.request_id {
             println!("Audit request id: {req}");
@@ -667,10 +706,44 @@ async fn run_send(
 async fn send_via_registry(
     message: MailboxMessage,
     conversation_id: Uuid,
+    routing_mode: &str,
     config: &Config,
     wait_timeout: Duration,
     json: bool,
 ) -> Result<(), MailboxCliError> {
+    if let Some(dispatcher) = MailboxDispatcherClient::from_env() {
+        match try_dispatch_via_mail_server(&dispatcher, &message, conversation_id, routing_mode)
+            .await?
+        {
+            Some(dispatch_ack) => {
+                let endpoint = dispatcher.endpoint().display().to_string();
+                emit_mailbox_output(
+                    json,
+                    &message,
+                    conversation_id,
+                    true,
+                    Some("delivered"),
+                    dispatch_ack.queue_depth,
+                    None,
+                    routing_mode,
+                    "dispatcher",
+                    &endpoint,
+                )?;
+                return Ok(());
+            }
+            None => {
+                info!(
+                    target: "codex::mailbox",
+                    event = "cli.dispatch.fallback",
+                    message_id = %message.message_id,
+                    conversation_id = %conversation_id,
+                    routing_mode,
+                    "dispatcher unavailable; falling back to local mailbox socket"
+                );
+            }
+        }
+    }
+
     let namespace = resolve_namespace();
     let mailbox_dir = config.codex_home.join(&namespace).join("mailbox");
     let registry_path = mailbox_dir.join("registry.json");
@@ -704,6 +777,7 @@ async fn send_via_registry(
                 (resolved.clone(), resolved, false)
             }
         };
+    let endpoint_display = socket_path.display().to_string();
 
     let stream = match connect_with_retry(&socket_path).await {
         Ok(stream) => stream,
@@ -783,22 +857,18 @@ Ensure the worker is online; the socket appears at this path when connected.",
             }
         }
 
-        let output = MailboxSendJsonOutput {
-            ok: true,
-            message_id: message.message_id,
-            request_id: message.audit.request_id.clone(),
+        emit_mailbox_output(
+            true,
+            &message,
             conversation_id,
-            ack: Some("none".to_string()),
-            queue_depth: None,
-            correlation_id: None,
-            socket_path: socket_path.display().to_string(),
-        };
-        let serialized = serde_json::to_string_pretty(&output).map_err(|err| {
-            MailboxCliError::io_failure(format!(
-                "failed to serialize mailbox acknowledgement output: {err}"
-            ))
-        })?;
-        println!("{serialized}");
+            true,
+            Some("none"),
+            None,
+            None,
+            routing_mode,
+            "ipc",
+            &endpoint_display,
+        )?;
         return Ok(());
     }
 
@@ -851,16 +921,46 @@ Run `codex_ctl mailbox sweep` and ensure the worker session is online."
         }
     }
 
+    emit_mailbox_output(
+        json,
+        &message,
+        conversation_id,
+        ack.ok,
+        ack.ack.as_deref(),
+        ack.queue_depth,
+        ack.correlation_id.clone(),
+        routing_mode,
+        "ipc",
+        &endpoint_display,
+    )?;
+
+    Ok(())
+}
+
+fn emit_mailbox_output(
+    json: bool,
+    message: &MailboxMessage,
+    conversation_id: Uuid,
+    ok: bool,
+    ack_label: Option<&str>,
+    queue_depth: Option<u64>,
+    correlation_id: Option<String>,
+    routing_mode: &str,
+    transport: &str,
+    endpoint: &str,
+) -> Result<(), MailboxCliError> {
     if json {
         let output = MailboxSendJsonOutput {
-            ok: ack.ok,
+            ok,
             message_id: message.message_id,
             request_id: message.audit.request_id.clone(),
             conversation_id,
-            ack: ack.ack.clone(),
-            queue_depth: ack.queue_depth,
-            correlation_id: ack.correlation_id.clone(),
-            socket_path: socket_path.display().to_string(),
+            ack: ack_label.map(|label| label.to_string()),
+            queue_depth,
+            correlation_id: correlation_id.clone(),
+            routing_mode: routing_mode.to_string(),
+            transport: transport.to_string(),
+            socket_path: endpoint.to_string(),
         };
         let serialized = serde_json::to_string_pretty(&output).map_err(|err| {
             MailboxCliError::io_failure(format!(
@@ -869,25 +969,146 @@ Run `codex_ctl mailbox sweep` and ensure the worker session is online."
         })?;
         println!("{serialized}");
     } else {
-        let ack_label = ack.ack.as_deref().unwrap_or("delivered");
-        let queue_depth = ack.queue_depth.unwrap_or_default();
+        let ack_display = ack_label.unwrap_or_else(|| if ok { "delivered" } else { "failed" });
+        let queue_depth_display = queue_depth.unwrap_or_default();
         println!(
-            "Mailbox message {} delivered to conversation {} (ack={}, queue_depth={}, socket={})",
+            "Mailbox message {} delivered to conversation {} (ack={}, queue_depth={}, routing={}, transport={}, endpoint={})",
             message.message_id,
             conversation_id,
-            ack_label,
-            queue_depth,
-            socket_path.display()
+            ack_display,
+            queue_depth_display,
+            routing_mode,
+            transport,
+            endpoint
         );
         if let Some(req) = &message.audit.request_id {
             println!("Audit request id: {req}");
         }
-        if let Some(correlation) = &ack.correlation_id {
+        if let Some(correlation) = correlation_id.as_ref() {
             println!("Delivery correlation id: {correlation}");
         }
     }
-
     Ok(())
+}
+
+fn infer_source_conversation_id(message: &MailboxMessage) -> Uuid {
+    message
+        .metadata
+        .get("sender_conversation_id")
+        .and_then(|value| value.as_str())
+        .and_then(|raw| Uuid::parse_str(raw).ok())
+        .unwrap_or_else(Uuid::new_v4)
+}
+
+async fn try_dispatch_via_mail_server(
+    dispatcher: &MailboxDispatcherClient,
+    message: &MailboxMessage,
+    conversation_id: Uuid,
+    routing_mode: &str,
+) -> Result<Option<DispatcherAck>, MailboxCliError> {
+    let submission_id = format!("cli/{}", message.message_id);
+    let source_conversation_id = infer_source_conversation_id(message);
+    let request_id = message.audit.request_id.clone().unwrap_or_default();
+
+    match dispatcher
+        .dispatch(
+            &submission_id,
+            source_conversation_id,
+            conversation_id,
+            message,
+        )
+        .await
+    {
+        Ok(outcome) => match outcome.status {
+            MailDispatcherStatus::Delivered => {
+                info!(
+                    target: "codex::mailbox",
+                    event = "cli.dispatch.delivered",
+                    message_id = %message.message_id,
+                    conversation_id = %conversation_id,
+                    routing_mode,
+                    queue_depth = outcome.queue_depth,
+                    "dispatcher delivered mailbox envelope"
+                );
+                Ok(Some(DispatcherAck {
+                    queue_depth: outcome.queue_depth.map(|depth| depth as u64),
+                }))
+            }
+            MailDispatcherStatus::QueueFull => {
+                let mut detail = outcome
+                    .detail
+                    .unwrap_or_else(|| "mailbox queue is full".to_string());
+                if let Some(capacity) = outcome.capacity {
+                    detail = format!("{detail} (capacity={capacity})");
+                }
+                Err(MailboxCliError::queue_full(detail))
+            }
+            MailDispatcherStatus::InvalidRequest => {
+                let detail = outcome
+                    .detail
+                    .unwrap_or_else(|| "dispatcher rejected request".to_string());
+                Err(MailboxCliError::io_failure(format!(
+                    "Dispatcher rejected mailbox send: {detail}"
+                )))
+            }
+            MailDispatcherStatus::Disabled
+            | MailDispatcherStatus::DispatcherClosed
+            | MailDispatcherStatus::Timeout
+            | MailDispatcherStatus::UnknownSession
+            | MailDispatcherStatus::TransportError => {
+                warn!(
+                    target: "codex::mailbox",
+                    event = "cli.dispatch.fallback",
+                    message_id = %message.message_id,
+                    conversation_id = %conversation_id,
+                    routing_mode,
+                    status = ?outcome.status,
+                    detail = outcome.detail.as_deref().unwrap_or(""),
+                    "dispatcher reported fallback condition"
+                );
+                Ok(None)
+            }
+        },
+        Err(err) => {
+            match &err {
+                MailboxDispatcherError::Unavailable(inner) | MailboxDispatcherError::Io(inner) => {
+                    warn!(
+                        target: "codex::mailbox",
+                        event = "cli.dispatch.error",
+                        message_id = %message.message_id,
+                        conversation_id = %conversation_id,
+                        routing_mode,
+                        source_conversation = %source_conversation_id,
+                        request_id = %request_id,
+                        error = %inner,
+                        "dispatcher connection error; will fall back to ipc"
+                    );
+                }
+                MailboxDispatcherError::Timeout => {
+                    warn!(
+                        target: "codex::mailbox",
+                        event = "cli.dispatch.timeout",
+                        message_id = %message.message_id,
+                        conversation_id = %conversation_id,
+                        routing_mode,
+                        "dispatcher timed out; falling back to ipc"
+                    );
+                }
+                MailboxDispatcherError::InvalidResponse(detail) => {
+                    warn!(
+                        target: "codex::mailbox",
+                        event = "cli.dispatch.invalid_response",
+                        message_id = %message.message_id,
+                        conversation_id = %conversation_id,
+                        routing_mode,
+                        detail = %detail,
+                        "dispatcher returned invalid response; falling back to ipc"
+                    );
+                }
+            }
+            Ok(None)
+        }
+    }
 }
 
 async fn connect_with_retry(socket_path: &Path) -> Result<UnixStream, io::Error> {
@@ -1216,5 +1437,7 @@ struct MailboxSendJsonOutput {
     ack: Option<String>,
     queue_depth: Option<u64>,
     correlation_id: Option<String>,
+    routing_mode: String,
+    transport: String,
     socket_path: String,
 }

@@ -509,6 +509,7 @@ mod tests {
 
         // First, send a mailbox message and wait for delivery
         let send_handler = crate::tools::handlers::MailboxSendHandler;
+        let target_id = uuid::Uuid::now_v7();
         let send_args = json!({
             "message": {
                 "sender": { "id": "system.test", "role": "system" },
@@ -516,6 +517,7 @@ mod tests {
                 "audit": { "request_id": "REQ-99", "justification": "ok", "change_ticket": "CHG-99" },
                 "priority": "high"
             },
+            "conversation_id": target_id.to_string(),
             "timeout_seconds": 5,
             "wait_for_delivery": true
         });

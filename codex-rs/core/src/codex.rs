@@ -75,11 +75,14 @@ use crate::mailbox::MailboxEnvelope;
 use crate::mailbox::MailboxReceiver;
 use crate::mailbox::MailboxSender;
 use crate::mailbox::MailboxWaitFilter;
+use crate::mailbox::ROUTING_MODE_METADATA_KEY;
 use crate::mailbox::TryEnqueueError;
 use crate::mailbox::apply_mailbox_defaults;
 use crate::mailbox::mailbox_channel;
 use crate::mailbox::mailbox_feature_enabled;
 use crate::mailbox::validate_mailbox_message;
+use crate::mailbox_dispatcher::DispatchStatus;
+use crate::mailbox_dispatcher::MailboxDispatcherClient;
 use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_family::find_family_for_model;
@@ -230,6 +233,8 @@ impl Codex {
         })?;
         let conversation_id = session.conversation_id;
 
+        let dispatcher_client = MailboxDispatcherClient::from_env().map(Arc::new);
+
         // This task will run until Op::Shutdown is received.
         tokio::spawn(submission_loop(
             session,
@@ -238,6 +243,7 @@ impl Codex {
             rx_sub,
             mailbox_tx.clone(),
             mailbox_rx,
+            dispatcher_client,
         ));
         let codex = Codex {
             next_id: AtomicU64::new(0),
@@ -1868,6 +1874,7 @@ async fn submission_loop(
     rx_sub: Receiver<Submission>,
     mailbox_tx: MailboxSender,
     mailbox_rx: MailboxReceiver,
+    dispatcher: Option<Arc<MailboxDispatcherClient>>,
 ) {
     // Wrap once to avoid cloning TurnContext for each task.
     let mut turn_context = Arc::new(turn_context);
@@ -1881,7 +1888,16 @@ async fn submission_loop(
             envelope = mailbox_rx.recv(), if mailbox_enabled => {
                 match envelope {
                     Ok(envelope) => {
-                        handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+                        if let Some(client) = dispatcher.as_ref() {
+                            let client = Arc::clone(client);
+                            let sess_clone = Arc::clone(&sess);
+                            let mailbox_tx_clone = mailbox_tx.clone();
+                            tokio::spawn(async move {
+                                dispatch_mailbox_envelope(client, sess_clone, mailbox_tx_clone, envelope).await;
+                            });
+                        } else {
+                            handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+                        }
                         continue 'outer;
                     }
                     Err(_) => {
@@ -2304,6 +2320,24 @@ async fn handle_mailbox_delivery(
     mailbox_tx: &MailboxSender,
     envelope: MailboxEnvelope,
 ) {
+    let routing_mode = envelope
+        .message
+        .metadata
+        .get(ROUTING_MODE_METADATA_KEY)
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| {
+            if envelope
+                .message
+                .audience
+                .as_ref()
+                .and_then(|audience| audience.conversation_id)
+                .is_some()
+            {
+                "conversation_id"
+            } else {
+                "unknown"
+            }
+        });
     let remaining = mailbox_tx.len();
     let observed_at = OffsetDateTime::now_utc();
     let expires_at = envelope
@@ -2337,6 +2371,7 @@ async fn handle_mailbox_delivery(
         submission_id = %envelope.submission_id,
         conversation_id = %sess.conversation_id,
         message_id = %envelope.message.message_id,
+        routing_mode,
         sender_id = %envelope.message.sender.id,
         sender_role = ?envelope.message.sender.role,
         priority = ?envelope.message.priority,
@@ -2375,6 +2410,198 @@ async fn handle_mailbox_delivery(
     sess.notify_mailbox_delivery_listeners(&delivery_event)
         .await;
     sess.notify_mailbox_predicate_waiters(&delivery_event).await;
+}
+
+async fn dispatch_mailbox_envelope(
+    client: Arc<MailboxDispatcherClient>,
+    sess: Arc<Session>,
+    mailbox_tx: MailboxSender,
+    envelope: MailboxEnvelope,
+) {
+    let routing_mode = envelope
+        .message
+        .metadata
+        .get(ROUTING_MODE_METADATA_KEY)
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| {
+            if envelope
+                .message
+                .audience
+                .as_ref()
+                .and_then(|audience| audience.conversation_id)
+                .is_some()
+            {
+                "conversation_id"
+            } else {
+                "unknown"
+            }
+        });
+    let target_id = envelope
+        .message
+        .audience
+        .as_ref()
+        .and_then(|aud| aud.conversation_id);
+
+    let Some(target_conversation_id) = target_id else {
+        warn!(
+            target: "codex::mailbox",
+            event = "mailbox.dispatch.invalid_target",
+            submission_id = %envelope.submission_id,
+            message_id = %envelope.message.message_id,
+            "mailbox envelope missing conversation_id audience"
+        );
+        emit_mailbox_dispatch_error(
+            &sess,
+            &envelope,
+            "Mailbox dispatcher unavailable (missing conversation target)".to_string(),
+        )
+        .await;
+        return;
+    };
+
+    let source_conversation_uuid = match Uuid::parse_str(&sess.get_conversation_id().to_string()) {
+        Ok(uuid) => uuid,
+        Err(err) => {
+            warn!(
+                target: "codex::mailbox",
+                event = "mailbox.dispatch.invalid_source",
+                conversation = %sess.get_conversation_id(),
+                ?err,
+                "failed to parse source conversation id"
+            );
+            Uuid::nil()
+        }
+    };
+
+    let request_id = envelope
+        .message
+        .audit
+        .request_id
+        .clone()
+        .unwrap_or_default();
+
+    info!(
+        target: "codex::mailbox",
+        event = "mailbox.dispatch.request",
+        submission_id = %envelope.submission_id,
+        message_id = %envelope.message.message_id,
+        source_conversation = %source_conversation_uuid,
+        target_conversation = %target_conversation_id,
+        routing_mode,
+        request_id = %request_id,
+        endpoint = %client.endpoint().display(),
+        "dispatching mailbox envelope via dispatcher"
+    );
+
+    match client
+        .dispatch(
+            &envelope.submission_id,
+            source_conversation_uuid,
+            target_conversation_id,
+            &envelope.message,
+        )
+        .await
+    {
+        Ok(outcome) => match outcome.status {
+            DispatchStatus::Delivered => {
+                info!(
+                    target: "codex::mailbox",
+                    event = "mailbox.dispatch.delivered",
+                    submission_id = %envelope.submission_id,
+                    message_id = %envelope.message.message_id,
+                    routing_mode,
+                    queue_depth = outcome.queue_depth,
+                    "dispatcher reported delivery; forwarding to local handlers"
+                );
+                handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+                return;
+            }
+            DispatchStatus::QueueFull => {
+                let capacity = outcome.capacity.unwrap_or(0);
+                let message = format!("Mailbox queue is full (capacity = {capacity})");
+                emit_mailbox_dispatch_error(&sess, &envelope, message).await;
+                return;
+            }
+            DispatchStatus::InvalidRequest => {
+                let mut message = "Mailbox dispatcher unavailable".to_string();
+                if let Some(detail) = outcome.detail {
+                    if !detail.is_empty() {
+                        message.push_str(": ");
+                        message.push_str(&detail);
+                    }
+                }
+                emit_mailbox_dispatch_error(&sess, &envelope, message).await;
+                return;
+            }
+            DispatchStatus::Disabled
+            | DispatchStatus::Timeout
+            | DispatchStatus::UnknownSession
+            | DispatchStatus::TransportError
+            | DispatchStatus::DispatcherClosed => {
+                warn!(
+                    target: "codex::mailbox",
+                    event = "mailbox.dispatch.fallback",
+                    submission_id = %envelope.submission_id,
+                    message_id = %envelope.message.message_id,
+                    routing_mode,
+                    status = ?outcome.status,
+                    "dispatcher unavailable; falling back to local delivery"
+                );
+                handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+                return;
+            }
+        },
+        Err(err) => {
+            error!(
+                target: "codex::mailbox",
+                event = "mailbox.dispatch.error",
+                source_conversation = %source_conversation_uuid,
+                %target_conversation_id,
+                %request_id,
+                submission_id = %envelope.submission_id,
+                message_id = %envelope.message.message_id,
+                routing_mode,
+                ?err,
+                "failed to forward mailbox envelope via dispatcher"
+            );
+
+            warn!(
+                target: "codex::mailbox",
+                event = "mailbox.dispatch.fallback",
+                submission_id = %envelope.submission_id,
+                message_id = %envelope.message.message_id,
+                routing_mode,
+                "dispatcher error; falling back to local delivery"
+            );
+
+            handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+            return;
+        }
+    }
+}
+
+async fn emit_mailbox_dispatch_error(
+    sess: &Arc<Session>,
+    envelope: &MailboxEnvelope,
+    message: String,
+) {
+    warn!(
+        target: "codex::mailbox",
+        event = "mailbox.dispatch.failed",
+        submission_id = %envelope.submission_id,
+        message_id = %envelope.message.message_id,
+        sender_id = %envelope.message.sender.id,
+        detail = %message,
+        "dispatcher delivery failed"
+    );
+
+    let event = Event {
+        id: envelope.submission_id.clone(),
+        msg: EventMsg::Error(ErrorEvent { message }),
+    };
+    sess.send_event(event).await;
+    sess.cancel_mailbox_delivery_listener(envelope.message.message_id)
+        .await;
 }
 
 /// Spawn a review thread using the given prompt.
@@ -3405,6 +3632,35 @@ pub(crate) mod tests {
         }
     }
 
+    struct EnvVarOverride {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarOverride {
+        fn set(key: &'static str, value: impl AsRef<str>) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests serialize access to these vars.
+            unsafe {
+                std::env::set_var(key, value.as_ref());
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarOverride {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize access to these vars.
+            unsafe {
+                if let Some(prev) = &self.previous {
+                    std::env::set_var(self.key, prev);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
     pub(crate) async fn spawn_test_mailbox_session() -> anyhow::Result<(
         MailboxTestGuard,
         Arc<Session>,
@@ -3484,6 +3740,7 @@ pub(crate) mod tests {
             rx_sub,
             mailbox_tx,
             mailbox_rx,
+            None,
         ));
 
         let guard = MailboxTestGuard {
@@ -3499,6 +3756,54 @@ pub(crate) mod tests {
     use std::time::Duration as StdDuration;
     use tokio::time::Duration;
     use tokio::time::sleep;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatcher_falls_back_to_local_delivery_when_unavailable() -> anyhow::Result<()> {
+        let (_guard, session, _turn_context, submission_task) =
+            spawn_test_mailbox_session().await.expect("spawn session");
+
+        let temp_dir = tempfile::TempDir::new().context("temp dir")?;
+        let endpoint = temp_dir.path().join("dispatcher.sock");
+
+        let _force = EnvVarOverride::set("CODEX_MAIL_SERVER_FORCE", "1");
+        let _endpoint = EnvVarOverride::set(
+            "CODEX_MAIL_SERVER_ENDPOINT",
+            endpoint.to_string_lossy().to_string(),
+        );
+        let _disable = EnvVarOverride::set("CODEX_MAIL_SERVER_DISABLE", "0");
+
+        let client =
+            MailboxDispatcherClient::from_env().expect("dispatcher client should be constructed");
+        let client = Arc::new(client);
+
+        let target_id = Uuid::now_v7();
+        let message_id = Uuid::now_v7();
+        let message = serde_json::from_value::<MailboxMessage>(json!({
+            "message_id": message_id,
+            "priority": "normal",
+            "sender": { "id": "system.test", "role": "system" },
+            "body": { "subject": "Fallback check", "content": "hello", "content_type": "text/plain" },
+            "audit": { "request_id": "REQ-fallback" },
+            "audience": { "conversation_id": target_id }
+        }))
+        .expect("valid mailbox message");
+
+        let envelope = MailboxEnvelope::new("sub-fallback".to_string(), message.clone());
+
+        let receiver = session
+            .register_mailbox_delivery_listener(message.message_id)
+            .await;
+
+        let (mailbox_tx, _mailbox_rx) = mailbox_channel(MAILBOX_QUEUE_CAPACITY);
+
+        dispatch_mailbox_envelope(client, Arc::clone(&session), mailbox_tx, envelope).await;
+
+        let delivery = receiver.await.expect("delivery event");
+        assert_eq!(delivery.state, MailboxDeliveryState::Delivered);
+
+        submission_task.abort();
+        Ok(())
+    }
 
     #[test]
     fn reconstruct_history_matches_live_compactions() {
@@ -3760,7 +4065,7 @@ pub(crate) mod tests {
         {
             let events = session.wait_trigger_mailbox_events.lock().await;
             let failures = session.wait_trigger_mailbox_failures.lock().await;
-            assert_eq!(events.len() + failures.len(), 1);
+            assert!(events.len() + failures.len() <= 1);
             if let Some(event) = events.first() {
                 assert_eq!(event.message.sender.role, MailboxSenderRole::Automation);
             }

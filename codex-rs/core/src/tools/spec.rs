@@ -268,16 +268,244 @@ fn create_view_image_tool() -> ToolSpec {
     })
 }
 
-fn create_mailbox_send_tool() -> ToolSpec {
-    let mut properties = BTreeMap::new();
-    properties.insert(
-        "message".to_string(),
+fn mailbox_body_schema() -> JsonSchema {
+    let mut body_properties = BTreeMap::new();
+    body_properties.insert(
+        "subject".to_string(),
+        JsonSchema::String {
+            description: Some("Subject line shown in mailbox inbox listings.".to_string()),
+        },
+    );
+    body_properties.insert(
+        "content".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Primary message content. Use text/plain unless content_type overrides it."
+                    .to_string(),
+            ),
+        },
+    );
+    body_properties.insert(
+        "content_type".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "MIME type for the content (text/plain, text/markdown, application/json). Defaults to text/plain.".to_string(),
+            ),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: body_properties,
+        required: Some(vec!["subject".to_string(), "content".to_string()]),
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_sender_schema() -> JsonSchema {
+    let mut sender_properties = BTreeMap::new();
+    sender_properties.insert(
+        "id".to_string(),
+        JsonSchema::String {
+            description: Some("Sender identifier (e.g., orchestrator.codex).".to_string()),
+        },
+    );
+    sender_properties.insert(
+        "role".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Sender role (system, orchestrator, operator, or automation).".to_string(),
+            ),
+        },
+    );
+    sender_properties.insert(
+        "display_name".to_string(),
+        JsonSchema::String {
+            description: Some("Optional human-friendly sender name.".to_string()),
+        },
+    );
+    sender_properties.insert(
+        "contact".to_string(),
+        JsonSchema::String {
+            description: Some("Optional contact URI (mailto, slack channel, etc.).".to_string()),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: sender_properties,
+        required: Some(vec!["id".to_string(), "role".to_string()]),
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_audit_schema() -> JsonSchema {
+    let mut audit_properties = BTreeMap::new();
+    audit_properties.insert(
+        "request_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Stable identifier used to correlate audit events (required).".to_string(),
+            ),
+        },
+    );
+    audit_properties.insert(
+        "change_ticket".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Change ticket reference required for high/critical traffic.".to_string(),
+            ),
+        },
+    );
+    audit_properties.insert(
+        "created_by".to_string(),
+        JsonSchema::String {
+            description: Some("Human readable attribution for the sender.".to_string()),
+        },
+    );
+    audit_properties.insert(
+        "justification".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Operational justification required for elevated priority or rate overrides."
+                    .to_string(),
+            ),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: audit_properties,
+        required: Some(vec!["request_id".to_string()]),
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_audience_schema() -> JsonSchema {
+    let mut audience_properties = BTreeMap::new();
+    audience_properties.insert(
+        "conversation_id".to_string(),
+        JsonSchema::String {
+            description: Some("Target conversation UUID (omit when using `to`).".to_string()),
+        },
+    );
+    audience_properties.insert(
+        "worker_id".to_string(),
+        JsonSchema::String {
+            description: Some("Restrict delivery to a specific worker_id.".to_string()),
+        },
+    );
+    audience_properties.insert(
+        "allow_broadcast".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "Allow broadcast to multiple recipients (default false).".to_string(),
+            ),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: audience_properties,
+        required: None,
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_ack_policy_schema() -> JsonSchema {
+    let mut ack_properties = BTreeMap::new();
+    ack_properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Ack policy mode (none, passive, required). Defaults to passive.".to_string(),
+            ),
+        },
+    );
+    ack_properties.insert(
+        "deadline".to_string(),
+        JsonSchema::String {
+            description: Some("RFC3339 deadline for acknowledgement.".to_string()),
+        },
+    );
+    ack_properties.insert(
+        "auto_ack_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some("Passive auto-ack timer in seconds.".to_string()),
+        },
+    );
+    ack_properties.insert(
+        "escalation_ticket".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Escalation ticket reference when ack.mode=required with high/critical priority."
+                    .to_string(),
+            ),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: ack_properties,
+        required: None,
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_message_schema() -> JsonSchema {
+    let mut message_properties = BTreeMap::new();
+    message_properties.insert(
+        "message_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional UUID for the message; defaults to v7 when omitted.".to_string(),
+            ),
+        },
+    );
+    message_properties.insert(
+        "priority".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Priority level (critical, high, normal, low). Defaults to normal.".to_string(),
+            ),
+        },
+    );
+    message_properties.insert("sender".to_string(), mailbox_sender_schema());
+    message_properties.insert("audience".to_string(), mailbox_audience_schema());
+    message_properties.insert("body".to_string(), mailbox_body_schema());
+    message_properties.insert("ack_policy".to_string(), mailbox_ack_policy_schema());
+    message_properties.insert("audit".to_string(), mailbox_audit_schema());
+    message_properties.insert(
+        "tags".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(
+                JsonSchema::String {
+                    description: Some("Tag values stored as key/value pairs.".to_string()),
+                }
+                .into(),
+            ),
+        },
+    );
+    message_properties.insert(
+        "metadata".to_string(),
         JsonSchema::Object {
             properties: BTreeMap::new(),
             required: None,
             additional_properties: Some(true.into()),
         },
     );
+
+    JsonSchema::Object {
+        properties: message_properties,
+        required: Some(vec![
+            "sender".to_string(),
+            "body".to_string(),
+            "audit".to_string(),
+        ]),
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn create_mailbox_send_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert("message".to_string(), mailbox_message_schema());
     properties.insert(
         "to".to_string(),
         JsonSchema::String {
@@ -364,14 +592,7 @@ fn create_mailbox_send_tool() -> ToolSpec {
 fn create_mailbox_send_alias_tool() -> ToolSpec {
     // Legacy alias with identical schema under the old name
     let mut properties = BTreeMap::new();
-    properties.insert(
-        "message".to_string(),
-        JsonSchema::Object {
-            properties: BTreeMap::new(),
-            required: None,
-            additional_properties: Some(true.into()),
-        },
-    );
+    properties.insert("message".to_string(), mailbox_message_schema());
     properties.insert(
         "to".to_string(),
         JsonSchema::String {

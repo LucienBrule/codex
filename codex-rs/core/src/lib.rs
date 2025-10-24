@@ -32,6 +32,7 @@ pub mod executor;
 mod flags;
 pub mod git_info;
 pub mod landlock;
+pub(crate) mod mailbox_dispatcher;
 pub mod mcp;
 mod mcp_connection_manager;
 mod mcp_tool_call;
@@ -94,8 +95,14 @@ pub use apply_patch::CODEX_APPLY_PATCH_ARG1;
 pub use command_safety::is_safe_command;
 pub use mailbox::DEFAULT_CRITICAL_MAILBOX_CAPACITY;
 pub use mailbox::DEFAULT_CRITICAL_MAILBOX_INTERVAL_SECONDS;
+pub use mailbox::ROUTING_MODE_METADATA_KEY;
 pub use mailbox::apply_mailbox_defaults;
+pub use mailbox::mailbox_feature_enabled;
 pub use mailbox::validate_mailbox_message;
+pub use mailbox_dispatcher::DispatchOutcome as MailDispatcherOutcome;
+pub use mailbox_dispatcher::DispatchStatus as MailDispatcherStatus;
+pub use mailbox_dispatcher::MailboxDispatcherClient;
+pub use mailbox_dispatcher::MailboxDispatcherError;
 pub use safety::get_platform_sandbox;
 // Re-export the protocol types from the standalone `codex-protocol` crate so existing
 // `codex_core::protocol::...` references continue to work across the workspace.
