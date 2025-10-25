@@ -97,7 +97,7 @@ async fn reload_registry(
         }
     };
 
-    let modified = meta.modified().unwrap_or_else(|_| SystemTime::UNIX_EPOCH);
+    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
     let should_reload = {
         let guard = state.read();
         guard
@@ -220,6 +220,7 @@ mod tests {
             registry_poll_interval: Duration::from_millis(50),
             max_inflight: 4,
             delivery_backend: DeliveryBackendKind::UnixSocket,
+            broker: None,
         }
     }
 

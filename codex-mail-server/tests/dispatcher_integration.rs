@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use tokio::time::{Duration, sleep};
 use uuid::Uuid;
 
+#[allow(clippy::field_reassign_with_default)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dispatcher_routes_message_between_sessions() -> Result<()> {
     let dir = TempDir::new().context("temp dir")?;
@@ -25,21 +26,21 @@ async fn dispatcher_routes_message_between_sessions() -> Result<()> {
         if let Ok((stream, _)) = target_listener.accept().await {
             let mut reader = BufReader::new(stream);
             let mut line = String::new();
-            if reader.read_line(&mut line).await.is_ok() {
-                if let Ok(msg) = serde_json::from_str::<MailboxMessage>(line.trim()) {
-                    let ack = json!({
-                        "ok": true,
-                        "submission_id": "sub-1",
-                        "message_id": msg.message_id,
-                        "queue_depth": 1
-                    });
-                    let mut stream = reader.into_inner();
-                    let payload = serde_json::to_vec(&ack).unwrap();
-                    let _ = stream.write_all(&payload).await;
-                    let _ = stream.write_all(b"\n").await;
-                    let _ = stream.flush().await;
-                    let _ = tx.send(msg);
-                }
+            if reader.read_line(&mut line).await.is_ok()
+                && let Ok(msg) = serde_json::from_str::<MailboxMessage>(line.trim())
+            {
+                let ack = json!({
+                    "ok": true,
+                    "submission_id": "sub-1",
+                    "message_id": msg.message_id,
+                    "queue_depth": 1
+                });
+                let mut stream = reader.into_inner();
+                let payload = serde_json::to_vec(&ack).unwrap();
+                let _ = stream.write_all(&payload).await;
+                let _ = stream.write_all(b"\n").await;
+                let _ = stream.flush().await;
+                let _ = tx.send(msg);
             }
         }
     });
@@ -71,12 +72,13 @@ async fn dispatcher_routes_message_between_sessions() -> Result<()> {
         registry_poll_interval: Duration::from_millis(50),
         max_inflight: 16,
         delivery_backend: DeliveryBackendKind::UnixSocket,
+        broker: None,
     };
 
     let watcher = RegistryWatcher::new(&config).await?;
     sleep(Duration::from_millis(120)).await;
 
-    let server = MailDispatcherServer::new(config.clone(), watcher);
+    let server = MailDispatcherServer::new(config.clone(), watcher).await?;
     let server_handle = tokio::spawn(async move {
         let _ = server.run().await;
     });

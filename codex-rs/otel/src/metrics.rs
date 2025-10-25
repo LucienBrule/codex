@@ -66,6 +66,13 @@ mod imp {
         accept_total: Counter<u64>,
         errors_total: Counter<u64>,
         queue_depth_gauge: UpDownCounter<i64>,
+        broker_publish_total: Counter<u64>,
+        broker_publish_failed_total: Counter<u64>,
+        broker_publish_latency: Histogram<u64>,
+        broker_delivery_total: Counter<u64>,
+        broker_inflight_gauge: UpDownCounter<i64>,
+        broker_connect_total: Counter<u64>,
+        broker_disconnect_total: Counter<u64>,
     }
 
     impl MailboxMetrics {
@@ -108,6 +115,42 @@ mod imp {
                     "Current mailbox queue depth, per namespace (up/down counter-based gauge).",
                 )
                 .build();
+            let broker_publish_total = meter
+                .u64_counter("codex_mailbox_broker_publish_total")
+                .with_description(
+                    "Count of broker publishes issued by the dispatcher backend, per namespace/target.",
+                )
+                .build();
+            let broker_publish_failed_total = meter
+                .u64_counter("codex_mailbox_broker_publish_failed_total")
+                .with_description(
+                    "Count of broker publish failures, labeled by namespace and error reason.",
+                )
+                .build();
+            let broker_publish_latency = meter
+                .u64_histogram("codex_mailbox_broker_publish_latency_ms")
+                .with_description("Latency of broker publish round-trips in milliseconds.")
+                .build();
+            let broker_delivery_total = meter
+                .u64_counter("codex_mailbox_broker_delivery_total")
+                .with_description(
+                    "Count of broker messages delivered to local mailboxes, per namespace/target.",
+                )
+                .build();
+            let broker_inflight_gauge = meter
+                .i64_up_down_counter("codex_mailbox_broker_inflight")
+                .with_description(
+                    "Number of in-flight broker publishes awaiting acknowledgement, per namespace.",
+                )
+                .build();
+            let broker_connect_total = meter
+                .u64_counter("codex_mailbox_broker_connect_total")
+                .with_description("Count of successful broker connections per namespace.")
+                .build();
+            let broker_disconnect_total = meter
+                .u64_counter("codex_mailbox_broker_disconnect_total")
+                .with_description("Count of broker disconnect events per namespace.")
+                .build();
             Self {
                 queue_depth,
                 delivery_latency,
@@ -116,6 +159,13 @@ mod imp {
                 accept_total,
                 errors_total,
                 queue_depth_gauge,
+                broker_publish_total,
+                broker_publish_failed_total,
+                broker_publish_latency,
+                broker_delivery_total,
+                broker_inflight_gauge,
+                broker_connect_total,
+                broker_disconnect_total,
             }
         }
     }
@@ -188,6 +238,20 @@ mod imp {
         [
             KeyValue::new("namespace", namespace.to_string()),
             KeyValue::new("error_kind", error_kind.to_string()),
+        ]
+    }
+
+    fn ns_target_attrs(namespace: &str, target: &str) -> [KeyValue; 2] {
+        [
+            KeyValue::new("namespace", namespace.to_string()),
+            KeyValue::new("target", target.to_string()),
+        ]
+    }
+
+    fn ns_reason_attrs(namespace: &str, reason: &str) -> [KeyValue; 2] {
+        [
+            KeyValue::new("namespace", namespace.to_string()),
+            KeyValue::new("reason", reason.to_string()),
         ]
     }
 
@@ -321,6 +385,43 @@ mod imp {
             map.insert(namespace.to_string(), current);
         }
     }
+
+    pub fn record_mailbox_broker_publish_total(namespace: &str, target: &str) {
+        let attrs = ns_target_attrs(namespace, target);
+        mailbox_metrics().broker_publish_total.add(1, &attrs);
+    }
+
+    pub fn record_mailbox_broker_publish_failed(namespace: &str, reason: &str) {
+        let attrs = ns_reason_attrs(namespace, reason);
+        mailbox_metrics().broker_publish_failed_total.add(1, &attrs);
+    }
+
+    pub fn record_mailbox_broker_publish_latency(namespace: &str, latency_ms: u64) {
+        let attrs = ns_attr(namespace);
+        mailbox_metrics()
+            .broker_publish_latency
+            .record(latency_ms, &attrs);
+    }
+
+    pub fn record_mailbox_broker_delivery_total(namespace: &str, target: &str) {
+        let attrs = ns_target_attrs(namespace, target);
+        mailbox_metrics().broker_delivery_total.add(1, &attrs);
+    }
+
+    pub fn update_mailbox_broker_inflight(namespace: &str, delta: i64) {
+        let attrs = ns_attr(namespace);
+        mailbox_metrics().broker_inflight_gauge.add(delta, &attrs);
+    }
+
+    pub fn record_mailbox_broker_connected(namespace: &str) {
+        let attrs = ns_attr(namespace);
+        mailbox_metrics().broker_connect_total.add(1, &attrs);
+    }
+
+    pub fn record_mailbox_broker_disconnected(namespace: &str) {
+        let attrs = ns_attr(namespace);
+        mailbox_metrics().broker_disconnect_total.add(1, &attrs);
+    }
 }
 
 #[cfg(not(feature = "otel"))]
@@ -356,6 +457,27 @@ mod imp {
     pub fn update_mailbox_queue_depth_gauge(_: &str, _: u64) {}
 
     #[inline]
+    pub fn record_mailbox_broker_publish_total(_: &str, _: &str) {}
+
+    #[inline]
+    pub fn record_mailbox_broker_publish_failed(_: &str, _: &str) {}
+
+    #[inline]
+    pub fn record_mailbox_broker_publish_latency(_: &str, _: u64) {}
+
+    #[inline]
+    pub fn record_mailbox_broker_delivery_total(_: &str, _: &str) {}
+
+    #[inline]
+    pub fn update_mailbox_broker_inflight(_: &str, _: i64) {}
+
+    #[inline]
+    pub fn record_mailbox_broker_connected(_: &str) {}
+
+    #[inline]
+    pub fn record_mailbox_broker_disconnected(_: &str) {}
+
+    #[inline]
     pub fn record_wait_started(_: &str) {}
 
     #[inline]
@@ -372,6 +494,12 @@ pub use imp::record_heartbeat;
 pub use imp::record_idle_timeout;
 pub use imp::record_mailbox_accept_total;
 pub use imp::record_mailbox_ack_total;
+pub use imp::record_mailbox_broker_connected;
+pub use imp::record_mailbox_broker_delivery_total;
+pub use imp::record_mailbox_broker_disconnected;
+pub use imp::record_mailbox_broker_publish_failed;
+pub use imp::record_mailbox_broker_publish_latency;
+pub use imp::record_mailbox_broker_publish_total;
 pub use imp::record_mailbox_delivery_latency;
 pub use imp::record_mailbox_error_total;
 pub use imp::record_mailbox_expiry_total;
@@ -381,4 +509,5 @@ pub use imp::record_wait_completed;
 pub use imp::record_wait_failed;
 pub use imp::record_wait_policy_violation;
 pub use imp::record_wait_started;
+pub use imp::update_mailbox_broker_inflight;
 pub use imp::update_mailbox_queue_depth_gauge;

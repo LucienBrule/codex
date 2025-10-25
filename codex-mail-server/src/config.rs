@@ -12,16 +12,20 @@ const DEFAULT_REGISTRY_POLL_MILLIS: u64 = 1_000;
 const DEFAULT_BACKOFF_MILLIS: &[u64] = &[100, 250, 500, 1_000, 2_000];
 const DEFAULT_MAX_INFLIGHT: usize = 128;
 const DEFAULT_DELIVERY_BACKEND: &str = "unix";
+const DEFAULT_BROKER_URL: &str = "nats://127.0.0.1:4222";
+const DEFAULT_BROKER_SUBJECT_PREFIX: &str = "codex.mail";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryBackendKind {
     UnixSocket,
+    Nats,
 }
 
 impl DeliveryBackendKind {
     fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "unix" | "uds" | "unix_socket" => Some(Self::UnixSocket),
+            "nats" => Some(Self::Nats),
             _ => None,
         }
     }
@@ -62,7 +66,7 @@ fn parse_backoff(var: &str) -> Option<Vec<Duration>> {
     env::var(var).ok().map(|raw| {
         raw.split(',')
             .filter_map(|piece| piece.trim().parse::<u64>().ok())
-            .map(|millis| Duration::from_millis(millis))
+            .map(Duration::from_millis)
             .collect::<Vec<_>>()
     })
 }
@@ -72,6 +76,14 @@ fn parse_env_usize(var: &str) -> Option<usize> {
         .ok()
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|value| *value > 0)
+}
+
+#[derive(Debug, Clone)]
+pub struct BrokerConfig {
+    pub url: String,
+    pub token: Option<String>,
+    pub subject_prefix: String,
+    pub request_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +98,7 @@ pub struct MailServerConfig {
     pub registry_poll_interval: Duration,
     pub max_inflight: usize,
     pub delivery_backend: DeliveryBackendKind,
+    pub broker: Option<BrokerConfig>,
 }
 
 impl MailServerConfig {
@@ -112,10 +125,7 @@ impl MailServerConfig {
             .ok()
             .map(|raw| {
                 DeliveryBackendKind::parse(&raw).ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "invalid CODEX_MAIL_SERVER_DELIVERY_BACKEND value: {}",
-                        raw
-                    )
+                    anyhow::anyhow!("invalid CODEX_MAIL_SERVER_DELIVERY_BACKEND value: {}", raw)
                 })
             })
             .transpose()?
@@ -141,6 +151,39 @@ impl MailServerConfig {
         let max_inflight =
             parse_env_usize("CODEX_MAIL_SERVER_MAX_INFLIGHT").unwrap_or(DEFAULT_MAX_INFLIGHT);
 
+        let broker = match delivery_backend {
+            DeliveryBackendKind::UnixSocket => None,
+            DeliveryBackendKind::Nats => {
+                let url = env::var("CODEX_MAIL_SERVER_BROKER_URL")
+                    .unwrap_or_else(|_| DEFAULT_BROKER_URL.to_string())
+                    .trim()
+                    .to_string();
+                if url.is_empty() {
+                    anyhow::bail!(
+                        "CODEX_MAIL_SERVER_BROKER_URL must not be empty when using the nats backend"
+                    );
+                }
+                let token = env::var("CODEX_MAIL_SERVER_BROKER_TOKEN")
+                    .ok()
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|value| !value.is_empty());
+                let subject_prefix = env::var("CODEX_MAIL_SERVER_BROKER_SUBJECT_PREFIX")
+                    .ok()
+                    .map(|raw| raw.trim().to_string())
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| DEFAULT_BROKER_SUBJECT_PREFIX.to_string());
+                let request_timeout =
+                    parse_env_duration_ms("CODEX_MAIL_SERVER_BROKER_REQUEST_TIMEOUT_MS")
+                        .unwrap_or(ack_timeout);
+                Some(BrokerConfig {
+                    url,
+                    token,
+                    subject_prefix,
+                    request_timeout,
+                })
+            }
+        };
+
         Ok(Self {
             namespace,
             codex_home,
@@ -152,6 +195,7 @@ impl MailServerConfig {
             registry_poll_interval,
             max_inflight,
             delivery_backend,
+            broker,
         })
     }
 

@@ -2,22 +2,26 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use async_nats::{Client, ConnectOptions, Event, RequestError, RequestErrorKind};
 use async_trait::async_trait;
+use bytes::Bytes;
 use codex_protocol::mailbox::MailboxMessage;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::pin;
 use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 use tokio::time::{Duration, sleep, timeout};
-use tracing::{error, info, warn};
+use tokio_stream::StreamExt;
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::config::{DeliveryBackendKind, MailServerConfig};
 use crate::registry::{RegistryRecord, RegistryWatcher};
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct DispatchRequest {
     submission_id: String,
     source_conversation_id: Uuid,
@@ -50,7 +54,7 @@ struct DispatchResponse {
 }
 
 #[allow(dead_code)]
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct MailboxAckPayload {
     ok: bool,
     #[serde(default)]
@@ -67,6 +71,113 @@ struct MailboxAckPayload {
     capacity: Option<usize>,
 }
 
+fn interpret_ack_payload(ack: MailboxAckPayload) -> Result<MailboxAckPayload, DeliveryError> {
+    if ack.ok {
+        return Ok(ack);
+    }
+
+    match ack.err.as_deref() {
+        Some("queue_full") => Err(DeliveryError::QueueFull {
+            capacity: ack.capacity,
+            detail: ack.detail.clone(),
+        }),
+        Some("disabled") => Err(DeliveryError::Disabled(ack.detail.clone())),
+        Some("closed") => Err(DeliveryError::DispatcherClosed(ack.detail.clone())),
+        Some("unknown_session") => Err(DeliveryError::UnknownSession(ack.detail.clone())),
+        Some("timeout") => Err(DeliveryError::AckTimeout),
+        Some(other) => Err(DeliveryError::Io {
+            err: std::io::Error::other(other.to_string()),
+            detail: ack.detail.clone(),
+        }),
+        None => Err(DeliveryError::Io {
+            err: std::io::Error::other("dispatcher returned failure without err field"),
+            detail: ack.detail.clone(),
+        }),
+    }
+}
+
+fn ack_from_delivery_error(error: &DeliveryError) -> MailboxAckPayload {
+    match error {
+        DeliveryError::QueueFull { capacity, detail } => MailboxAckPayload {
+            ok: false,
+            submission_id: None,
+            message_id: None,
+            queue_depth: None,
+            err: Some("queue_full".to_string()),
+            detail: detail.clone(),
+            capacity: *capacity,
+        },
+        DeliveryError::DispatcherClosed(detail) => MailboxAckPayload {
+            ok: false,
+            submission_id: None,
+            message_id: None,
+            queue_depth: None,
+            err: Some("closed".to_string()),
+            detail: detail.clone(),
+            capacity: None,
+        },
+        DeliveryError::Disabled(detail) => MailboxAckPayload {
+            ok: false,
+            submission_id: None,
+            message_id: None,
+            queue_depth: None,
+            err: Some("disabled".to_string()),
+            detail: detail.clone(),
+            capacity: None,
+        },
+        DeliveryError::AckTimeout => MailboxAckPayload {
+            ok: false,
+            submission_id: None,
+            message_id: None,
+            queue_depth: None,
+            err: Some("timeout".to_string()),
+            detail: Some("timed out waiting for acknowledgement".to_string()),
+            capacity: None,
+        },
+        DeliveryError::Io { err, detail } => MailboxAckPayload {
+            ok: false,
+            submission_id: None,
+            message_id: None,
+            queue_depth: None,
+            err: Some("transport_error".to_string()),
+            detail: Some(detail.clone().unwrap_or_else(|| err.to_string())),
+            capacity: None,
+        },
+        DeliveryError::UnknownSession(detail) => MailboxAckPayload {
+            ok: false,
+            submission_id: None,
+            message_id: None,
+            queue_depth: None,
+            err: Some("unknown_session".to_string()),
+            detail: detail.clone(),
+            capacity: None,
+        },
+    }
+}
+
+fn request_error_reason(kind: RequestErrorKind) -> &'static str {
+    match kind {
+        RequestErrorKind::TimedOut => "timeout",
+        RequestErrorKind::NoResponders => "no_responders",
+        RequestErrorKind::Other => "other",
+    }
+}
+
+fn map_request_error(err: RequestError) -> DeliveryError {
+    match err.kind() {
+        RequestErrorKind::TimedOut => {
+            DeliveryError::UnknownSession(Some("broker request timed out".to_string()))
+        }
+        RequestErrorKind::NoResponders => {
+            DeliveryError::UnknownSession(Some("no broker responders present".to_string()))
+        }
+        RequestErrorKind::Other => DeliveryError::Io {
+            err: std::io::Error::other(err.to_string()),
+            detail: Some("broker request failed".to_string()),
+        },
+    }
+}
+
 #[derive(Debug)]
 enum DeliveryError {
     QueueFull {
@@ -80,6 +191,7 @@ enum DeliveryError {
         err: std::io::Error,
         detail: Option<String>,
     },
+    UnknownSession(Option<String>),
 }
 
 #[async_trait]
@@ -87,7 +199,7 @@ trait DeliveryBackend: Send + Sync {
     async fn send(
         &self,
         request: &DispatchRequest,
-        entry: &RegistryRecord,
+        entry: Option<&RegistryRecord>,
     ) -> Result<MailboxAckPayload, DeliveryError>;
 }
 
@@ -111,8 +223,16 @@ impl DeliveryBackend for UnixSocketBackend {
     async fn send(
         &self,
         request: &DispatchRequest,
-        entry: &RegistryRecord,
+        entry: Option<&RegistryRecord>,
     ) -> Result<MailboxAckPayload, DeliveryError> {
+        let entry = match entry {
+            Some(entry) => entry,
+            None => {
+                return Err(DeliveryError::UnknownSession(Some(
+                    "target conversation not registered locally".to_string(),
+                )));
+            }
+        };
         let socket_path = &entry.socket_path;
         let connect = UnixStream::connect(socket_path);
         let mut stream = match timeout(self.connect_timeout, connect).await {
@@ -131,10 +251,11 @@ impl DeliveryBackend for UnixSocketBackend {
             }
         };
 
-        let mut payload = serde_json::to_vec(&request.message).map_err(|err| DeliveryError::Io {
-            err: std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()),
-            detail: Some("failed to serialize mailbox message".to_string()),
-        })?;
+        let mut payload =
+            serde_json::to_vec(&request.message).map_err(|err| DeliveryError::Io {
+                err: std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()),
+                detail: Some("failed to serialize mailbox message".to_string()),
+            })?;
         payload.push(b'\n');
 
         stream
@@ -144,13 +265,10 @@ impl DeliveryBackend for UnixSocketBackend {
                 err,
                 detail: Some("failed to write mailbox payload".to_string()),
             })?;
-        stream
-            .flush()
-            .await
-            .map_err(|err| DeliveryError::Io {
-                err,
-                detail: Some("failed to flush mailbox payload".to_string()),
-            })?;
+        stream.flush().await.map_err(|err| DeliveryError::Io {
+            err,
+            detail: Some("failed to flush mailbox payload".to_string()),
+        })?;
 
         let mut reader = BufReader::new(stream);
         let mut line = String::new();
@@ -174,26 +292,446 @@ impl DeliveryBackend for UnixSocketBackend {
                 detail: Some("failed to parse mailbox acknowledgement".to_string()),
             })?;
 
-        if ack.ok {
-            return Ok(ack);
+        interpret_ack_payload(ack)
+    }
+}
+
+#[derive(Clone)]
+struct NatsBackend {
+    inner: Arc<NatsInner>,
+}
+
+struct NatsInner {
+    client: Client,
+    namespace: String,
+    subject_prefix: String,
+    request_timeout: Duration,
+    local_backend: UnixSocketBackend,
+}
+
+struct BrokerRuntime {
+    handles: Vec<JoinHandle<()>>,
+}
+
+impl BrokerRuntime {
+    fn new(handles: Vec<JoinHandle<()>>) -> Self {
+        Self { handles }
+    }
+}
+
+impl Drop for BrokerRuntime {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
+impl NatsBackend {
+    async fn connect(
+        config: &MailServerConfig,
+        registry: RegistryWatcher,
+    ) -> Result<(Self, BrokerRuntime)> {
+        let broker = config
+            .broker
+            .as_ref()
+            .context("nats backend requires broker configuration")?;
+
+        let namespace = config.namespace.clone();
+        let namespace_for_events = Arc::new(namespace.clone());
+        let subject_prefix = broker.subject_prefix.clone();
+        let request_timeout = broker.request_timeout;
+        let local_backend = UnixSocketBackend::new(config);
+
+        let mut options = ConnectOptions::new()
+            .name(format!("codex-mail-server-{}", namespace))
+            .retry_on_initial_connect()
+            .request_timeout(Some(request_timeout))
+            .max_reconnects(None);
+
+        if let Some(token) = &broker.token {
+            options = options.token(token.clone());
         }
 
-        match ack.err.as_deref() {
-            Some("queue_full") => Err(DeliveryError::QueueFull {
-                capacity: ack.capacity,
-                detail: ack.detail.clone(),
-            }),
-            Some("disabled") => Err(DeliveryError::Disabled(ack.detail.clone())),
-            Some("closed") => Err(DeliveryError::DispatcherClosed(ack.detail.clone())),
-            Some(other) => Err(DeliveryError::Io {
-                err: std::io::Error::new(std::io::ErrorKind::Other, other.to_string()),
-                detail: ack.detail.clone(),
-            }),
-            None => Err(DeliveryError::Io {
-                err: std::io::Error::new(std::io::ErrorKind::Other, "unknown dispatcher error"),
-                detail: ack.detail.clone(),
-            }),
+        let events_namespace = namespace_for_events.clone();
+        options = options.event_callback(move |event| {
+            let ns = events_namespace.clone();
+            async move {
+                match event {
+                    Event::Connected => {
+                        info!(
+                            target: "codex::mailbox",
+                            event = "broker.connected",
+                            namespace = %ns,
+                            "connected to NATS broker"
+                        );
+                        #[cfg(feature = "otel")]
+                        codex_otel::metrics::record_mailbox_broker_connected(ns.as_str());
+                    }
+                    Event::Disconnected => {
+                        warn!(
+                            target: "codex::mailbox",
+                            event = "broker.disconnected",
+                            namespace = %ns,
+                            "lost connection to NATS broker; retrying"
+                        );
+                        #[cfg(feature = "otel")]
+                        codex_otel::metrics::record_mailbox_broker_disconnected(ns.as_str());
+                    }
+                    Event::LameDuckMode => {
+                        warn!(
+                            target: "codex::mailbox",
+                            event = "broker.lame_duck",
+                            namespace = %ns,
+                            "broker entered lame duck mode"
+                        );
+                    }
+                    Event::Draining => {
+                        info!(
+                            target: "codex::mailbox",
+                            event = "broker.draining",
+                            namespace = %ns,
+                            "broker drain requested"
+                        );
+                    }
+                    Event::Closed => {
+                        warn!(
+                            target: "codex::mailbox",
+                            event = "broker.closed",
+                            namespace = %ns,
+                            "broker connection closed"
+                        );
+                    }
+                    Event::SlowConsumer(sid) => {
+                        warn!(
+                            target: "codex::mailbox",
+                            event = "broker.slow_consumer",
+                            namespace = %ns,
+                            sid,
+                            "slow consumer detected on broker subscription"
+                        );
+                    }
+                    Event::ServerError(err) => {
+                        error!(
+                            target: "codex::mailbox",
+                            event = "broker.server_error",
+                            namespace = %ns,
+                            error = %err,
+                            "server-side broker error observed"
+                        );
+                    }
+                    Event::ClientError(err) => {
+                        error!(
+                            target: "codex::mailbox",
+                            event = "broker.client_error",
+                            namespace = %ns,
+                            error = %err,
+                            "client-side broker error observed"
+                        );
+                        #[cfg(feature = "otel")]
+                        codex_otel::metrics::record_mailbox_broker_publish_failed(
+                            ns.as_str(),
+                            "client_error",
+                        );
+                    }
+                }
+            }
+        });
+
+        let client = options
+            .connect(&broker.url)
+            .await
+            .with_context(|| format!("failed to connect to NATS broker at {}", broker.url))?;
+
+        info!(
+            target: "codex::mailbox",
+            event = "broker.connect.success",
+            namespace = %namespace,
+            url = %broker.url,
+            "nats backend connected"
+        );
+
+        let inner = Arc::new(NatsInner {
+            client: client.clone(),
+            namespace: namespace.clone(),
+            subject_prefix: subject_prefix.clone(),
+            request_timeout,
+            local_backend,
+        });
+
+        let consumer_handle = spawn_nats_consumer(inner.clone(), registry);
+        let runtime = BrokerRuntime::new(vec![consumer_handle]);
+
+        Ok((Self { inner }, runtime))
+    }
+
+    fn subject_for(&self, conversation_id: &Uuid) -> String {
+        format!(
+            "{}.{}.{}",
+            self.inner.subject_prefix, self.inner.namespace, conversation_id
+        )
+    }
+}
+
+fn spawn_nats_consumer(inner: Arc<NatsInner>, registry: RegistryWatcher) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let subject = format!("{}.{}.*", inner.subject_prefix, inner.namespace);
+        match inner.client.subscribe(subject.clone()).await {
+            Ok(mut subscription) => {
+                info!(
+                    target: "codex::mailbox",
+                    event = "broker.consumer.ready",
+                    namespace = %inner.namespace,
+                    subject = %subject,
+                    "broker consumer subscribed"
+                );
+                while let Some(message) = subscription.next().await {
+                    let registry_clone = registry.clone();
+                    let inner_clone = inner.clone();
+                    if let Err(err) =
+                        process_broker_message(inner_clone, registry_clone, message).await
+                    {
+                        warn!(
+                            target: "codex::mailbox",
+                            event = "broker.consumer.error",
+                            namespace = %inner.namespace,
+                            ?err,
+                            "failed to process broker message"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                error!(
+                    target: "codex::mailbox",
+                    event = "broker.consumer.subscribe_error",
+                    namespace = %inner.namespace,
+                    subject = %subject,
+                    ?err,
+                    "failed to subscribe to broker subject"
+                );
+            }
         }
+    })
+}
+
+async fn process_broker_message(
+    inner: Arc<NatsInner>,
+    registry: RegistryWatcher,
+    message: async_nats::Message,
+) -> Result<()> {
+    let subject = message.subject.clone();
+    let reply = message.reply.clone();
+    let payload = message.payload.clone();
+    let prefix = format!("{}.{}.", inner.subject_prefix, inner.namespace);
+    if !subject.starts_with(&prefix) {
+        debug!(
+            target: "codex::mailbox",
+            event = "broker.consumer.subject_mismatch",
+            namespace = %inner.namespace,
+            subject = %subject,
+            "ignoring broker message for unrelated subject"
+        );
+        return Ok(());
+    }
+
+    let id_segment = &subject[prefix.len()..];
+    let target_conversation_id = match Uuid::parse_str(id_segment) {
+        Ok(id) => id,
+        Err(err) => {
+            warn!(
+                target: "codex::mailbox",
+                event = "broker.consumer.invalid_subject",
+                namespace = %inner.namespace,
+                subject = %subject,
+                ?err,
+                "broker subject missing valid conversation id"
+            );
+            return Ok(());
+        }
+    };
+
+    let request: DispatchRequest = match serde_json::from_slice(&payload) {
+        Ok(request) => request,
+        Err(err) => {
+            warn!(
+                target: "codex::mailbox",
+                event = "broker.consumer.deser_error",
+                namespace = %inner.namespace,
+                subject = %subject,
+                ?err,
+                "failed to deserialize broker payload"
+            );
+            return Ok(());
+        }
+    };
+
+    let entry = match registry.lookup(&target_conversation_id) {
+        Some(entry) => entry,
+        None => {
+            debug!(
+                target: "codex::mailbox",
+                event = "broker.consumer.missing_registry",
+                namespace = %inner.namespace,
+                subject = %subject,
+                conversation = %target_conversation_id,
+                "no local registry entry; leaving message for other consumers"
+            );
+            return Ok(());
+        }
+    };
+
+    #[cfg(feature = "otel")]
+    codex_otel::metrics::update_mailbox_broker_inflight(inner.namespace.as_str(), 1);
+
+    let started = Instant::now();
+    let send_result = inner.local_backend.send(&request, Some(&entry)).await;
+
+    #[cfg(feature = "otel")]
+    codex_otel::metrics::update_mailbox_broker_inflight(inner.namespace.as_str(), -1);
+
+    let ack = match send_result {
+        Ok(mut ack) => {
+            if ack.submission_id.is_none() {
+                ack.submission_id = Some(request.submission_id.clone());
+            }
+            #[cfg(feature = "otel")]
+            {
+                codex_otel::metrics::record_mailbox_broker_delivery_total(
+                    inner.namespace.as_str(),
+                    &target_conversation_id.to_string(),
+                );
+                codex_otel::metrics::record_mailbox_broker_publish_latency(
+                    inner.namespace.as_str(),
+                    started.elapsed().as_millis() as u64,
+                );
+            }
+            ack
+        }
+        Err(err) => {
+            #[cfg(feature = "otel")]
+            codex_otel::metrics::record_mailbox_broker_publish_failed(
+                inner.namespace.as_str(),
+                "local_delivery_failed",
+            );
+            ack_from_delivery_error(&err)
+        }
+    };
+
+    if let Some(reply_subject) = reply {
+        let buf = match serde_json::to_vec(&ack) {
+            Ok(buf) => buf,
+            Err(err) => {
+                error!(
+                    target: "codex::mailbox",
+                    event = "broker.consumer.serialize_ack_error",
+                    namespace = %inner.namespace,
+                    ?err,
+                    "failed to serialize broker acknowledgement"
+                );
+                return Ok(());
+            }
+        };
+        if let Err(err) = inner.client.publish(reply_subject, Bytes::from(buf)).await {
+            error!(
+                target: "codex::mailbox",
+                event = "broker.consumer.respond_error",
+                namespace = %inner.namespace,
+                ?err,
+                "failed to publish broker acknowledgement"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+#[async_trait]
+impl DeliveryBackend for NatsBackend {
+    async fn send(
+        &self,
+        request: &DispatchRequest,
+        entry: Option<&RegistryRecord>,
+    ) -> Result<MailboxAckPayload, DeliveryError> {
+        if let Some(entry) = entry {
+            return self.inner.local_backend.send(request, Some(entry)).await;
+        }
+
+        let payload = serde_json::to_vec(request).map_err(|err| DeliveryError::Io {
+            err: std::io::Error::other(err.to_string()),
+            detail: Some("failed to serialize broker payload".to_string()),
+        })?;
+        let subject = self.subject_for(&request.target_conversation_id);
+
+        #[cfg(feature = "otel")]
+        codex_otel::metrics::record_mailbox_broker_publish_total(
+            self.inner.namespace.as_str(),
+            &request.target_conversation_id.to_string(),
+        );
+        #[cfg(feature = "otel")]
+        codex_otel::metrics::update_mailbox_broker_inflight(self.inner.namespace.as_str(), 1);
+
+        let started = Instant::now();
+        let response = timeout(
+            self.inner.request_timeout,
+            self.inner.client.request(subject, Bytes::from(payload)),
+        )
+        .await;
+
+        let message = match response {
+            Ok(Ok(message)) => {
+                #[cfg(feature = "otel")]
+                codex_otel::metrics::update_mailbox_broker_inflight(
+                    self.inner.namespace.as_str(),
+                    -1,
+                );
+                message
+            }
+            Ok(Err(err)) => {
+                #[cfg(feature = "otel")]
+                {
+                    codex_otel::metrics::update_mailbox_broker_inflight(
+                        self.inner.namespace.as_str(),
+                        -1,
+                    );
+                    codex_otel::metrics::record_mailbox_broker_publish_failed(
+                        self.inner.namespace.as_str(),
+                        request_error_reason(err.kind()),
+                    );
+                }
+                return Err(map_request_error(err));
+            }
+            Err(_) => {
+                #[cfg(feature = "otel")]
+                {
+                    codex_otel::metrics::update_mailbox_broker_inflight(
+                        self.inner.namespace.as_str(),
+                        -1,
+                    );
+                    codex_otel::metrics::record_mailbox_broker_publish_failed(
+                        self.inner.namespace.as_str(),
+                        "timeout",
+                    );
+                }
+                return Err(DeliveryError::UnknownSession(Some(
+                    "no remote mailbox responded via broker".to_string(),
+                )));
+            }
+        };
+
+        #[cfg(feature = "otel")]
+        codex_otel::metrics::record_mailbox_broker_publish_latency(
+            self.inner.namespace.as_str(),
+            started.elapsed().as_millis() as u64,
+        );
+
+        let ack: MailboxAckPayload =
+            serde_json::from_slice(&message.payload).map_err(|err| DeliveryError::Io {
+                err: std::io::Error::other(err.to_string()),
+                detail: Some("failed to deserialize broker acknowledgement".to_string()),
+            })?;
+
+        interpret_ack_payload(ack)
     }
 }
 
@@ -202,20 +740,31 @@ pub struct MailDispatcherServer {
     registry: RegistryWatcher,
     semaphore: Arc<Semaphore>,
     backend: Arc<dyn DeliveryBackend>,
+    _broker_runtime: Option<BrokerRuntime>,
 }
 
 impl MailDispatcherServer {
-    pub fn new(config: MailServerConfig, registry: RegistryWatcher) -> Self {
+    pub async fn new(config: MailServerConfig, registry: RegistryWatcher) -> Result<Self> {
         let semaphore = Arc::new(Semaphore::new(config.max_inflight));
-        let backend: Arc<dyn DeliveryBackend> = match config.delivery_backend {
-            DeliveryBackendKind::UnixSocket => Arc::new(UnixSocketBackend::new(&config)),
-        };
-        Self {
+        let (backend, broker_runtime): (Arc<dyn DeliveryBackend>, Option<BrokerRuntime>) =
+            match config.delivery_backend {
+                DeliveryBackendKind::UnixSocket => {
+                    (Arc::new(UnixSocketBackend::new(&config)), None)
+                }
+                DeliveryBackendKind::Nats => {
+                    let (backend, runtime) =
+                        NatsBackend::connect(&config, registry.clone()).await?;
+                    (Arc::new(backend), Some(runtime))
+                }
+            };
+
+        Ok(Self {
             config,
             registry,
             semaphore,
             backend,
-        }
+            _broker_runtime: broker_runtime,
+        })
     }
 
     pub async fn run(self) -> Result<()> {
@@ -355,36 +904,47 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let registry_entry = match registry.lookup(&request.target_conversation_id) {
-        Some(entry) => entry,
-        None => {
-            warn!(
-                target: "codex::mailbox",
-                event = "dispatcher.unknown_target",
-                source = %request.source_conversation_id,
-                target = %request.target_conversation_id,
-                "target conversation not present in registry"
-            );
-            respond(
-                reader.into_inner(),
-                &DispatchResponse {
-                    status: DispatchStatus::UnknownSession,
-                    queue_depth: None,
-                    detail: Some("target conversation not registered".to_string()),
-                    capacity: None,
-                },
-            )
-            .await?;
-            return Ok(());
-        }
-    };
+    let registry_entry = registry.lookup(&request.target_conversation_id);
+
+    if registry_entry.is_none()
+        && matches!(config.delivery_backend, DeliveryBackendKind::UnixSocket)
+    {
+        warn!(
+            target: "codex::mailbox",
+            event = "dispatcher.unknown_target",
+            source = %request.source_conversation_id,
+            target = %request.target_conversation_id,
+            "target conversation not present in registry"
+        );
+        respond(
+            reader.into_inner(),
+            &DispatchResponse {
+                status: DispatchStatus::UnknownSession,
+                queue_depth: None,
+                detail: Some("target conversation not registered".to_string()),
+                capacity: None,
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if registry_entry.is_none() {
+        debug!(
+            target: "codex::mailbox",
+            event = "dispatcher.broker_fallback",
+            source = %request.source_conversation_id,
+            target = %request.target_conversation_id,
+            "registry missing target locally; falling back to broker backend"
+        );
+    }
 
     let DispatchOutcome {
         status,
         queue_depth,
         detail,
         capacity,
-    } = dispatch_with_backend(&request, &registry_entry, backend.as_ref(), &config).await;
+    } = dispatch_with_backend(&request, registry_entry.as_ref(), backend.as_ref(), &config).await;
 
     respond(
         reader.into_inner(),
@@ -422,7 +982,7 @@ struct DispatchOutcome {
 
 async fn dispatch_with_backend<B>(
     request: &DispatchRequest,
-    entry: &RegistryRecord,
+    entry: Option<&RegistryRecord>,
     backend: &B,
     config: &MailServerConfig,
 ) -> DispatchOutcome
@@ -431,6 +991,9 @@ where
 {
     let mut attempts = 0usize;
     let started = Instant::now();
+    let namespace_for_metrics = entry
+        .map(|record| record.namespace.as_str())
+        .unwrap_or(config.namespace.as_str());
 
     loop {
         attempts += 1;
@@ -438,10 +1001,10 @@ where
             Ok(ack) => {
                 #[cfg(feature = "otel")]
                 {
-                    codex_otel::metrics::record_mailbox_accept_total(&entry.namespace);
-                    if let Some(depth) = ack.queue_depth {
+                    codex_otel::metrics::record_mailbox_accept_total(namespace_for_metrics);
+                    if let (Some(record), Some(depth)) = (entry, ack.queue_depth) {
                         codex_otel::metrics::update_mailbox_queue_depth_gauge(
-                            &entry.namespace,
+                            &record.namespace,
                             depth as u64,
                         );
                     }
@@ -456,7 +1019,10 @@ where
             Err(DeliveryError::QueueFull { capacity, detail }) => {
                 #[cfg(feature = "otel")]
                 {
-                    codex_otel::metrics::record_mailbox_error_total(&entry.namespace, "queue_full");
+                    codex_otel::metrics::record_mailbox_error_total(
+                        namespace_for_metrics,
+                        "queue_full",
+                    );
                 }
                 return DispatchOutcome {
                     status: DispatchStatus::QueueFull,
@@ -469,7 +1035,7 @@ where
                 #[cfg(feature = "otel")]
                 {
                     codex_otel::metrics::record_mailbox_error_total(
-                        &entry.namespace,
+                        namespace_for_metrics,
                         "dispatcher_closed",
                     );
                 }
@@ -484,7 +1050,7 @@ where
                 #[cfg(feature = "otel")]
                 {
                     codex_otel::metrics::record_mailbox_error_total(
-                        &entry.namespace,
+                        namespace_for_metrics,
                         "dispatcher_disabled",
                     );
                 }
@@ -499,7 +1065,7 @@ where
                 #[cfg(feature = "otel")]
                 {
                     codex_otel::metrics::record_mailbox_error_total(
-                        &entry.namespace,
+                        namespace_for_metrics,
                         "ack_timeout",
                     );
                 }
@@ -510,10 +1076,27 @@ where
                     capacity: None,
                 };
             }
+            Err(DeliveryError::UnknownSession(detail)) => {
+                #[cfg(feature = "otel")]
+                codex_otel::metrics::record_mailbox_error_total(
+                    namespace_for_metrics,
+                    "unknown_session",
+                );
+                return DispatchOutcome {
+                    status: DispatchStatus::UnknownSession,
+                    queue_depth: None,
+                    detail: detail
+                        .or_else(|| Some("target conversation not registered".to_string())),
+                    capacity: None,
+                };
+            }
             Err(DeliveryError::Io { err, detail }) => {
                 #[cfg(feature = "otel")]
                 {
-                    codex_otel::metrics::record_mailbox_error_total(&entry.namespace, "io_error");
+                    codex_otel::metrics::record_mailbox_error_total(
+                        namespace_for_metrics,
+                        "io_error",
+                    );
                 }
                 warn!(
                     target: "codex::mailbox",
@@ -567,9 +1150,9 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::VecDeque;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
     use tokio::net::UnixListener;
     use tokio::sync::{Mutex, oneshot};
@@ -586,14 +1169,15 @@ mod tests {
             registry_poll_interval: Duration::from_millis(50),
             max_inflight: 8,
             delivery_backend: DeliveryBackendKind::UnixSocket,
+            broker: None,
         }
     }
 
-    fn make_record(socket_path: &PathBuf) -> RegistryRecord {
+    fn make_record(socket_path: &Path) -> RegistryRecord {
         RegistryRecord {
             conversation_id: Uuid::now_v7(),
             session_id: Uuid::now_v7().to_string(),
-            socket_path: socket_path.clone(),
+            socket_path: socket_path.to_path_buf(),
             pid: std::process::id(),
             namespace: "test".to_string(),
         }
@@ -624,7 +1208,7 @@ mod tests {
         async fn send(
             &self,
             _request: &DispatchRequest,
-            _entry: &RegistryRecord,
+            _entry: Option<&RegistryRecord>,
         ) -> Result<MailboxAckPayload, DeliveryError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let mut guard = self.responses.lock().await;
@@ -676,7 +1260,7 @@ mod tests {
         };
 
         let backend = UnixSocketBackend::new(&config);
-        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
+        let outcome = dispatch_with_backend(&request, Some(&record), &backend, &config).await;
         assert!(matches!(outcome.status, DispatchStatus::Delivered));
         assert_eq!(outcome.queue_depth, Some(3));
         assert!(rx.await.is_ok());
@@ -721,7 +1305,7 @@ mod tests {
         };
 
         let backend = UnixSocketBackend::new(&config);
-        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
+        let outcome = dispatch_with_backend(&request, Some(&record), &backend, &config).await;
         assert!(matches!(outcome.status, DispatchStatus::QueueFull));
         assert_eq!(outcome.capacity, Some(16));
         Ok(())
@@ -744,7 +1328,7 @@ mod tests {
         };
 
         let backend = UnixSocketBackend::new(&config);
-        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
+        let outcome = dispatch_with_backend(&request, Some(&record), &backend, &config).await;
         assert!(matches!(outcome.status, DispatchStatus::TransportError));
         Ok(())
     }
@@ -779,7 +1363,7 @@ mod tests {
         ];
 
         let backend = MockBackend::new(responses);
-        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
+        let outcome = dispatch_with_backend(&request, Some(&record), &backend, &config).await;
 
         assert!(matches!(outcome.status, DispatchStatus::Delivered));
         assert_eq!(outcome.queue_depth, Some(2));
@@ -802,11 +1386,63 @@ mod tests {
             "dispatcher disabled".to_string(),
         )))]);
 
-        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
+        let outcome = dispatch_with_backend(&request, Some(&record), &backend, &config).await;
 
         assert!(matches!(outcome.status, DispatchStatus::Disabled));
         assert_eq!(backend.call_count(), 1);
         assert_eq!(outcome.detail.as_deref(), Some("dispatcher disabled"));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nats_dispatch_falls_back_when_registry_missing() -> Result<()> {
+        let mut config = base_config();
+        config.delivery_backend = DeliveryBackendKind::Nats;
+        let request = DispatchRequest {
+            submission_id: "sub-1".to_string(),
+            source_conversation_id: Uuid::now_v7(),
+            target_conversation_id: Uuid::now_v7(),
+            message: MailboxMessage::default(),
+        };
+
+        let ack = MailboxAckPayload {
+            ok: true,
+            submission_id: Some("sub-1".to_string()),
+            message_id: Some(Uuid::now_v7()),
+            queue_depth: Some(1),
+            err: None,
+            detail: None,
+            capacity: None,
+        };
+
+        let backend = MockBackend::new(vec![Ok(ack)]);
+        let outcome = dispatch_with_backend(&request, None, &backend, &config).await;
+
+        assert!(matches!(outcome.status, DispatchStatus::Delivered));
+        assert_eq!(backend.call_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn nats_dispatch_reports_unknown_session() -> Result<()> {
+        let mut config = base_config();
+        config.delivery_backend = DeliveryBackendKind::Nats;
+        let request = DispatchRequest {
+            submission_id: "sub-2".to_string(),
+            source_conversation_id: Uuid::now_v7(),
+            target_conversation_id: Uuid::now_v7(),
+            message: MailboxMessage::default(),
+        };
+
+        let backend = MockBackend::new(vec![Err(DeliveryError::UnknownSession(Some(
+            "missing".to_string(),
+        )))]);
+
+        let outcome = dispatch_with_backend(&request, None, &backend, &config).await;
+
+        assert!(matches!(outcome.status, DispatchStatus::UnknownSession));
+        assert_eq!(backend.call_count(), 1);
+        assert_eq!(outcome.detail.as_deref(), Some("missing"));
         Ok(())
     }
 }
