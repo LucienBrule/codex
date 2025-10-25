@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use codex_mail_server::config::MailServerConfig;
+use codex_mail_server::config::{DeliveryBackendKind, MailServerConfig};
 use codex_mail_server::registry::RegistryWatcher;
 use codex_mail_server::server::MailDispatcherServer;
 use codex_protocol::mailbox::{MailboxAudience, MailboxMessage, MailboxSenderRole};
@@ -70,6 +70,7 @@ async fn dispatcher_routes_message_between_sessions() -> Result<()> {
         retry_backoff: vec![Duration::from_millis(50), Duration::from_millis(100)],
         registry_poll_interval: Duration::from_millis(50),
         max_inflight: 16,
+        delivery_backend: DeliveryBackendKind::UnixSocket,
     };
 
     let watcher = RegistryWatcher::new(&config).await?;

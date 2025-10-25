@@ -11,6 +11,21 @@ const DEFAULT_CONNECT_TIMEOUT_MILLIS: u64 = 1_500;
 const DEFAULT_REGISTRY_POLL_MILLIS: u64 = 1_000;
 const DEFAULT_BACKOFF_MILLIS: &[u64] = &[100, 250, 500, 1_000, 2_000];
 const DEFAULT_MAX_INFLIGHT: usize = 128;
+const DEFAULT_DELIVERY_BACKEND: &str = "unix";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryBackendKind {
+    UnixSocket,
+}
+
+impl DeliveryBackendKind {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "unix" | "uds" | "unix_socket" => Some(Self::UnixSocket),
+            _ => None,
+        }
+    }
+}
 
 fn resolve_namespace() -> String {
     env::var("CODEX_NAMESPACE")
@@ -70,6 +85,7 @@ pub struct MailServerConfig {
     pub retry_backoff: Vec<Duration>,
     pub registry_poll_interval: Duration,
     pub max_inflight: usize,
+    pub delivery_backend: DeliveryBackendKind,
 }
 
 impl MailServerConfig {
@@ -91,6 +107,22 @@ impl MailServerConfig {
         let registry_path = env::var("CODEX_MAILBOX_REGISTRY_PATH")
             .map(PathBuf::from)
             .unwrap_or(default_registry);
+
+        let delivery_backend = env::var("CODEX_MAIL_SERVER_DELIVERY_BACKEND")
+            .ok()
+            .map(|raw| {
+                DeliveryBackendKind::parse(&raw).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid CODEX_MAIL_SERVER_DELIVERY_BACKEND value: {}",
+                        raw
+                    )
+                })
+            })
+            .transpose()?
+            .unwrap_or_else(|| {
+                DeliveryBackendKind::parse(DEFAULT_DELIVERY_BACKEND)
+                    .expect("default delivery backend must parse")
+            });
 
         let ack_timeout = parse_env_duration_secs("CODEX_MAIL_SERVER_ACK_TIMEOUT_SECS")
             .unwrap_or_else(|| Duration::from_secs(DEFAULT_ACK_TIMEOUT_SECS));
@@ -119,6 +151,7 @@ impl MailServerConfig {
             retry_backoff,
             registry_poll_interval,
             max_inflight,
+            delivery_backend,
         })
     }
 

@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use codex_protocol::mailbox::MailboxMessage;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -12,7 +13,7 @@ use tokio::time::{Duration, sleep, timeout};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::config::MailServerConfig;
+use crate::config::{DeliveryBackendKind, MailServerConfig};
 use crate::registry::{RegistryRecord, RegistryWatcher};
 
 #[allow(dead_code)]
@@ -66,19 +67,154 @@ struct MailboxAckPayload {
     capacity: Option<usize>,
 }
 
+#[derive(Debug)]
+enum DeliveryError {
+    QueueFull {
+        capacity: Option<usize>,
+        detail: Option<String>,
+    },
+    DispatcherClosed(Option<String>),
+    Disabled(Option<String>),
+    AckTimeout,
+    Io {
+        err: std::io::Error,
+        detail: Option<String>,
+    },
+}
+
+#[async_trait]
+trait DeliveryBackend: Send + Sync {
+    async fn send(
+        &self,
+        request: &DispatchRequest,
+        entry: &RegistryRecord,
+    ) -> Result<MailboxAckPayload, DeliveryError>;
+}
+
+#[derive(Clone)]
+struct UnixSocketBackend {
+    connect_timeout: Duration,
+    ack_timeout: Duration,
+}
+
+impl UnixSocketBackend {
+    fn new(config: &MailServerConfig) -> Self {
+        Self {
+            connect_timeout: config.connect_timeout,
+            ack_timeout: config.ack_timeout,
+        }
+    }
+}
+
+#[async_trait]
+impl DeliveryBackend for UnixSocketBackend {
+    async fn send(
+        &self,
+        request: &DispatchRequest,
+        entry: &RegistryRecord,
+    ) -> Result<MailboxAckPayload, DeliveryError> {
+        let socket_path = &entry.socket_path;
+        let connect = UnixStream::connect(socket_path);
+        let mut stream = match timeout(self.connect_timeout, connect).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(err)) => {
+                return Err(DeliveryError::Io {
+                    err,
+                    detail: Some("failed to connect to mailbox socket".to_string()),
+                });
+            }
+            Err(_) => {
+                return Err(DeliveryError::Io {
+                    err: std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"),
+                    detail: Some("connecting to mailbox socket timed out".to_string()),
+                });
+            }
+        };
+
+        let mut payload = serde_json::to_vec(&request.message).map_err(|err| DeliveryError::Io {
+            err: std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()),
+            detail: Some("failed to serialize mailbox message".to_string()),
+        })?;
+        payload.push(b'\n');
+
+        stream
+            .write_all(&payload)
+            .await
+            .map_err(|err| DeliveryError::Io {
+                err,
+                detail: Some("failed to write mailbox payload".to_string()),
+            })?;
+        stream
+            .flush()
+            .await
+            .map_err(|err| DeliveryError::Io {
+                err,
+                detail: Some("failed to flush mailbox payload".to_string()),
+            })?;
+
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        let bytes = timeout(self.ack_timeout, reader.read_line(&mut line))
+            .await
+            .map_err(|_| DeliveryError::AckTimeout)?
+            .map_err(|err| DeliveryError::Io {
+                err,
+                detail: Some("failed to read mailbox acknowledgement".to_string()),
+            })?;
+
+        if bytes == 0 {
+            return Err(DeliveryError::DispatcherClosed(Some(
+                "mailbox listener closed connection without acknowledgement".to_string(),
+            )));
+        }
+
+        let ack: MailboxAckPayload =
+            serde_json::from_str(line.trim()).map_err(|err| DeliveryError::Io {
+                err: std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()),
+                detail: Some("failed to parse mailbox acknowledgement".to_string()),
+            })?;
+
+        if ack.ok {
+            return Ok(ack);
+        }
+
+        match ack.err.as_deref() {
+            Some("queue_full") => Err(DeliveryError::QueueFull {
+                capacity: ack.capacity,
+                detail: ack.detail.clone(),
+            }),
+            Some("disabled") => Err(DeliveryError::Disabled(ack.detail.clone())),
+            Some("closed") => Err(DeliveryError::DispatcherClosed(ack.detail.clone())),
+            Some(other) => Err(DeliveryError::Io {
+                err: std::io::Error::new(std::io::ErrorKind::Other, other.to_string()),
+                detail: ack.detail.clone(),
+            }),
+            None => Err(DeliveryError::Io {
+                err: std::io::Error::new(std::io::ErrorKind::Other, "unknown dispatcher error"),
+                detail: ack.detail.clone(),
+            }),
+        }
+    }
+}
+
 pub struct MailDispatcherServer {
     config: MailServerConfig,
     registry: RegistryWatcher,
     semaphore: Arc<Semaphore>,
+    backend: Arc<dyn DeliveryBackend>,
 }
 
 impl MailDispatcherServer {
     pub fn new(config: MailServerConfig, registry: RegistryWatcher) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_inflight));
+        let backend: Arc<dyn DeliveryBackend> = match config.delivery_backend {
+            DeliveryBackendKind::UnixSocket => Arc::new(UnixSocketBackend::new(&config)),
+        };
         Self {
             config,
             registry,
             semaphore,
+            backend,
         }
     }
 
@@ -120,6 +256,7 @@ impl MailDispatcherServer {
         let semaphore = self.semaphore.clone();
         let registry = self.registry.clone();
         let config = self.config.clone();
+        let backend = self.backend.clone();
 
         let shutdown = tokio::signal::ctrl_c();
         pin!(shutdown);
@@ -137,9 +274,12 @@ impl MailDispatcherServer {
                             let permit = semaphore.clone().acquire_owned().await;
                             let registry = registry.clone();
                             let config = config.clone();
+                            let backend = backend.clone();
                             tokio::spawn(async move {
                                 if let Ok(permit) = permit {
-                                    if let Err(err) = handle_connection(stream, registry, &config).await {
+                                    if let Err(err) =
+                                        handle_connection(stream, registry, config, backend).await
+                                    {
                                         error!(target: "codex::mailbox", event = "dispatcher.connection_error", ?err, "connection handling failed");
                                     }
                                     drop(permit);
@@ -163,7 +303,8 @@ impl MailDispatcherServer {
 async fn handle_connection(
     stream: UnixStream,
     registry: RegistryWatcher,
-    config: &MailServerConfig,
+    config: MailServerConfig,
+    backend: Arc<dyn DeliveryBackend>,
 ) -> Result<()> {
     let peer = stream.peer_addr().ok();
     let mut reader = BufReader::new(stream);
@@ -243,7 +384,7 @@ async fn handle_connection(
         queue_depth,
         detail,
         capacity,
-    } = dispatch_to_socket(&request, &registry_entry, config).await;
+    } = dispatch_with_backend(&request, &registry_entry, backend.as_ref(), &config).await;
 
     respond(
         reader.into_inner(),
@@ -279,17 +420,21 @@ struct DispatchOutcome {
     capacity: Option<usize>,
 }
 
-async fn dispatch_to_socket(
+async fn dispatch_with_backend<B>(
     request: &DispatchRequest,
     entry: &RegistryRecord,
+    backend: &B,
     config: &MailServerConfig,
-) -> DispatchOutcome {
+) -> DispatchOutcome
+where
+    B: DeliveryBackend + ?Sized,
+{
     let mut attempts = 0usize;
     let started = Instant::now();
 
     loop {
         attempts += 1;
-        match attempt_forward(request, entry, config).await {
+        match backend.send(request, entry).await {
             Ok(ack) => {
                 #[cfg(feature = "otel")]
                 {
@@ -308,7 +453,7 @@ async fn dispatch_to_socket(
                     capacity: None,
                 };
             }
-            Err(ForwardError::QueueFull { capacity, detail }) => {
+            Err(DeliveryError::QueueFull { capacity, detail }) => {
                 #[cfg(feature = "otel")]
                 {
                     codex_otel::metrics::record_mailbox_error_total(&entry.namespace, "queue_full");
@@ -320,7 +465,7 @@ async fn dispatch_to_socket(
                     capacity,
                 };
             }
-            Err(ForwardError::DispatcherClosed(detail)) => {
+            Err(DeliveryError::DispatcherClosed(detail)) => {
                 #[cfg(feature = "otel")]
                 {
                     codex_otel::metrics::record_mailbox_error_total(
@@ -335,7 +480,7 @@ async fn dispatch_to_socket(
                     capacity: None,
                 };
             }
-            Err(ForwardError::Disabled(detail)) => {
+            Err(DeliveryError::Disabled(detail)) => {
                 #[cfg(feature = "otel")]
                 {
                     codex_otel::metrics::record_mailbox_error_total(
@@ -350,7 +495,7 @@ async fn dispatch_to_socket(
                     capacity: None,
                 };
             }
-            Err(ForwardError::AckTimeout) => {
+            Err(DeliveryError::AckTimeout) => {
                 #[cfg(feature = "otel")]
                 {
                     codex_otel::metrics::record_mailbox_error_total(
@@ -365,7 +510,7 @@ async fn dispatch_to_socket(
                     capacity: None,
                 };
             }
-            Err(ForwardError::Io { err, detail }) => {
+            Err(DeliveryError::Io { err, detail }) => {
                 #[cfg(feature = "otel")]
                 {
                     codex_otel::metrics::record_mailbox_error_total(&entry.namespace, "io_error");
@@ -396,91 +541,6 @@ async fn dispatch_to_socket(
     }
 }
 
-async fn attempt_forward(
-    request: &DispatchRequest,
-    entry: &RegistryRecord,
-    config: &MailServerConfig,
-) -> Result<MailboxAckPayload, ForwardError> {
-    let socket_path = &entry.socket_path;
-    let connect = UnixStream::connect(socket_path);
-    let mut stream = match timeout(config.connect_timeout, connect).await {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(err)) => {
-            return Err(ForwardError::Io {
-                err,
-                detail: Some("failed to connect to mailbox socket".to_string()),
-            });
-        }
-        Err(_) => {
-            return Err(ForwardError::Io {
-                err: std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"),
-                detail: Some("connecting to mailbox socket timed out".to_string()),
-            });
-        }
-    };
-
-    let mut payload = serde_json::to_vec(&request.message).map_err(|err| ForwardError::Io {
-        err: std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()),
-        detail: Some("failed to serialize mailbox message".to_string()),
-    })?;
-    payload.push(b'\n');
-
-    stream
-        .write_all(&payload)
-        .await
-        .map_err(|err| ForwardError::Io {
-            err,
-            detail: Some("failed to write mailbox payload".to_string()),
-        })?;
-    stream.flush().await.map_err(|err| ForwardError::Io {
-        err,
-        detail: Some("failed to flush mailbox payload".to_string()),
-    })?;
-
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    let bytes = timeout(config.ack_timeout, reader.read_line(&mut line))
-        .await
-        .map_err(|_| ForwardError::AckTimeout)?
-        .map_err(|err| ForwardError::Io {
-            err,
-            detail: Some("failed to read mailbox acknowledgement".to_string()),
-        })?;
-
-    if bytes == 0 {
-        return Err(ForwardError::DispatcherClosed(Some(
-            "mailbox listener closed connection without acknowledgement".to_string(),
-        )));
-    }
-
-    let ack: MailboxAckPayload =
-        serde_json::from_str(line.trim()).map_err(|err| ForwardError::Io {
-            err: std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()),
-            detail: Some("failed to parse mailbox acknowledgement".to_string()),
-        })?;
-
-    if ack.ok {
-        return Ok(ack);
-    }
-
-    match ack.err.as_deref() {
-        Some("queue_full") => Err(ForwardError::QueueFull {
-            capacity: ack.capacity,
-            detail: ack.detail.clone(),
-        }),
-        Some("disabled") => Err(ForwardError::Disabled(ack.detail.clone())),
-        Some("closed") => Err(ForwardError::DispatcherClosed(ack.detail.clone())),
-        Some(other) => Err(ForwardError::Io {
-            err: std::io::Error::new(std::io::ErrorKind::Other, other.to_string()),
-            detail: ack.detail.clone(),
-        }),
-        None => Err(ForwardError::Io {
-            err: std::io::Error::new(std::io::ErrorKind::Other, "unknown dispatcher error"),
-            detail: ack.detail.clone(),
-        }),
-    }
-}
-
 async fn respond(mut stream: UnixStream, response: &DispatchResponse) -> Result<()> {
     let mut buf = serde_json::to_vec(response)?;
     buf.push(b'\n');
@@ -501,30 +561,18 @@ fn format_status(status: &DispatchStatus) -> &'static str {
         DispatchStatus::InvalidRequest => "invalid_request",
     }
 }
-
-#[derive(Debug)]
-enum ForwardError {
-    QueueFull {
-        capacity: Option<usize>,
-        detail: Option<String>,
-    },
-    DispatcherClosed(Option<String>),
-    Disabled(Option<String>),
-    AckTimeout,
-    Io {
-        err: std::io::Error,
-        detail: Option<String>,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use serde_json::json;
+    use std::collections::VecDeque;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::net::UnixListener;
-    use tokio::sync::oneshot;
+    use tokio::sync::{Mutex, oneshot};
 
     fn base_config() -> MailServerConfig {
         MailServerConfig {
@@ -537,6 +585,7 @@ mod tests {
             retry_backoff: vec![Duration::from_millis(50), Duration::from_millis(100)],
             registry_poll_interval: Duration::from_millis(50),
             max_inflight: 8,
+            delivery_backend: DeliveryBackendKind::UnixSocket,
         }
     }
 
@@ -550,8 +599,44 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct MockBackend {
+        responses: Arc<Mutex<VecDeque<Result<MailboxAckPayload, DeliveryError>>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl MockBackend {
+        fn new(responses: Vec<Result<MailboxAckPayload, DeliveryError>>) -> Self {
+            let deque: VecDeque<_> = responses.into_iter().collect();
+            Self {
+                responses: Arc::new(Mutex::new(deque)),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl DeliveryBackend for MockBackend {
+        async fn send(
+            &self,
+            _request: &DispatchRequest,
+            _entry: &RegistryRecord,
+        ) -> Result<MailboxAckPayload, DeliveryError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self.responses.lock().await;
+            match guard.pop_front() {
+                Some(result) => result,
+                None => panic!("mock backend exhausted"),
+            }
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn dispatch_to_socket_succeeds() -> Result<()> {
+    async fn dispatch_with_unix_backend_succeeds() -> Result<()> {
         let dir = TempDir::new().context("temp dir")?;
         let mailbox_sock = dir.path().join("mailbox.sock");
         let listener = UnixListener::bind(&mailbox_sock).context("bind mailbox socket")?;
@@ -590,7 +675,8 @@ mod tests {
             message: message.clone(),
         };
 
-        let outcome = dispatch_to_socket(&request, &record, &config).await;
+        let backend = UnixSocketBackend::new(&config);
+        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
         assert!(matches!(outcome.status, DispatchStatus::Delivered));
         assert_eq!(outcome.queue_depth, Some(3));
         assert!(rx.await.is_ok());
@@ -634,7 +720,8 @@ mod tests {
             message: MailboxMessage::default(),
         };
 
-        let outcome = dispatch_to_socket(&request, &record, &config).await;
+        let backend = UnixSocketBackend::new(&config);
+        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
         assert!(matches!(outcome.status, DispatchStatus::QueueFull));
         assert_eq!(outcome.capacity, Some(16));
         Ok(())
@@ -656,8 +743,70 @@ mod tests {
             message: MailboxMessage::default(),
         };
 
-        let outcome = dispatch_to_socket(&request, &record, &config).await;
+        let backend = UnixSocketBackend::new(&config);
+        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
         assert!(matches!(outcome.status, DispatchStatus::TransportError));
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_retries_transport_error_then_succeeds() -> Result<()> {
+        let mut config = base_config();
+        config.retry_backoff = vec![Duration::from_millis(1), Duration::from_millis(1)];
+
+        let record = make_record(&PathBuf::from("unused.sock"));
+        let request = DispatchRequest {
+            submission_id: "sub-1".to_string(),
+            source_conversation_id: Uuid::now_v7(),
+            target_conversation_id: record.conversation_id,
+            message: MailboxMessage::default(),
+        };
+
+        let responses = vec![
+            Err(DeliveryError::Io {
+                err: std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused"),
+                detail: Some("connect failed".to_string()),
+            }),
+            Ok(MailboxAckPayload {
+                ok: true,
+                submission_id: Some("sub-1".to_string()),
+                message_id: Some(Uuid::now_v7()),
+                queue_depth: Some(2),
+                err: None,
+                detail: None,
+                capacity: None,
+            }),
+        ];
+
+        let backend = MockBackend::new(responses);
+        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
+
+        assert!(matches!(outcome.status, DispatchStatus::Delivered));
+        assert_eq!(outcome.queue_depth, Some(2));
+        assert_eq!(backend.call_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dispatch_propagates_disabled_error() -> Result<()> {
+        let config = base_config();
+        let record = make_record(&PathBuf::from("unused.sock"));
+        let request = DispatchRequest {
+            submission_id: "sub-1".to_string(),
+            source_conversation_id: Uuid::now_v7(),
+            target_conversation_id: record.conversation_id,
+            message: MailboxMessage::default(),
+        };
+
+        let backend = MockBackend::new(vec![Err(DeliveryError::Disabled(Some(
+            "dispatcher disabled".to_string(),
+        )))]);
+
+        let outcome = dispatch_with_backend(&request, &record, &backend, &config).await;
+
+        assert!(matches!(outcome.status, DispatchStatus::Disabled));
+        assert_eq!(backend.call_count(), 1);
+        assert_eq!(outcome.detail.as_deref(), Some("dispatcher disabled"));
         Ok(())
     }
 }

@@ -203,6 +203,7 @@ fn log_registry_diff(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DeliveryBackendKind;
     use serde_json::json;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -218,6 +219,7 @@ mod tests {
             retry_backoff: vec![Duration::from_millis(10)],
             registry_poll_interval: Duration::from_millis(50),
             max_inflight: 4,
+            delivery_backend: DeliveryBackendKind::UnixSocket,
         }
     }
 
