@@ -13,6 +13,7 @@ build/
 out/
 storybook-static/
 target/
+docker-data/
 
 # ignore README for publishing
 codex-cli/README.md

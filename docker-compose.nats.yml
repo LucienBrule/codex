@@ -1,0 +1,30 @@
+services:
+  nats:
+    image: nats:2.10
+    container_name: codex-mailbox-nats
+    command:
+      - "-js"
+      - "-sd"
+      - "/jetstream"
+    environment:
+      - NATS_SERVER_NAME=${NATS_SERVER_NAME:-codex-mailbox}
+    ports:
+      - "${NATS_PORT:-4222}:4222"
+      - "${NATS_CLUSTER_PORT:-6222}:6222"
+      - "${NATS_HTTP_PORT:-8222}:8222"
+    volumes:
+      - ./docker-data/nats-jetstream:/jetstream
+    restart: unless-stopped
+
+  nats-box:
+    image: synadia/nats-box:latest
+    container_name: codex-mailbox-nats-box
+    depends_on:
+      - nats
+    environment:
+      - NATS_URL=nats://nats:4222
+    entrypoint: ["/bin/sh", "-c", "sleep infinity"]
+
+networks:
+  default:
+    name: codex-mailbox-nats
