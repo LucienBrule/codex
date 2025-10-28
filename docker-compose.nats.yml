@@ -1,11 +1,12 @@
 services:
   nats:
-    image: nats:2.10
+    image: codex/fedora42-nats:dev
+    build:
+      context: ./docker/fedora42-nats
+      dockerfile: Dockerfile
+      args:
+        FEDORA_BASE_IMAGE: ${FEDORA_BASE_IMAGE:-codex/fedora42-base:dev}
     container_name: codex-mailbox-nats
-    command:
-      - "-js"
-      - "-sd"
-      - "/jetstream"
     environment:
       - NATS_SERVER_NAME=${NATS_SERVER_NAME:-codex-mailbox}
     ports:
