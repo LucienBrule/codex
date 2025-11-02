@@ -55,7 +55,7 @@ async fn mailbox_envelope_dispatches_while_idle() {
     let base_url = format!("{}/v1", server.uri());
     let TestCodex { codex, .. } = test_codex()
         .with_config(move |config| {
-            config.model_provider.base_url = Some(base_url.clone());
+            config.model_provider.base_url = Some(base_url);
             config.model_provider.env_key = Some("PATH".into());
             config.model_provider.request_max_retries = Some(0);
             config.model_provider.stream_max_retries = Some(0);

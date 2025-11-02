@@ -1,0 +1,171 @@
+use std::collections::BTreeMap;
+
+use async_trait::async_trait;
+use codex_protocol::models::PtyOpenToolCallParams;
+use serde_json::json;
+use std::env;
+use std::time::Duration;
+
+use crate::state::PtySessionState;
+use crate::codex::TurnContext;
+use crate::function_tool::FunctionCallError;
+use crate::tools::context::ToolInvocation;
+use crate::tools::context::ToolOutput;
+use crate::tools::context::ToolPayload;
+use crate::tools::registry::ToolHandler;
+use crate::tools::registry::ToolKind;
+use crate::vm_pty::VmPtyOpenRequest;
+
+use super::pty_common::map_vm_pty_error;
+
+pub struct PtyOpenHandler;
+
+#[async_trait]
+impl ToolHandler for PtyOpenHandler {
+    fn kind(&self) -> ToolKind {
+        ToolKind::Function
+    }
+
+    async fn handle(&self, invocation: ToolInvocation) -> Result<ToolOutput, FunctionCallError> {
+        let ToolInvocation {
+            session,
+            turn,
+            payload,
+            ..
+        } = invocation;
+
+        let ToolPayload::Function { arguments } = payload else {
+            return Err(FunctionCallError::RespondToModel(
+                "pty_open handler received an incompatible payload".to_string(),
+            ));
+        };
+
+        let params: PtyOpenToolCallParams = serde_json::from_str(&arguments).map_err(|err| {
+            FunctionCallError::RespondToModel(format!(
+                "failed to parse function arguments: {err}"
+            ))
+        })?;
+
+        let client = session
+            .services
+            .vm_pty_client
+            .as_ref()
+            .ok_or_else(|| {
+                FunctionCallError::RespondToModel(
+                    "pty_open tool is disabled; set CODEX_VM_PTY_SOCKET and enable the vm-pty lane"
+                        .to_string(),
+                )
+            })?
+            .clone();
+
+        // Resolve vmId: use param, else CODEX_VM_PTY_VM_ID.
+        let vm_id_param = params.vm_id.trim();
+        let vm_id = if vm_id_param.is_empty() {
+            env::var("CODEX_VM_PTY_VM_ID").unwrap_or_default()
+        } else {
+            params.vm_id.clone()
+        };
+        if vm_id.trim().is_empty() {
+            return Err(FunctionCallError::RespondToModel(
+                "pty_open requires vmId or CODEX_VM_PTY_VM_ID to be set".to_string(),
+            ));
+        }
+
+        // Attach-first: try to reattach to an existing session.
+        if let Ok(attached) = client.pty_attach(&vm_id).await {
+            let session_id = attached.session_id.clone();
+                {
+                    let mut guard = session.services.pty_state.lock().await;
+                    *guard = Some(PtySessionState {
+                        session_id: session_id.clone(),
+                        pending_output: None,
+                    });
+                }
+                let output = serde_json::json!({
+                    "session_id": session_id,
+                    "initial_output": "",
+                    "cols": attached.cols,
+                    "rows": attached.rows,
+                    "attached": true,
+                });
+                return Ok(ToolOutput::Function { content: output.to_string(), success: Some(true) });
+        }
+
+        // Build the open request with defaults.
+        let mut request = build_open_request(&params, turn.as_ref());
+        request.vm_id = vm_id;
+
+        // Bump timeout for pty_open (slow path on cold boots).
+        let open_timeout_ms: u64 = env::var("CODEX_VM_PTY_OPEN_TIMEOUT_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(90_000);
+        let client_open = client.with_request_timeout(Duration::from_millis(open_timeout_ms));
+        let response = client_open.pty_open(request).await.map_err(map_vm_pty_error)?;
+
+        let session_id = response.session_id.clone();
+        let initial_output = response.initial_output.clone();
+        {
+            let mut guard = session.services.pty_state.lock().await;
+            *guard = Some(PtySessionState {
+                session_id: session_id.clone(),
+                pending_output: if initial_output.is_empty() {
+                    None
+                } else {
+                    Some(initial_output.clone())
+                },
+            });
+        }
+
+        let output = serde_json::json!({
+            "session_id": session_id,
+            "initial_output": initial_output,
+            "cols": response.cols,
+            "rows": response.rows,
+        });
+
+        Ok(ToolOutput::Function {
+            content: output.to_string(),
+            success: Some(true),
+        })
+    }
+}
+
+fn build_open_request(params: &PtyOpenToolCallParams, turn: &TurnContext) -> VmPtyOpenRequest {
+    let workspace = params
+        .workspace
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| turn.cwd.to_string_lossy().into_owned());
+
+    let cwd = params
+        .cwd
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| workspace.clone());
+
+    let env = params
+        .env
+        .clone()
+        .map(|map| map.into_iter().collect())
+        .unwrap_or_else(BTreeMap::new);
+
+    let shell = params
+        .shell
+        .as_deref()
+        .map(str::to_string)
+        .unwrap_or_else(|| "/bin/bash".to_string());
+
+    let cols = params.cols.unwrap_or(80);
+    let rows = params.rows.unwrap_or(24);
+
+    VmPtyOpenRequest::new(
+        params.vm_id.clone(),
+        workspace,
+        cwd,
+        env,
+        shell,
+        cols,
+        rows,
+    )
+}

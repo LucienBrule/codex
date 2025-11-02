@@ -8,4 +8,4 @@ import type { MailboxMessage } from "./MailboxMessage";
 /**
  * Structured mailbox delivery payload that downstream clients can consume.
  */
-export type MailboxDeliveryEvent = { message: MailboxMessage, state: MailboxDeliveryState, queue_depth: number | null, observed_at: string | null, correlation_id: string | null, ingress?: MailboxDeliveryIngress, delivery_latency_ms?: number, };
+export type MailboxDeliveryEvent = { message: MailboxMessage, state: MailboxDeliveryState, queue_depth: number | null, observed_at: string | null, correlation_id: string | null, ingress?: MailboxDeliveryIngress, delivery_latency_ms?: bigint, };

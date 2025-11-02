@@ -32,11 +32,14 @@ pub enum ConfigShellToolType {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
+    pub include_shell_tool: bool,
     pub shell_type: ConfigShellToolType,
     pub plan_tool: bool,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_request: bool,
     pub include_view_image_tool: bool,
+    pub include_vm_pty_tool: bool,
+    pub include_vm_pty_open_tool: bool,
     pub experimental_unified_exec_tool: bool,
     pub experimental_supported_tools: Vec<String>,
 }
@@ -47,7 +50,10 @@ pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) include_apply_patch_tool: bool,
     pub(crate) include_web_search_request: bool,
     pub(crate) use_streamable_shell_tool: bool,
+    pub(crate) include_shell_tool: bool,
     pub(crate) include_view_image_tool: bool,
+    pub(crate) include_vm_pty_tool: bool,
+    pub(crate) include_vm_pty_open_tool: bool,
     pub(crate) experimental_unified_exec_tool: bool,
 }
 
@@ -59,7 +65,10 @@ impl ToolsConfig {
             include_apply_patch_tool,
             include_web_search_request,
             use_streamable_shell_tool,
+            include_shell_tool,
             include_view_image_tool,
+            include_vm_pty_tool,
+            include_vm_pty_open_tool,
             experimental_unified_exec_tool,
         } = params;
         let shell_type = if *use_streamable_shell_tool {
@@ -83,11 +92,14 @@ impl ToolsConfig {
         };
 
         Self {
+            include_shell_tool: *include_shell_tool,
             shell_type,
             plan_tool: *include_plan_tool,
             apply_patch_tool_type,
             web_search_request: *include_web_search_request,
             include_view_image_tool: *include_view_image_tool,
+            include_vm_pty_tool: *include_vm_pty_tool,
+            include_vm_pty_open_tool: *include_vm_pty_open_tool,
             experimental_unified_exec_tool: *experimental_unified_exec_tool,
             experimental_supported_tools: model_family.experimental_supported_tools.clone(),
         }
@@ -192,6 +204,211 @@ fn create_unified_exec_tool() -> ToolSpec {
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["input".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_open_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "vmId".to_string(),
+        JsonSchema::String {
+            description: Some("Identifier for the target VM to attach a PTY session to.".to_string()),
+        },
+    );
+    properties.insert(
+        "workspace".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional host workspace path override. Defaults to the session workspace if omitted."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "cwd".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Working directory inside the VM. Relative paths are resolved against the selected workspace."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "shell".to_string(),
+        JsonSchema::String {
+            description: Some("Shell executable to launch (defaults to /bin/bash).".to_string()),
+        },
+    );
+    properties.insert(
+        "env".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(
+                JsonSchema::String {
+                    description: Some(
+                        "Additional environment variables to define before launching the shell."
+                            .to_string(),
+                    ),
+                }
+                .into(),
+            ),
+        },
+    );
+    properties.insert(
+        "cols".to_string(),
+        JsonSchema::Number {
+            description: Some("Requested terminal column width (defaults to 80).".to_string()),
+        },
+    );
+    properties.insert(
+        "rows".to_string(),
+        JsonSchema::Number {
+            description: Some("Requested terminal row height (defaults to 24).".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_open".to_string(),
+        description: "Opens an interactive PTY session inside the VM lane and returns a session handle plus initial output."
+            .to_string(),
+        strict: true,
+        parameters: JsonSchema::Object {
+            properties,
+            // Host requires 'required' to include every key present in properties when strict=true.
+            // Provide sensible defaults in the handler when values are empty.
+            required: Some(vec![
+                "vmId".to_string(),
+                "workspace".to_string(),
+                "cwd".to_string(),
+                "shell".to_string(),
+                "env".to_string(),
+                "cols".to_string(),
+                "rows".to_string(),
+            ]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_write_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "text".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Text to write to the PTY. Supports control tokens such as <C-C> or <UP>."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "cursor".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional write sequence number for concurrency control.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_write".to_string(),
+        description: "Writes text or control sequences to the active PTY; include a trailing newline (\"\\n\") to run shell commands.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["text".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_read_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "maxBytes".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum bytes to read from the PTY (defaults to 4096).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "cursor".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional read cursor sequence for ordered consumption.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_read".to_string(),
+        description: "Reads buffered output from the active PTY session; call after pty_write and set maxBytes (for example 16384) to drain pending output.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_resize_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "cols".to_string(),
+        JsonSchema::Number {
+            description: Some("Requested terminal column width.".to_string()),
+        },
+    );
+    properties.insert(
+        "rows".to_string(),
+        JsonSchema::Number {
+            description: Some("Requested terminal row height.".to_string()),
+        },
+    );
+    properties.insert(
+        "cursor".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional write sequence number to synchronise with previous writes.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_resize".to_string(),
+        description: "Resizes the PTY session; follow with pty_read to confirm the remote shell observed the new size (e.g. via \"stty size\").".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_signal_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "send".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Signal to send (interrupt, suspend, eof, terminate).".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_signal".to_string(),
+        description: "Injects a control signal into the PTY (interrupt, suspend, eof, terminate).".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["send".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -1369,6 +1586,11 @@ pub(crate) fn build_specs(
     use crate::tools::handlers::MailboxWaitHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::PlanHandler;
+use crate::tools::handlers::PtyOpenHandler;
+use crate::tools::handlers::PtyReadHandler;
+use crate::tools::handlers::PtyResizeHandler;
+use crate::tools::handlers::PtySignalHandler;
+use crate::tools::handlers::PtyWriteHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::ShellHandler;
     use crate::tools::handlers::TestSyncHandler;
@@ -1385,41 +1607,48 @@ pub(crate) fn build_specs(
     let plan_handler = Arc::new(PlanHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
+    let pty_open_handler = Arc::new(PtyOpenHandler);
+    let pty_write_handler = Arc::new(PtyWriteHandler);
+    let pty_read_handler = Arc::new(PtyReadHandler);
+    let pty_resize_handler = Arc::new(PtyResizeHandler);
+    let pty_signal_handler = Arc::new(PtySignalHandler);
     let mcp_handler = Arc::new(McpHandler);
     let mailbox_send_handler = Arc::new(MailboxSendHandler);
     let mailbox_wait_handler = Arc::new(MailboxWaitHandler);
     let mailbox_read_handler = Arc::new(crate::tools::handlers::MailboxReadHandler);
     let wait_handler = Arc::new(WaitHandler);
 
-    if config.experimental_unified_exec_tool {
-        builder.push_spec(create_unified_exec_tool());
-        builder.register_handler("unified_exec", unified_exec_handler);
-    } else {
-        match &config.shell_type {
-            ConfigShellToolType::Default => {
-                builder.push_spec(create_shell_tool());
-            }
-            ConfigShellToolType::Local => {
-                builder.push_spec(ToolSpec::LocalShell {});
-            }
-            ConfigShellToolType::Streamable => {
-                builder.push_spec(ToolSpec::Function(
-                    create_exec_command_tool_for_responses_api(),
-                ));
-                builder.push_spec(ToolSpec::Function(
-                    create_write_stdin_tool_for_responses_api(),
-                ));
-                builder.register_handler(EXEC_COMMAND_TOOL_NAME, exec_stream_handler.clone());
-                builder.register_handler(WRITE_STDIN_TOOL_NAME, exec_stream_handler);
+    if config.include_shell_tool {
+        if config.experimental_unified_exec_tool {
+            builder.push_spec(create_unified_exec_tool());
+            builder.register_handler("unified_exec", unified_exec_handler);
+        } else {
+            match &config.shell_type {
+                ConfigShellToolType::Default => {
+                    builder.push_spec(create_shell_tool());
+                }
+                ConfigShellToolType::Local => {
+                    builder.push_spec(ToolSpec::LocalShell {});
+                }
+                ConfigShellToolType::Streamable => {
+                    builder.push_spec(ToolSpec::Function(
+                        create_exec_command_tool_for_responses_api(),
+                    ));
+                    builder.push_spec(ToolSpec::Function(
+                        create_write_stdin_tool_for_responses_api(),
+                    ));
+                    builder.register_handler(EXEC_COMMAND_TOOL_NAME, exec_stream_handler.clone());
+                    builder.register_handler(WRITE_STDIN_TOOL_NAME, exec_stream_handler);
+                }
             }
         }
-    }
 
-    // Always register shell aliases so older prompts remain compatible.
-    builder.register_handler(SHELL_TOOL_NAME, shell_handler.clone());
-    builder.register_handler(CONTAINER_EXEC_TOOL_NAME, shell_handler.clone());
-    builder.register_handler(LEGACY_CONTAINER_EXEC_TOOL_NAME, shell_handler.clone());
-    builder.register_handler(LOCAL_SHELL_TOOL_NAME, shell_handler);
+        // Register shell aliases so older prompts remain compatible.
+        builder.register_handler(SHELL_TOOL_NAME, shell_handler.clone());
+        builder.register_handler(CONTAINER_EXEC_TOOL_NAME, shell_handler.clone());
+        builder.register_handler(LEGACY_CONTAINER_EXEC_TOOL_NAME, shell_handler.clone());
+        builder.register_handler(LOCAL_SHELL_TOOL_NAME, shell_handler);
+    }
 
     if config.plan_tool {
         builder.push_spec(PLAN_TOOL.clone());
@@ -1502,6 +1731,25 @@ pub(crate) fn build_specs(
         builder.register_handler("view_image", view_image_handler);
     }
 
+    if config.include_vm_pty_tool {
+        if config.include_vm_pty_open_tool {
+            builder.push_spec(create_pty_open_tool());
+            builder.register_handler("pty_open", pty_open_handler.clone());
+        }
+
+        builder.push_spec(create_pty_write_tool());
+        builder.register_handler("pty_write", pty_write_handler.clone());
+
+        builder.push_spec(create_pty_read_tool());
+        builder.register_handler("pty_read", pty_read_handler.clone());
+
+        builder.push_spec(create_pty_resize_tool());
+        builder.register_handler("pty_resize", pty_resize_handler.clone());
+
+        builder.push_spec(create_pty_signal_tool());
+        builder.register_handler("pty_signal", pty_signal_handler.clone());
+    }
+
     if let Some(mcp_tools) = mcp_tools {
         let mut entries: Vec<(String, mcp_types::Tool)> = mcp_tools.into_iter().collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1582,6 +1830,9 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
         let (tools, _) = build_specs(&config, Some(HashMap::new())).build();
@@ -1612,6 +1863,8 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
         let (tools, _) = build_specs(&config, Some(HashMap::new())).build();
@@ -1644,6 +1897,8 @@ mod tests {
             include_web_search_request: false,
             use_streamable_shell_tool: false,
             include_view_image_tool: false,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
         let (tools, _) = build_specs(&config, None).build();
@@ -1665,6 +1920,8 @@ mod tests {
             include_web_search_request: false,
             use_streamable_shell_tool: false,
             include_view_image_tool: false,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: false,
         });
         let (tools, _) = build_specs(&config, None).build();
@@ -1697,6 +1954,8 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
         let (tools, _) = build_specs(
@@ -1808,6 +2067,8 @@ mod tests {
             include_web_search_request: false,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
 
@@ -1890,6 +2151,8 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
 
@@ -1965,6 +2228,8 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
 
@@ -2035,6 +2300,8 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
 
@@ -2108,6 +2375,8 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
 
@@ -2177,6 +2446,8 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
 
@@ -2250,6 +2521,8 @@ mod tests {
             include_web_search_request: true,
             use_streamable_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
         });
         let (tools, _) = build_specs(

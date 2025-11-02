@@ -14,6 +14,7 @@ mod json_result;
 mod list_dir;
 mod live_cli;
 mod mailbox;
+mod pty_open;
 mod model_overrides;
 mod model_tools;
 mod otel;

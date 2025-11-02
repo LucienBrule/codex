@@ -150,6 +150,7 @@ use crate::unified_exec::UnifiedExecSessionManager;
 use crate::user_instructions::UserInstructions;
 use crate::user_notification::UserNotification;
 use crate::util::backoff;
+use crate::vm_pty::VmPtyClient;
 use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -638,6 +639,23 @@ impl Session {
             model_reasoning_summary,
             conversation_id,
         );
+        let vm_pty_client = if config.include_vm_pty_tool {
+            match VmPtyClient::from_env() {
+                Ok(Some(client)) => Some(Arc::new(client)),
+                Ok(None) => {
+                    warn!("pty_open tool enabled but CODEX_VM_PTY_SOCKET is unset; disabling tool");
+                    None
+                }
+                Err(err) => {
+                    warn!("failed to initialize vm-pty client: {err}; disabling pty_open tool");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let include_vm_pty_tool = config.include_vm_pty_tool && vm_pty_client.is_some();
+        let include_vm_pty_open_tool = config.include_vm_pty_open_tool && include_vm_pty_tool;
         let turn_context = TurnContext {
             client,
             tools_config: ToolsConfig::new(&ToolsConfigParams {
@@ -646,7 +664,10 @@ impl Session {
                 include_apply_patch_tool: config.include_apply_patch_tool,
                 include_web_search_request: config.tools_web_search_request,
                 use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+                include_shell_tool: config.include_shell_tool,
                 include_view_image_tool: config.include_view_image_tool,
+                include_vm_pty_tool,
+                include_vm_pty_open_tool,
                 experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
             }),
             user_instructions,
@@ -672,6 +693,8 @@ impl Session {
                 config.codex_linux_sandbox_exe.clone(),
             )),
             summaries: Mutex::new(None),
+            vm_pty_client: vm_pty_client.clone(),
+            pty_state: Mutex::new(None),
         };
 
         let mailbox_liveness = if config.mailbox_liveness.enabled {
@@ -1978,13 +2001,20 @@ async fn submission_loop(
                     .unwrap_or(prev.sandbox_policy.clone());
                 let new_cwd = cwd.clone().unwrap_or_else(|| prev.cwd.clone());
 
+                let include_vm_pty_tool =
+                    config.include_vm_pty_tool && sess.services.vm_pty_client.is_some();
+                let include_vm_pty_open_tool =
+                    config.include_vm_pty_open_tool && include_vm_pty_tool;
                 let tools_config = ToolsConfig::new(&ToolsConfigParams {
                     model_family: &effective_family,
                     include_plan_tool: config.include_plan_tool,
                     include_apply_patch_tool: config.include_apply_patch_tool,
                     include_web_search_request: config.tools_web_search_request,
                     use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+                    include_shell_tool: config.include_shell_tool,
                     include_view_image_tool: config.include_view_image_tool,
+                    include_vm_pty_tool,
+                    include_vm_pty_open_tool,
                     experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
                 });
 
@@ -2080,17 +2110,26 @@ async fn submission_loop(
 
                     let fresh_turn_context = TurnContext {
                         client,
-                        tools_config: ToolsConfig::new(&ToolsConfigParams {
-                            model_family: &model_family,
-                            include_plan_tool: config.include_plan_tool,
-                            include_apply_patch_tool: config.include_apply_patch_tool,
-                            include_web_search_request: config.tools_web_search_request,
-                            use_streamable_shell_tool: config
-                                .use_experimental_streamable_shell_tool,
-                            include_view_image_tool: config.include_view_image_tool,
-                            experimental_unified_exec_tool: config
-                                .use_experimental_unified_exec_tool,
-                        }),
+                        tools_config: {
+                            let include_vm_pty_tool = config.include_vm_pty_tool
+                                && sess.services.vm_pty_client.is_some();
+                            let include_vm_pty_open_tool =
+                                config.include_vm_pty_open_tool && include_vm_pty_tool;
+                            ToolsConfig::new(&ToolsConfigParams {
+                                model_family: &model_family,
+                                include_plan_tool: config.include_plan_tool,
+                                include_apply_patch_tool: config.include_apply_patch_tool,
+                                include_web_search_request: config.tools_web_search_request,
+                                use_streamable_shell_tool: config
+                                    .use_experimental_streamable_shell_tool,
+                                include_shell_tool: config.include_shell_tool,
+                                include_view_image_tool: config.include_view_image_tool,
+                                include_vm_pty_tool,
+                                include_vm_pty_open_tool,
+                                experimental_unified_exec_tool: config
+                                    .use_experimental_unified_exec_tool,
+                            })
+                        },
                         user_instructions: turn_context.user_instructions.clone(),
                         base_instructions: turn_context.base_instructions.clone(),
                         approval_policy,
@@ -2621,7 +2660,10 @@ async fn spawn_review_thread(
         include_apply_patch_tool: config.include_apply_patch_tool,
         include_web_search_request: false,
         use_streamable_shell_tool: false,
+        include_shell_tool: false,
         include_view_image_tool: false,
+        include_vm_pty_tool: false,
+        include_vm_pty_open_tool: false,
         experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
     });
 
@@ -3709,6 +3751,10 @@ pub(crate) mod tests {
         .await
         .context("failed to initialize session")?;
 
+        let include_vm_pty_tool =
+            config_arc.include_vm_pty_tool && session.services.vm_pty_client.is_some();
+        let include_vm_pty_open_tool =
+            config_arc.include_vm_pty_open_tool && include_vm_pty_tool;
         let handler_turn_context = Arc::new(TurnContext {
             client: turn_context.client.clone(),
             cwd: turn_context.cwd.clone(),
@@ -3723,7 +3769,10 @@ pub(crate) mod tests {
                 include_apply_patch_tool: config_arc.include_apply_patch_tool,
                 include_web_search_request: config_arc.tools_web_search_request,
                 use_streamable_shell_tool: config_arc.use_experimental_streamable_shell_tool,
+                include_shell_tool: config_arc.include_shell_tool,
                 include_view_image_tool: config_arc.include_view_image_tool,
+                include_vm_pty_tool,
+                include_vm_pty_open_tool,
                 experimental_unified_exec_tool: config_arc.use_experimental_unified_exec_tool,
             }),
             is_review_mode: false,
@@ -4249,8 +4298,11 @@ pub(crate) mod tests {
             include_apply_patch_tool: config.include_apply_patch_tool,
             include_web_search_request: config.tools_web_search_request,
             use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+            include_shell_tool: config.include_shell_tool,
             include_view_image_tool: config.include_view_image_tool,
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+            include_vm_pty_tool: config.include_vm_pty_tool,
+            include_vm_pty_open_tool: config.include_vm_pty_open_tool,
         });
         let turn_context = TurnContext {
             client,
@@ -4278,6 +4330,8 @@ pub(crate) mod tests {
                 None,
             )),
             summaries: Mutex::new(None),
+            vm_pty_client: None,
+            pty_state: Mutex::new(None),
         };
         let (mailbox_tx, _) = mailbox_channel(1);
         let session = Session {
@@ -4335,8 +4389,11 @@ pub(crate) mod tests {
             include_apply_patch_tool: config.include_apply_patch_tool,
             include_web_search_request: config.tools_web_search_request,
             use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+            include_shell_tool: config.include_shell_tool,
             include_view_image_tool: config.include_view_image_tool,
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+            include_vm_pty_tool: config.include_vm_pty_tool,
+            include_vm_pty_open_tool: config.include_vm_pty_open_tool,
         });
         let turn_context = Arc::new(TurnContext {
             client,
@@ -4364,6 +4421,8 @@ pub(crate) mod tests {
                 None,
             )),
             summaries: Mutex::new(None),
+            vm_pty_client: None,
+            pty_state: Mutex::new(None),
         };
         let (mailbox_tx, _) = mailbox_channel(1);
         let session = Arc::new(Session {

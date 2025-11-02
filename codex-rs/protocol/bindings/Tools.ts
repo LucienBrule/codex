@@ -5,4 +5,4 @@
 /**
  * MCP representation of a [`codex_core::config::ToolsToml`].
  */
-export type Tools = { webSearch: boolean | null, viewImage: boolean | null, };
+export type Tools = { webSearch: boolean | null, viewImage: boolean | null, vmPtyLane: boolean | null, };

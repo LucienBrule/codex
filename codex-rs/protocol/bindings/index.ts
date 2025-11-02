@@ -139,6 +139,7 @@ export type { SetDefaultModelParams } from "./SetDefaultModelParams";
 export type { SetDefaultModelResponse } from "./SetDefaultModelResponse";
 export type { StepStatus } from "./StepStatus";
 export type { StreamErrorEvent } from "./StreamErrorEvent";
+export type { SummaryUpdatedEvent } from "./SummaryUpdatedEvent";
 export type { TaskCompleteEvent } from "./TaskCompleteEvent";
 export type { TaskStartedEvent } from "./TaskStartedEvent";
 export type { TextContent } from "./TextContent";

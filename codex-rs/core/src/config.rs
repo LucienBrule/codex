@@ -26,6 +26,7 @@ use crate::model_provider_info::built_in_model_providers;
 use crate::openai_model_info::get_model_info;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
+use crate::vm_pty;
 use codex_app_server_protocol::Tools;
 use codex_app_server_protocol::UserSavedConfig;
 use codex_protocol::config_types::ReasoningEffort;
@@ -46,6 +47,7 @@ use std::str::FromStr;
 use std::sync::OnceLock;
 use std::sync::RwLock;
 use std::time::Duration;
+use tracing::warn;
 
 use crate::config_edit::CONFIG_KEY_EFFORT;
 use crate::config_edit::CONFIG_KEY_MODEL;
@@ -250,6 +252,15 @@ pub struct Config {
 
     /// Include the `view_image` tool that lets the agent attach a local image path to context.
     pub include_view_image_tool: bool,
+
+    /// Whether to include host shell tools for this session.
+    pub include_shell_tool: bool,
+
+    /// Whether to attempt to include the VM-backed PTY tool for this session.
+    pub include_vm_pty_tool: bool,
+
+    /// Whether to expose the management-only pty_open tool.
+    pub include_vm_pty_open_tool: bool,
 
     /// The active profile name used to derive this `Config` (if any).
     pub active_profile: Option<String>,
@@ -1114,6 +1125,10 @@ pub struct ConfigToml {
     /// Nested tools section for feature toggles
     pub tools: Option<ToolsToml>,
 
+    /// VM-backed PTY feature flag configuration.
+    #[serde(default)]
+    pub vm_pty: VmPtyToml,
+
     /// When true, disables burst-paste detection for typed input entirely.
     /// All characters are inserted as they are received, and no buffering
     /// or placeholder replacement will occur for fast keypress bursts.
@@ -1166,6 +1181,43 @@ pub struct ToolsToml {
     /// Enable the `view_image` tool that lets the agent attach local images.
     #[serde(default)]
     pub view_image: Option<bool>,
+
+    /// Shell tool configuration and profile gating.
+    #[serde(default)]
+    pub shell: Option<ShellToolsToml>,
+
+    /// Experimental VM-backed PTY lane configuration.
+    #[serde(default)]
+    pub vm_pty: VmPtyToml,
+
+    /// Explicit toggle for the unified_exec tool. When absent, defaults to false.
+    /// This allows enabling the VM PTY lane without automatically exposing a
+    /// general-purpose exec tool to the agent.
+    #[serde(default)]
+    pub unified_exec_enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct VmPtyToml {
+    /// Global feature flag for the VM-backed PTY lane.
+    pub enabled: Option<bool>,
+    /// Active profile names that are allowed to use the PTY lane.
+    #[serde(default)]
+    pub allow_profiles: Vec<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct ShellToolsToml {
+    /// Enable the `shell`/`container_exec` tools (default: true).
+    pub enabled: Option<bool>,
+    /// Profiles explicitly allowed to use the shell tool. Empty → allow all.
+    #[serde(default)]
+    pub allow_profiles: Vec<String>,
+    /// Profiles explicitly disallowed from using the shell tool.
+    #[serde(default)]
+    pub disallow_profiles: Vec<String>,
 }
 
 impl From<ToolsToml> for Tools {
@@ -1173,6 +1225,7 @@ impl From<ToolsToml> for Tools {
         Self {
             web_search: tools_toml.web_search,
             view_image: tools_toml.view_image,
+            vm_pty_lane: tools_toml.vm_pty.enabled,
         }
     }
 }
@@ -1431,6 +1484,104 @@ impl Config {
             .or(cfg.tools.as_ref().and_then(|t| t.view_image))
             .unwrap_or(true);
 
+        let shell_settings = cfg
+            .tools
+            .as_ref()
+            .and_then(|t| t.shell.clone())
+            .unwrap_or_default();
+        let shell_enabled = shell_settings.enabled.unwrap_or(true);
+        let normalize_profiles = |profiles: Vec<String>| {
+            profiles
+                .into_iter()
+                .map(|entry| entry.trim().to_ascii_lowercase())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>()
+        };
+        let shell_allow = normalize_profiles(shell_settings.allow_profiles);
+        let shell_deny = normalize_profiles(shell_settings.disallow_profiles);
+        let include_shell_tool = if !shell_enabled {
+            false
+        } else if let Some(profile) = active_profile_name.as_ref() {
+            let profile = profile.trim().to_ascii_lowercase();
+            let allowed = if shell_allow.is_empty() {
+                true
+            } else {
+                shell_allow
+                    .iter()
+                    .any(|entry| entry == "*" || entry == &profile)
+            };
+            let denied = shell_deny
+                .iter()
+                .any(|entry| entry == "*" || entry == &profile);
+            allowed && !denied
+        } else {
+            let allowed = shell_allow.is_empty()
+                || shell_allow.iter().any(|entry| entry == "*");
+            let denied = shell_deny.iter().any(|entry| entry == "*");
+            allowed && !denied
+        };
+
+        let legacy_vm_pty_enabled = cfg.experimental_use_unified_exec_tool.unwrap_or(false);
+        // Prefer nested tools.vm_pty if provided; fall back to top-level vm_pty for backward-compat.
+        let vm_pty_cfg = if let Some(t) = &cfg.tools {
+            let mut nested = t.vm_pty.clone();
+            // If nested contains no settings, fall back to top-level.
+            if nested.enabled.is_none() && nested.allow_profiles.is_empty() {
+                cfg.vm_pty.clone()
+            } else {
+                nested
+            }
+        } else {
+            cfg.vm_pty.clone()
+        };
+        let mut vm_pty_allowed_profiles: Vec<String> = vm_pty_cfg
+            .allow_profiles
+            .into_iter()
+            .map(|profile| profile.trim().to_ascii_lowercase())
+            .filter(|profile| !profile.is_empty())
+            .collect();
+        vm_pty_allowed_profiles.sort_unstable();
+        vm_pty_allowed_profiles.dedup();
+        let vm_pty_requested = vm_pty_cfg.enabled.unwrap_or(legacy_vm_pty_enabled);
+        let vm_pty_flag_enabled = if vm_pty_requested && !vm_pty::is_configured() {
+            warn!(
+                target: "codex::config",
+                "vm-pty lane enabled but CODEX_VM_PTY_SOCKET is not configured; disabling pty_open tool"
+            );
+            false
+        } else {
+            vm_pty_requested
+        };
+        let vm_pty_profile_allowlisted = if vm_pty_flag_enabled {
+            match active_profile_name.as_ref() {
+                Some(profile) => {
+                    let normalized = profile.to_ascii_lowercase();
+                    vm_pty_allowed_profiles
+                        .iter()
+                        .any(|allowed| allowed == "*" || allowed == &normalized)
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        let include_vm_pty_tool = vm_pty_flag_enabled && vm_pty_profile_allowlisted;
+        // Enable pty_open for a small allowlist of trusted profiles.
+        let include_vm_pty_open_tool = include_vm_pty_tool
+            && active_profile_name
+                .as_ref()
+                .map(|profile| {
+                    let p = profile.to_ascii_lowercase();
+                    p == "management" || p == "worker-pty-sandbox"
+                })
+                .unwrap_or(false);
+        let exec_explicit_enabled = cfg
+            .tools
+            .as_ref()
+            .and_then(|t| t.unified_exec_enabled)
+            .unwrap_or(false);
+        let use_experimental_unified_exec_tool = include_vm_pty_tool && exec_explicit_enabled;
+
         let model = model
             .or(config_profile.model)
             .or(cfg.model)
@@ -1565,11 +1716,12 @@ impl Config {
             use_experimental_streamable_shell_tool: cfg
                 .experimental_use_exec_command_tool
                 .unwrap_or(false),
-            use_experimental_unified_exec_tool: cfg
-                .experimental_use_unified_exec_tool
-                .unwrap_or(false),
+            use_experimental_unified_exec_tool,
             use_experimental_use_rmcp_client: cfg.experimental_use_rmcp_client.unwrap_or(false),
             include_view_image_tool,
+            include_shell_tool,
+            include_vm_pty_tool,
+            include_vm_pty_open_tool,
             active_profile: active_profile_name,
             windows_wsl_setup_acknowledged: cfg.windows_wsl_setup_acknowledged.unwrap_or(false),
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
@@ -1946,6 +2098,106 @@ persistence = "none"
         assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
         assert!(!config.wait.is_allowed(WaitPredicateKind::Filesystem));
         assert!(!config.wait.is_allowed(WaitPredicateKind::Shell));
+    }
+
+    #[test]
+    fn vm_pty_disabled_by_default() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert!(
+            !config.use_experimental_unified_exec_tool,
+            "unified_exec should be disabled unless the VM PTY feature flag and allowlist are set"
+        );
+        assert!(
+            !config.include_vm_pty_tool,
+            "vm-pty tool must be disabled unless the feature flag, allowlist, and socket are configured"
+        );
+    }
+
+    #[test]
+    fn vm_pty_requires_allowlisted_profile() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let socket_dir = tempfile::tempdir().expect("socket_dir");
+        let socket_path = socket_dir.path().join("pty.sock");
+        let _socket_guard = EnvVarGuard::set_os(
+            "CODEX_VM_PTY_SOCKET",
+            socket_path.as_os_str(),
+        );
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.profiles
+            .insert("workers".to_string(), ConfigProfile::default());
+        cfg.profiles
+            .insert("management".to_string(), ConfigProfile::default());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("workers".to_string());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert!(
+            !config.use_experimental_unified_exec_tool,
+            "non-allowlisted profiles must not receive the unified_exec tool"
+        );
+        assert!(
+            !config.include_vm_pty_tool,
+            "non-allowlisted profiles must not receive the vm-pty tool"
+        );
+    }
+
+    #[test]
+    fn vm_pty_enabled_for_management_profile() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let socket_dir = tempfile::tempdir().expect("socket_dir");
+        let socket_path = socket_dir.path().join("pty.sock");
+        let _socket_guard = EnvVarGuard::set_os(
+            "CODEX_VM_PTY_SOCKET",
+            socket_path.as_os_str(),
+        );
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.profiles
+            .insert("management".to_string(), ConfigProfile::default());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("management".to_string());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert!(
+            config.use_experimental_unified_exec_tool,
+            "allowlisted Management profile should receive the unified_exec tool"
+        );
+        assert!(
+            config.include_vm_pty_tool,
+            "allowlisted Management profile should receive the vm-pty tool"
+        );
     }
 
     #[test]
@@ -2714,6 +2966,9 @@ model_verbosity = "high"
                 use_experimental_unified_exec_tool: false,
                 use_experimental_use_rmcp_client: false,
                 include_view_image_tool: true,
+                include_shell_tool: true,
+                include_vm_pty_tool: false,
+                include_vm_pty_open_tool: false,
                 active_profile: Some("o3".to_string()),
                 windows_wsl_setup_acknowledged: false,
                 disable_paste_burst: false,
@@ -2780,6 +3035,9 @@ model_verbosity = "high"
             use_experimental_unified_exec_tool: false,
             use_experimental_use_rmcp_client: false,
             include_view_image_tool: true,
+            include_shell_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             active_profile: Some("gpt3".to_string()),
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
@@ -2861,6 +3119,9 @@ model_verbosity = "high"
             use_experimental_unified_exec_tool: false,
             use_experimental_use_rmcp_client: false,
             include_view_image_tool: true,
+            include_shell_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             active_profile: Some("zdr".to_string()),
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
@@ -2928,6 +3189,9 @@ model_verbosity = "high"
             use_experimental_unified_exec_tool: false,
             use_experimental_use_rmcp_client: false,
             include_view_image_tool: true,
+            include_shell_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
             active_profile: Some("gpt5".to_string()),
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,

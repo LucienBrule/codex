@@ -61,7 +61,7 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
     let base_url = format!("{}/v1", server.uri());
     let test_codex = test_codex()
         .with_config(move |config| {
-            config.model_provider.base_url = Some(base_url.clone());
+            config.model_provider.base_url = Some(base_url);
             config.model_provider.env_key = Some("PATH".into());
             config.model_provider.request_max_retries = Some(0);
             config.model_provider.stream_max_retries = Some(0);
@@ -208,8 +208,8 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
                 "latency exceeded 1s for {}",
                 event.message_id
             );
-        } else if let Some(enqueued) = enqueued_map.get(&event.message_id) {
-            if let (Some(start), Some(end)) = (enqueued.observed_at_ms, event.observed_at_ms) {
+        } else if let Some(enqueued) = enqueued_map.get(&event.message_id)
+            && let (Some(start), Some(end)) = (enqueued.observed_at_ms, event.observed_at_ms) {
                 let diff = end.saturating_sub(start);
                 assert!(
                     diff <= 1_000,
@@ -218,7 +218,6 @@ async fn mailbox_concurrency_preserves_fifo_and_latency() {
                 );
                 latency_ms.push(diff);
             }
-        }
 
         if let Some(enqueued) = enqueued_map.get(&event.message_id) {
             assert!(
