@@ -297,6 +297,29 @@ fn create_pty_open_tool() -> ToolSpec {
     })
 }
 
+fn create_pty_session_info_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "vmId".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional VM identifier. If omitted, returns the active/default session info.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_session_info".to_string(),
+        description: "Returns the vm_id and session_id for the active/default PTY session; accepts optional vmId to query a specific session.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_pty_write_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -1594,7 +1617,8 @@ use crate::tools::handlers::PtyOpenHandler;
 use crate::tools::handlers::PtyReadHandler;
 use crate::tools::handlers::PtyResizeHandler;
 use crate::tools::handlers::PtySignalHandler;
-use crate::tools::handlers::PtyWriteHandler;
+    use crate::tools::handlers::PtyWriteHandler;
+    use crate::tools::handlers::PtySessionInfoHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::ShellHandler;
     use crate::tools::handlers::TestSyncHandler;
@@ -1612,6 +1636,7 @@ use crate::tools::handlers::PtyWriteHandler;
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
     let pty_open_handler = Arc::new(PtyOpenHandler);
+    let pty_session_info_handler = Arc::new(PtySessionInfoHandler);
     let pty_write_handler = Arc::new(PtyWriteHandler);
     let pty_read_handler = Arc::new(PtyReadHandler);
     let pty_resize_handler = Arc::new(PtyResizeHandler);
@@ -1740,6 +1765,10 @@ use crate::tools::handlers::PtyWriteHandler;
             builder.push_spec(create_pty_open_tool());
             builder.register_handler("pty_open", pty_open_handler.clone());
         }
+
+        // Lightweight telemetry tool: report vm_id/session_id for default or specified VM.
+        builder.push_spec(create_pty_session_info_tool());
+        builder.register_handler("pty_session_info", pty_session_info_handler);
 
         builder.push_spec(create_pty_write_tool());
         builder.register_handler("pty_write", pty_write_handler.clone());

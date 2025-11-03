@@ -194,6 +194,7 @@ impl VmPtyClient {
         let parsed: VmPtyOpenResultInternal =
             serde_json::from_value(result_value).map_err(VmPtyClientError::Deserialize)?;
         Ok(VmPtyOpenResponse {
+            vm_id: parsed.vm_id,
             session_id: parsed.session_id,
             initial_output: parsed.initial_output.unwrap_or_default(),
             cols: parsed.cols.unwrap_or(80),
@@ -391,6 +392,8 @@ impl VmPtyOpenRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VmPtyOpenResponse {
+    /// Effective vm_id assigned by the server (optional for back-compat).
+    pub vm_id: Option<String>,
     pub session_id: String,
     pub initial_output: String,
     pub cols: u16,
@@ -460,6 +463,8 @@ struct VmPtyResponseInternal {
 
 #[derive(Debug, Deserialize)]
 struct VmPtyOpenResultInternal {
+    #[serde(default)]
+    vm_id: Option<String>,
     session_id: String,
     #[serde(default)]
     initial_output: Option<String>,
@@ -571,6 +576,7 @@ mod tests {
         assert_eq!(
             result,
             VmPtyOpenResponse {
+                vm_id: None,
                 session_id: "session-123".to_string(),
                 initial_output: "welcome\n".to_string(),
                 cols: 100,

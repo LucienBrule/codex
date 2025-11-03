@@ -700,7 +700,7 @@ impl Session {
             )),
             summaries: Mutex::new(None),
             vm_pty_client: vm_pty_client.clone(),
-            pty_state: Mutex::new(None),
+            pty_sessions: Mutex::new(Default::default()),
         };
 
         let mailbox_liveness = if config.mailbox_liveness.enabled {
@@ -4357,7 +4357,7 @@ pub(crate) mod tests {
             )),
             summaries: Mutex::new(None),
             vm_pty_client: None,
-            pty_state: Mutex::new(None),
+            pty_sessions: Mutex::new(Default::default()),
         };
         let (mailbox_tx, _) = mailbox_channel(1);
         let session = Session {
@@ -4452,7 +4452,7 @@ pub(crate) mod tests {
             )),
             summaries: Mutex::new(None),
             vm_pty_client: None,
-            pty_state: Mutex::new(None),
+            pty_sessions: Mutex::new(Default::default()),
         };
         let (mailbox_tx, _) = mailbox_channel(1);
         let session = Arc::new(Session {

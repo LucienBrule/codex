@@ -2,8 +2,6 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use codex_protocol::models::PtyOpenToolCallParams;
-use serde_json::json;
-use std::env;
 use std::time::Duration;
 
 use crate::state::PtySessionState;
@@ -15,6 +13,7 @@ use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
 use crate::vm_pty::VmPtyOpenRequest;
+use tracing::info;
 
 use super::pty_common::map_vm_pty_error;
 
@@ -58,7 +57,7 @@ impl ToolHandler for PtyOpenHandler {
             })?
             .clone();
 
-        // Resolve vmId: use param, else configured default.
+        // Resolve vmId: use param, else configured default. Allow empty for handshake.
         let vm_id_param = params.vm_id.trim();
         let vm_id = if vm_id_param.is_empty() {
             turn
@@ -68,23 +67,24 @@ impl ToolHandler for PtyOpenHandler {
         } else {
             params.vm_id.clone()
         };
-        if vm_id.trim().is_empty() {
-            return Err(FunctionCallError::RespondToModel(
-                "pty_open requires vmId or CODEX_VM_PTY_VM_ID to be set".to_string(),
-            ));
-        }
 
         // Attach-first: try to reattach to an existing session.
-        if let Ok(attached) = client.pty_attach(&vm_id).await {
+        if !vm_id.trim().is_empty() {
+            if let Ok(attached) = client.pty_attach(&vm_id).await {
             let session_id = attached.session_id.clone();
                 {
-                    let mut guard = session.services.pty_state.lock().await;
-                    *guard = Some(PtySessionState {
+                    let mut guard = session.services.pty_sessions.lock().await;
+                    if guard.default_vm_id.is_none() {
+                        guard.default_vm_id = Some(vm_id.clone());
+                    }
+                    guard.sessions.insert(vm_id.clone(), PtySessionState {
+                        vm_id: vm_id.clone(),
                         session_id: session_id.clone(),
                         pending_output: None,
                     });
                 }
                 let output = serde_json::json!({
+                    "vm_id": vm_id,
                     "session_id": session_id,
                     "initial_output": "",
                     "cols": attached.cols,
@@ -92,11 +92,12 @@ impl ToolHandler for PtyOpenHandler {
                     "attached": true,
                 });
                 return Ok(ToolOutput::Function { content: output.to_string(), success: Some(true) });
+            }
         }
 
         // Build the open request with defaults.
         let mut request = build_open_request(&params, turn.as_ref());
-        request.vm_id = vm_id;
+        request.vm_id = vm_id.clone();
 
         // Bump timeout for pty_open (slow path on cold boots) using configured timeout.
         let client_open = client.with_request_timeout(turn.vm_pty_open_timeout);
@@ -104,9 +105,17 @@ impl ToolHandler for PtyOpenHandler {
 
         let session_id = response.session_id.clone();
         let initial_output = response.initial_output.clone();
+        let assigned_vm_id = response
+            .vm_id
+            .clone()
+            .unwrap_or_else(|| vm_id.clone());
         {
-            let mut guard = session.services.pty_state.lock().await;
-            *guard = Some(PtySessionState {
+            let mut guard = session.services.pty_sessions.lock().await;
+            if guard.default_vm_id.is_none() {
+                guard.default_vm_id = Some(assigned_vm_id.clone());
+            }
+            guard.sessions.insert(assigned_vm_id.clone(), PtySessionState {
+                vm_id: assigned_vm_id.clone(),
                 session_id: session_id.clone(),
                 pending_output: if initial_output.is_empty() {
                     None
@@ -117,11 +126,14 @@ impl ToolHandler for PtyOpenHandler {
         }
 
         let output = serde_json::json!({
+            "vm_id": assigned_vm_id,
             "session_id": session_id,
             "initial_output": initial_output,
             "cols": response.cols,
             "rows": response.rows,
         });
+
+        info!(target: "codex::vm_pty", vm_id = %assigned_vm_id, session_id = %session_id, "vm-pty session opened");
 
         Ok(ToolOutput::Function {
             content: output.to_string(),
