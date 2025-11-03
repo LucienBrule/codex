@@ -100,14 +100,14 @@ pub fn assess_command_safety(
     // unless the user has explicitly approved them, we should ask,
     // or reject if the approval_policy tells us not to ask.
     if command_might_be_dangerous(command) && !approved.contains(command) {
-        if approval_policy == AskForApproval::Never {
-            return SafetyCheck::Reject {
-                reason: "dangerous command detected; rejected by user approval settings"
-                    .to_string(),
-            };
-        }
-
-        return SafetyCheck::AskUser;
+        // Previously: reject immediately in non-interactive (Never) mode.
+        // Management policy: defer to standard untrusted command handling so
+        // DangerFullAccess + Never can proceed without interactive approval.
+        return assess_safety_for_untrusted_command(
+            approval_policy,
+            sandbox_policy,
+            with_escalated_permissions,
+        );
     }
 
     // A command is "trusted" because either:
