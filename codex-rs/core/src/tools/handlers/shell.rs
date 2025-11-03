@@ -2,6 +2,8 @@ use async_trait::async_trait;
 use codex_protocol::models::ShellToolCallParams;
 use std::sync::Arc;
 
+use super::pty_common::{ensure_session, map_vm_pty_error};
+
 use crate::codex::TurnContext;
 use crate::exec::ExecParams;
 use crate::exec_env::create_env;
@@ -61,6 +63,27 @@ impl ToolHandler for ShellHandler {
                             "failed to parse function arguments: {e:?}"
                         ))
                     })?;
+                // Route through VM PTY exec in PTY-enabled worker profiles.
+                if turn.tools_config.route_shell_via_pty {
+                    let (client, session_id) = ensure_session(&session, &turn).await?;
+                    // Join command tokens into a shell string.
+                    let cmd = shlex::try_join(params.command.iter().map(String::as_str))
+                        .unwrap_or_else(|_| params.command.join(" "));
+                    let result = client
+                        .pty_exec(&session_id, &cmd, params.timeout_ms, Some("stripped"))
+                        .await
+                        .map_err(map_vm_pty_error)?;
+                    let stdout = result
+                        .get("stdout")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| result.to_string());
+                    return Ok(ToolOutput::Function {
+                        content: stdout,
+                        success: Some(true),
+                    });
+                }
+
                 let exec_params = Self::to_exec_params(params, turn.as_ref());
                 let canonical_name = normalize_tool_name(tool_name.as_str());
                 let content = handle_container_exec_with_params(
@@ -73,10 +96,7 @@ impl ToolHandler for ShellHandler {
                     call_id.clone(),
                 )
                 .await?;
-                Ok(ToolOutput::Function {
-                    content,
-                    success: Some(true),
-                })
+                Ok(ToolOutput::Function { content, success: Some(true) })
             }
             ToolPayload::LocalShell { params } => {
                 let exec_params = Self::to_exec_params(params, turn.as_ref());

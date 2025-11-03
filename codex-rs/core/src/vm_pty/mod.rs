@@ -250,6 +250,46 @@ impl VmPtyClient {
         self.request_json("pty_read", &payload).await
     }
 
+    pub async fn pty_read_until(
+        &self,
+        session_id: &str,
+        pattern: &str,
+        timeout_ms: Option<u64>,
+        ansi: Option<&str>,
+    ) -> Result<JsonValue, VmPtyClientError> {
+        let mut payload = json!({
+            "session_id": session_id,
+            "pattern": pattern,
+        });
+        if let Some(ms) = timeout_ms {
+            payload["timeout_ms"] = json!(ms);
+        }
+        if let Some(a) = ansi {
+            payload["ansi"] = json!(a);
+        }
+        self.request_json("pty_read_until", &payload).await
+    }
+
+    pub async fn pty_exec(
+        &self,
+        session_id: &str,
+        cmd: &str,
+        timeout_ms: Option<u64>,
+        ansi: Option<&str>,
+    ) -> Result<JsonValue, VmPtyClientError> {
+        let mut payload = json!({
+            "session_id": session_id,
+            "cmd": cmd,
+        });
+        if let Some(ms) = timeout_ms {
+            payload["timeout_ms"] = json!(ms);
+        }
+        if let Some(a) = ansi {
+            payload["ansi"] = json!(a);
+        }
+        self.request_json("pty_exec", &payload).await
+    }
+
     pub async fn pty_attach(&self, vm_id: &str) -> Result<VmPtyAttachResponse, VmPtyClientError> {
         let response = self
             .perform_request("pty_attach", &json!({ "vm_id": vm_id }))

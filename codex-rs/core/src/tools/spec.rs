@@ -22,6 +22,7 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum ConfigShellToolType {
@@ -40,6 +41,7 @@ pub(crate) struct ToolsConfig {
     pub include_view_image_tool: bool,
     pub include_vm_pty_tool: bool,
     pub include_vm_pty_open_tool: bool,
+    pub route_shell_via_pty: bool,
     pub experimental_unified_exec_tool: bool,
     pub experimental_supported_tools: Vec<String>,
     pub debug_tools: bool,
@@ -55,6 +57,7 @@ pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) include_view_image_tool: bool,
     pub(crate) include_vm_pty_tool: bool,
     pub(crate) include_vm_pty_open_tool: bool,
+    pub(crate) route_shell_via_pty: bool,
     pub(crate) experimental_unified_exec_tool: bool,
     pub(crate) debug_tools: bool,
 }
@@ -103,6 +106,7 @@ impl ToolsConfig {
             include_view_image_tool: *include_view_image_tool,
             include_vm_pty_tool: *include_vm_pty_tool,
             include_vm_pty_open_tool: *include_vm_pty_open_tool,
+            route_shell_via_pty: params.route_shell_via_pty,
             experimental_unified_exec_tool: *experimental_unified_exec_tool,
             experimental_supported_tools: model_family.experimental_supported_tools.clone(),
             debug_tools: params.debug_tools,
@@ -438,6 +442,52 @@ fn create_pty_signal_tool() -> ToolSpec {
             required: Some(vec!["send".to_string()]),
             additional_properties: Some(false.into()),
         },
+    })
+}
+
+fn create_pty_read_until_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "pattern".to_string(),
+        JsonSchema::String { description: Some("Substring to wait for in the PTY output.".to_string()) },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number { description: Some("Maximum time to wait for the pattern, in milliseconds.".to_string()) },
+    );
+    properties.insert(
+        "ansi".to_string(),
+        JsonSchema::String { description: Some("ANSI handling: 'raw' (default) or 'stripped'.".to_string()) },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_read_until".to_string(),
+        description: "Reads from the active PTY until the pattern is seen or timeout elapses.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object { properties, required: Some(vec!["pattern".to_string()]), additional_properties: Some(false.into()) },
+    })
+}
+
+fn create_pty_exec_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "cmd".to_string(),
+        JsonSchema::String { description: Some("Shell command to execute inside the active PTY session.".to_string()) },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number { description: Some("Maximum time to wait for completion, in milliseconds.".to_string()) },
+    );
+    properties.insert(
+        "ansi".to_string(),
+        JsonSchema::String { description: Some("ANSI handling: 'raw' (default) or 'stripped'.".to_string()) },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_exec".to_string(),
+        description: "Executes a command inside the active PTY and returns stdout + exit code.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object { properties, required: Some(vec!["cmd".to_string()]), additional_properties: Some(false.into()) },
     })
 }
 
@@ -1781,6 +1831,13 @@ use crate::tools::handlers::PtySignalHandler;
 
         builder.push_spec(create_pty_signal_tool());
         builder.register_handler("pty_signal", pty_signal_handler.clone());
+
+        // High-level helpers
+        builder.push_spec(create_pty_read_until_tool());
+        builder.register_handler("pty_read_until", Arc::new(crate::tools::handlers::PtyReadUntilHandler));
+
+        builder.push_spec(create_pty_exec_tool());
+        builder.register_handler("pty_exec", Arc::new(crate::tools::handlers::PtyExecHandler));
     }
 
     if let Some(mcp_tools) = mcp_tools {
@@ -1866,6 +1923,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -1900,6 +1958,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -1936,6 +1995,7 @@ mod tests {
             include_view_image_tool: false,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -1961,6 +2021,7 @@ mod tests {
             include_view_image_tool: false,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: false,
             debug_tools: false,
         });
@@ -1997,6 +2058,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -2112,6 +2174,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -2198,6 +2261,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -2277,6 +2341,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -2351,6 +2416,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -2428,6 +2494,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -2501,6 +2568,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });
@@ -2578,6 +2646,7 @@ mod tests {
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
             debug_tools: false,
         });

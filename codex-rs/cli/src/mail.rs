@@ -1329,6 +1329,7 @@ async fn load_config(
         show_raw_agent_reasoning: None,
         tools_web_search_request: None,
         wait_policy: None,
+        cli_resolved_overrides: None,
     };
 
     let kv_overrides = cli_overrides.parse_overrides().map_err(|e| anyhow!(e))?;

@@ -658,6 +658,9 @@ impl Session {
         };
         let include_vm_pty_tool = config.include_vm_pty_tool && vm_pty_client.is_some();
         let include_vm_pty_open_tool = config.include_vm_pty_open_tool && include_vm_pty_tool;
+        let route_shell_via_pty = include_vm_pty_tool
+            && matches!(config.active_profile.as_deref(), Some("worker-pty-sandbox"));
+
         let turn_context = TurnContext {
             client,
             tools_config: ToolsConfig::new(&ToolsConfigParams {
@@ -670,6 +673,7 @@ impl Session {
                 include_view_image_tool: config.include_view_image_tool,
                 include_vm_pty_tool,
                 include_vm_pty_open_tool,
+                route_shell_via_pty,
                 experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
                 debug_tools: config.debug_tools,
             }),
@@ -2011,6 +2015,8 @@ async fn submission_loop(
                     config.include_vm_pty_tool && sess.services.vm_pty_client.is_some();
                 let include_vm_pty_open_tool =
                     config.include_vm_pty_open_tool && include_vm_pty_tool;
+                let route_shell_via_pty = include_vm_pty_tool
+                    && matches!(config.active_profile.as_deref(), Some("worker-pty-sandbox"));
                 let tools_config = ToolsConfig::new(&ToolsConfigParams {
                     model_family: &effective_family,
                     include_plan_tool: config.include_plan_tool,
@@ -2021,6 +2027,7 @@ async fn submission_loop(
                     include_view_image_tool: config.include_view_image_tool,
                     include_vm_pty_tool,
                     include_vm_pty_open_tool,
+                    route_shell_via_pty,
                     experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
                     debug_tools: config.debug_tools,
                 });
@@ -2125,6 +2132,8 @@ async fn submission_loop(
                                 && sess.services.vm_pty_client.is_some();
                             let include_vm_pty_open_tool =
                                 config.include_vm_pty_open_tool && include_vm_pty_tool;
+                            let route_shell_via_pty = include_vm_pty_tool
+                                && matches!(config.active_profile.as_deref(), Some("worker-pty-sandbox"));
                             ToolsConfig::new(&ToolsConfigParams {
                                 model_family: &model_family,
                                 include_plan_tool: config.include_plan_tool,
@@ -2136,6 +2145,7 @@ async fn submission_loop(
                                 include_view_image_tool: config.include_view_image_tool,
                                 include_vm_pty_tool,
                                 include_vm_pty_open_tool,
+                                route_shell_via_pty,
                                 experimental_unified_exec_tool: config
                                     .use_experimental_unified_exec_tool,
                                 debug_tools: config.debug_tools,
@@ -2678,6 +2688,7 @@ async fn spawn_review_thread(
         include_view_image_tool: false,
         include_vm_pty_tool: false,
         include_vm_pty_open_tool: false,
+        route_shell_via_pty: false,
         experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
         debug_tools: config.debug_tools,
     });
@@ -3791,6 +3802,7 @@ pub(crate) mod tests {
                 include_view_image_tool: config_arc.include_view_image_tool,
                 include_vm_pty_tool,
                 include_vm_pty_open_tool,
+                route_shell_via_pty: false,
                 experimental_unified_exec_tool: config_arc.use_experimental_unified_exec_tool,
                 debug_tools: config_arc.debug_tools,
             }),
@@ -4325,6 +4337,7 @@ pub(crate) mod tests {
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
             include_vm_pty_tool: config.include_vm_pty_tool,
             include_vm_pty_open_tool: config.include_vm_pty_open_tool,
+            route_shell_via_pty: false,
             debug_tools: config.debug_tools,
         });
         let turn_context = TurnContext {
@@ -4420,6 +4433,7 @@ pub(crate) mod tests {
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
             include_vm_pty_tool: config.include_vm_pty_tool,
             include_vm_pty_open_tool: config.include_vm_pty_open_tool,
+            route_shell_via_pty: false,
             debug_tools: config.debug_tools,
         });
         let turn_context = Arc::new(TurnContext {
