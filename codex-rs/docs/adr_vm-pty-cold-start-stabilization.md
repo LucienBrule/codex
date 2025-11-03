@@ -94,6 +94,13 @@ Operational Notes
 - Prefer group‑based libvirt access (no interactive sudo), with socket ACLs and polkit rule for org.libvirt.unix.manage.
 - Keep per‑run logs: server (.codex/codex/logs/ptyd-*.log), harness (.codex/codex/logs/scale*-*.log), artifacts (artifacts/qa/scale*-*.log).
 
+Artifacts (untracked)
+- artifacts/adr/vm-pty-cold-start-stabilization/scale5-1762206153-warmcold.log
+- artifacts/adr/vm-pty-cold-start-stabilization/scale10-1762207433-warmcold.log
+- artifacts/adr/vm-pty-cold-start-stabilization/scale5-1762205514.log
+
+Note: files under artifacts/adr are not tracked in version control; paths are for operator reference.
+
 Open Questions
 - Pool sizing policy: static N vs adaptive based on recent demand and boot rate.
 - Lease semantics for attach‑first when multiple clients contend for a warm VM.
@@ -106,4 +113,3 @@ Alternatives Considered
 References (from recent runs)
 - 5 workers, 25 iters: warm overall p95 ≈ 114 ms
 - 10 workers, 25 iters: warm overall p95 ≈ 118 ms; cold_open_ms p95 ≈ 98.7 s; cold_first_exec_ms p95 ≈ 75.2 s
-
