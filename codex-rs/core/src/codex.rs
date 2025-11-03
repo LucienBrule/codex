@@ -461,6 +461,7 @@ pub(crate) struct TurnContext {
     pub(crate) vm_pty_default_vm_id: Option<String>,
     pub(crate) vm_pty_open_timeout: std::time::Duration,
     pub(crate) vm_pty_open_blocking: bool,
+    pub(crate) vm_pty_max_concurrent_per_worker: Option<usize>,
     pub(crate) is_review_mode: bool,
     pub(crate) final_output_json_schema: Option<Value>,
 }
@@ -686,6 +687,7 @@ impl Session {
             vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
             vm_pty_open_timeout: config.vm_pty_open_timeout,
             vm_pty_open_blocking: config.vm_pty_open_blocking,
+            vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
             is_review_mode: false,
             final_output_json_schema: None,
         };
@@ -2044,6 +2046,7 @@ async fn submission_loop(
                     vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
                     vm_pty_open_timeout: config.vm_pty_open_timeout,
                     vm_pty_open_blocking: config.vm_pty_open_blocking,
+                    vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
                     is_review_mode: false,
                     final_output_json_schema: None,
                 };
@@ -2160,6 +2163,7 @@ async fn submission_loop(
                         vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
                         vm_pty_open_timeout: config.vm_pty_open_timeout,
                         vm_pty_open_blocking: config.vm_pty_open_blocking,
+                        vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
                         is_review_mode: false,
                         final_output_json_schema,
                     };
@@ -2740,6 +2744,7 @@ async fn spawn_review_thread(
         vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
         vm_pty_open_timeout: config.vm_pty_open_timeout,
         vm_pty_open_blocking: config.vm_pty_open_blocking,
+        vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
         is_review_mode: true,
         final_output_json_schema: None,
     };
@@ -3809,6 +3814,7 @@ pub(crate) mod tests {
             vm_pty_default_vm_id: config_arc.vm_pty_default_vm_id.clone(),
             vm_pty_open_timeout: config_arc.vm_pty_open_timeout,
             vm_pty_open_blocking: config_arc.vm_pty_open_blocking,
+            vm_pty_max_concurrent_per_worker: config_arc.vm_pty_max_concurrent_per_worker,
             is_review_mode: false,
             final_output_json_schema: None,
         });
@@ -4352,6 +4358,7 @@ pub(crate) mod tests {
             vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
             vm_pty_open_timeout: config.vm_pty_open_timeout,
             vm_pty_open_blocking: config.vm_pty_open_blocking,
+            vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
             is_review_mode: false,
             final_output_json_schema: None,
         };
@@ -4448,6 +4455,7 @@ pub(crate) mod tests {
             vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
             vm_pty_open_timeout: config.vm_pty_open_timeout,
             vm_pty_open_blocking: config.vm_pty_open_blocking,
+            vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
             is_review_mode: false,
             final_output_json_schema: None,
         });

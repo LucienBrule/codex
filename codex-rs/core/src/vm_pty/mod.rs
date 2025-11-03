@@ -309,6 +309,23 @@ impl VmPtyClient {
         Ok(VmPtyAttachResponse { session_id: parsed.session_id, cols: parsed.cols.unwrap_or(80), rows: parsed.rows.unwrap_or(24) })
     }
 
+    pub async fn pty_list(&self) -> Result<PtyListResponse, VmPtyClientError> {
+        let response = self.perform_request("pty_list", &json!({})).await?;
+        let VmPtyResponseInternal { id: _, status, ok, result, error } = response;
+        let success = matches!(status.as_deref(), Some("ok")) || ok.unwrap_or(false);
+        if !success {
+            let error = error.unwrap_or_default();
+            return Err(VmPtyClientError::Server {
+                code: error.code.unwrap_or_else(|| "E_UNKNOWN".to_string()),
+                message: error.message.unwrap_or_else(|| "vm-pty daemon reported an error".to_string()),
+            });
+        }
+        let result_value = result.ok_or(VmPtyClientError::MissingResult)?;
+        let parsed: PtyListResultInternal = serde_json::from_value(result_value)
+            .map_err(VmPtyClientError::Deserialize)?;
+        Ok(PtyListResponse { items: parsed.items })
+    }
+
     pub async fn pty_resize(
         &self,
         session_id: &str,
@@ -512,6 +529,24 @@ struct VmPtyOpenResultInternal {
     cols: Option<u16>,
     #[serde(default)]
     rows: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PtyListItem {
+    pub vm_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct PtyListResultInternal {
+    pub items: Vec<PtyListItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PtyListResponse {
+    pub items: Vec<PtyListItem>,
 }
 
 #[derive(Debug, Default, Deserialize)]

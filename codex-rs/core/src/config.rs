@@ -282,6 +282,8 @@ pub struct Config {
     pub vm_pty_open_timeout: Duration,
     /// If true, request a blocking open; when false (default), request nonblocking.
     pub vm_pty_open_blocking: bool,
+    /// Optional per-worker cap on concurrently open VM PTY sessions. When None or 0, unlimited.
+    pub vm_pty_max_concurrent_per_worker: Option<usize>,
 
     /// The active profile name used to derive this `Config` (if any).
     pub active_profile: Option<String>,
@@ -1341,6 +1343,8 @@ pub struct VmPtyToml {
     pub timeouts: VmPtyTimeoutsToml,
     /// Request a blocking open; defaults to nonblocking when unset.
     pub open_blocking: Option<bool>,
+    /// Optional per-worker cap on concurrently open VM PTY sessions.
+    pub max_concurrent_per_worker: Option<usize>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
@@ -1864,6 +1868,12 @@ impl Config {
             })
             .unwrap_or(false);
 
+        // Resolve optional per-worker concurrency cap for VM PTY sessions
+        let resolved_max_concurrent_per_worker = profile_vm_pty_cfg
+            .max_concurrent_per_worker
+            .or(base_vm_pty_cfg.max_concurrent_per_worker)
+            .filter(|n| *n > 0);
+
         // Resolve default vm id for pty_open/attach.
         let resolved_default_vm_id = cli_resolved_overrides
             .as_ref()
@@ -2008,6 +2018,7 @@ impl Config {
             vm_pty_request_timeout: resolved_request_timeout,
             vm_pty_open_timeout: resolved_open_timeout,
             vm_pty_open_blocking: resolved_open_blocking,
+            vm_pty_max_concurrent_per_worker: resolved_max_concurrent_per_worker,
             active_profile: active_profile_name,
             windows_wsl_setup_acknowledged: cfg.windows_wsl_setup_acknowledged.unwrap_or(false),
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
