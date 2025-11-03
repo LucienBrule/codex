@@ -31,6 +31,9 @@ pub(crate) struct ExecutorConfig {
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) sandbox_cwd: PathBuf,
     codex_linux_sandbox_exe: Option<PathBuf>,
+    /// Force running without any platform sandbox regardless of policy.
+    /// Used to guarantee fully unsandboxed behavior for the management profile.
+    pub(crate) force_no_sandbox: bool,
 }
 
 impl ExecutorConfig {
@@ -38,11 +41,13 @@ impl ExecutorConfig {
         sandbox_policy: SandboxPolicy,
         sandbox_cwd: PathBuf,
         codex_linux_sandbox_exe: Option<PathBuf>,
+        force_no_sandbox: bool,
     ) -> Self {
         Self {
             sandbox_policy,
             sandbox_cwd,
             codex_linux_sandbox_exe,
+            force_no_sandbox,
         }
     }
 }
