@@ -42,6 +42,7 @@ pub(crate) struct ToolsConfig {
     pub include_vm_pty_open_tool: bool,
     pub experimental_unified_exec_tool: bool,
     pub experimental_supported_tools: Vec<String>,
+    pub debug_tools: bool,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
@@ -55,6 +56,7 @@ pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) include_vm_pty_tool: bool,
     pub(crate) include_vm_pty_open_tool: bool,
     pub(crate) experimental_unified_exec_tool: bool,
+    pub(crate) debug_tools: bool,
 }
 
 impl ToolsConfig {
@@ -70,6 +72,7 @@ impl ToolsConfig {
             include_vm_pty_tool,
             include_vm_pty_open_tool,
             experimental_unified_exec_tool,
+            ..
         } = params;
         let shell_type = if *use_streamable_shell_tool {
             ConfigShellToolType::Streamable
@@ -102,6 +105,7 @@ impl ToolsConfig {
             include_vm_pty_open_tool: *include_vm_pty_open_tool,
             experimental_unified_exec_tool: *experimental_unified_exec_tool,
             experimental_supported_tools: model_family.experimental_supported_tools.clone(),
+            debug_tools: params.debug_tools,
         }
     }
 }
@@ -1829,11 +1833,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: true,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
-            include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(&config, Some(HashMap::new())).build();
 
@@ -1862,10 +1867,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: true,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(&config, Some(HashMap::new())).build();
 
@@ -1896,10 +1903,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: false,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: false,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(&config, None).build();
 
@@ -1919,10 +1928,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: false,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: false,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: false,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(&config, None).build();
 
@@ -1953,10 +1964,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(
             &config,
@@ -2066,10 +2079,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: false,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         // Intentionally construct a map with keys that would sort alphabetically.
@@ -2150,10 +2165,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let (tools, _) = build_specs(
@@ -2227,10 +2244,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let (tools, _) = build_specs(
@@ -2299,10 +2318,12 @@ mod tests {
             include_apply_patch_tool: true,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let (tools, _) = build_specs(
@@ -2374,10 +2395,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let (tools, _) = build_specs(
@@ -2445,10 +2468,12 @@ mod tests {
             include_apply_patch_tool: true,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: true,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let mcp_tools = HashMap::from([
@@ -2520,10 +2545,12 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(
             &config,

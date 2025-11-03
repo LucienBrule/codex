@@ -62,7 +62,7 @@ pub(crate) async fn ensure_session(
         .cloned()
         .ok_or_else(|| {
             FunctionCallError::RespondToModel(
-                "vm-pty tool is disabled; set CODEX_VM_PTY_SOCKET".to_string(),
+                "vm-pty tool is disabled; configure tools.vm_pty.socket and enable vm_pty lane".to_string(),
             )
         })?;
 
@@ -73,11 +73,14 @@ pub(crate) async fn ensure_session(
         }
     }
 
-    let vm_id = std::env::var("CODEX_VM_PTY_VM_ID").map_err(|_| {
-        FunctionCallError::RespondToModel(
-            "vm-pty worker missing CODEX_VM_PTY_VM_ID environment variable".to_string(),
-        )
-    })?;
+    let vm_id = turn
+        .vm_pty_default_vm_id
+        .clone()
+        .ok_or_else(|| {
+            FunctionCallError::RespondToModel(
+                "vm-pty worker missing default vm id; configure vm_pty.default_vm_id".to_string(),
+            )
+        })?;
 
     let workspace = turn.cwd.to_string_lossy().into_owned();
     let request = VmPtyOpenRequest::new(

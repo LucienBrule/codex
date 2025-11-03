@@ -60,28 +60,52 @@ fn spawn_vm_pty_server(
     let listener = UnixListener::from_std(std_listener).expect("convert listener");
 
     tokio::spawn(async move {
-        let (mut stream, _) = listener.accept().await.expect("accept client");
-        let mut reader = BufReader::new(stream);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.expect("read request");
+        for _ in 0..2 {
+            let (mut stream, _) = match listener.accept().await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.is_err() {
+                break;
+            }
 
-        let req_json: serde_json::Value =
-            serde_json::from_str(line.trim_end()).expect("request json");
-        {
-            let mut guard = captured.lock().await;
-            *guard = Some(req_json.clone());
+            let req_json: serde_json::Value = match serde_json::from_str(line.trim_end()) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            {
+                let mut guard = captured.lock().await;
+                *guard = Some(req_json.clone());
+            }
+
+            let mut stream = reader.into_inner();
+            // Respond with an error for pty_attach so pty_open path is exercised.
+            let resp_body = if req_json
+                .get("action")
+                .and_then(|v| v.as_str())
+                .map(|s| s == "pty_attach")
+                .unwrap_or(false)
+            {
+                serde_json::json!({
+                    "id": req_json.get("id").and_then(|v| v.as_str()).unwrap_or(""),
+                    "status": "error",
+                    "error": {"code": "E_NO_ATTACH", "message": "attach disabled"}
+                })
+            } else {
+                let mut response_json = response.clone();
+                if let Some(request_id) = req_json.get("id").and_then(|v| v.as_str()) {
+                    response_json["id"] = serde_json::Value::String(request_id.to_string());
+                }
+                response_json
+            };
+
+            let mut payload = resp_body.to_string().into_bytes();
+            payload.push(b'\n');
+            let _ = stream.write_all(&payload).await;
+            let _ = stream.flush().await;
         }
-
-        let mut response_json = response;
-        if let Some(request_id) = req_json.get("id").and_then(|v| v.as_str()) {
-            response_json["id"] = serde_json::Value::String(request_id.to_string());
-        }
-
-        let mut stream = reader.into_inner();
-        let mut payload = response_json.to_string().into_bytes();
-        payload.push(b'\n');
-        stream.write_all(&payload).await.expect("write response");
-        stream.flush().await.expect("flush response");
     })
 }
 
@@ -118,8 +142,6 @@ async fn pty_open_returns_session_details() -> Result<()> {
         captured.clone(),
     );
 
-    let _env_guard = EnvGuard::set("CODEX_VM_PTY_SOCKET", socket_path.as_os_str());
-
     println!("socket exists immediately: {}", socket_path.exists());
     sleep(Duration::from_millis(50)).await;
     wait_for_socket(&socket_path).await;
@@ -147,8 +169,10 @@ async fn pty_open_returns_session_details() -> Result<()> {
     ]);
     let response_mock = mount_sse_once_match(&mock_server, wiremock::matchers::any(), second_response).await;
 
-    let mut builder = test_codex().with_config(|config| {
+    let mut builder = test_codex().with_config(move |config| {
         config.include_vm_pty_tool = true;
+        config.include_vm_pty_open_tool = true;
+        config.vm_pty_socket = Some(socket_path.clone());
     });
     let test = builder.build(&mock_server).await?;
 
@@ -239,6 +263,7 @@ async fn pty_open_reports_invalid_vm_error() -> Result<()> {
 
     let mut builder = test_codex().with_config(|config| {
         config.include_vm_pty_tool = true;
+        config.include_vm_pty_open_tool = true;
     });
     let test = builder.build(&mock_server).await?;
 
@@ -266,7 +291,7 @@ async fn pty_open_reports_invalid_vm_error() -> Result<()> {
         .get("output")
         .and_then(Value::as_str)
         .expect("function output string");
-    assert!(output_text.contains("pty_open failed (E_NO_VM): vm not found"));
+    assert!(output_text.contains("pty request failed (E_NO_VM): vm not found"));
 
     let recorded_request = captured.lock().await.clone().expect("captured request");
     assert_eq!(recorded_request["payload"]["vm_id"], "missing-vm");

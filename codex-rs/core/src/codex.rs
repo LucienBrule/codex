@@ -457,6 +457,10 @@ pub(crate) struct TurnContext {
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
     pub(crate) tools_config: ToolsConfig,
+    // Resolved vm-pty defaults
+    pub(crate) vm_pty_default_vm_id: Option<String>,
+    pub(crate) vm_pty_open_timeout: std::time::Duration,
+    pub(crate) vm_pty_open_blocking: bool,
     pub(crate) is_review_mode: bool,
     pub(crate) final_output_json_schema: Option<Value>,
 }
@@ -640,16 +644,14 @@ impl Session {
             conversation_id,
         );
         let vm_pty_client = if config.include_vm_pty_tool {
-            match VmPtyClient::from_env() {
-                Ok(Some(client)) => Some(Arc::new(client)),
-                Ok(None) => {
-                    warn!("pty_open tool enabled but CODEX_VM_PTY_SOCKET is unset; disabling tool");
-                    None
-                }
-                Err(err) => {
-                    warn!("failed to initialize vm-pty client: {err}; disabling pty_open tool");
-                    None
-                }
+            if let Some(endpoint) = &config.vm_pty_socket {
+                Some(Arc::new(VmPtyClient::new(
+                    endpoint.clone(),
+                    config.vm_pty_connect_timeout,
+                    config.vm_pty_request_timeout,
+                )))
+            } else {
+                None
             }
         } else {
             None
@@ -669,6 +671,7 @@ impl Session {
                 include_vm_pty_tool,
                 include_vm_pty_open_tool,
                 experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                debug_tools: config.debug_tools,
             }),
             user_instructions,
             base_instructions,
@@ -676,6 +679,9 @@ impl Session {
             sandbox_policy,
             shell_environment_policy: config.shell_environment_policy.clone(),
             cwd,
+            vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+            vm_pty_open_timeout: config.vm_pty_open_timeout,
+            vm_pty_open_blocking: config.vm_pty_open_blocking,
             is_review_mode: false,
             final_output_json_schema: None,
         };
@@ -2016,6 +2022,7 @@ async fn submission_loop(
                     include_vm_pty_tool,
                     include_vm_pty_open_tool,
                     experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                    debug_tools: config.debug_tools,
                 });
 
                 let new_turn_context = TurnContext {
@@ -2027,6 +2034,9 @@ async fn submission_loop(
                     sandbox_policy: new_sandbox_policy.clone(),
                     shell_environment_policy: prev.shell_environment_policy.clone(),
                     cwd: new_cwd.clone(),
+                    vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+                    vm_pty_open_timeout: config.vm_pty_open_timeout,
+                    vm_pty_open_blocking: config.vm_pty_open_blocking,
                     is_review_mode: false,
                     final_output_json_schema: None,
                 };
@@ -2128,6 +2138,7 @@ async fn submission_loop(
                                 include_vm_pty_open_tool,
                                 experimental_unified_exec_tool: config
                                     .use_experimental_unified_exec_tool,
+                                debug_tools: config.debug_tools,
                             })
                         },
                         user_instructions: turn_context.user_instructions.clone(),
@@ -2136,6 +2147,9 @@ async fn submission_loop(
                         sandbox_policy,
                         shell_environment_policy: turn_context.shell_environment_policy.clone(),
                         cwd,
+                        vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+                        vm_pty_open_timeout: config.vm_pty_open_timeout,
+                        vm_pty_open_blocking: config.vm_pty_open_blocking,
                         is_review_mode: false,
                         final_output_json_schema,
                     };
@@ -2665,6 +2679,7 @@ async fn spawn_review_thread(
         include_vm_pty_tool: false,
         include_vm_pty_open_tool: false,
         experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+        debug_tools: config.debug_tools,
     });
 
     let base_instructions = REVIEW_PROMPT.to_string();
@@ -2711,6 +2726,9 @@ async fn spawn_review_thread(
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
         cwd: parent_turn_context.cwd.clone(),
+        vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+        vm_pty_open_timeout: config.vm_pty_open_timeout,
+        vm_pty_open_blocking: config.vm_pty_open_blocking,
         is_review_mode: true,
         final_output_json_schema: None,
     };
@@ -3774,7 +3792,11 @@ pub(crate) mod tests {
                 include_vm_pty_tool,
                 include_vm_pty_open_tool,
                 experimental_unified_exec_tool: config_arc.use_experimental_unified_exec_tool,
+                debug_tools: config_arc.debug_tools,
             }),
+            vm_pty_default_vm_id: config_arc.vm_pty_default_vm_id.clone(),
+            vm_pty_open_timeout: config_arc.vm_pty_open_timeout,
+            vm_pty_open_blocking: config_arc.vm_pty_open_blocking,
             is_review_mode: false,
             final_output_json_schema: None,
         });
@@ -4303,6 +4325,7 @@ pub(crate) mod tests {
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
             include_vm_pty_tool: config.include_vm_pty_tool,
             include_vm_pty_open_tool: config.include_vm_pty_open_tool,
+            debug_tools: config.debug_tools,
         });
         let turn_context = TurnContext {
             client,
@@ -4313,6 +4336,9 @@ pub(crate) mod tests {
             sandbox_policy: config.sandbox_policy.clone(),
             shell_environment_policy: config.shell_environment_policy.clone(),
             tools_config,
+            vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+            vm_pty_open_timeout: config.vm_pty_open_timeout,
+            vm_pty_open_blocking: config.vm_pty_open_blocking,
             is_review_mode: false,
             final_output_json_schema: None,
         };
@@ -4394,6 +4420,7 @@ pub(crate) mod tests {
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
             include_vm_pty_tool: config.include_vm_pty_tool,
             include_vm_pty_open_tool: config.include_vm_pty_open_tool,
+            debug_tools: config.debug_tools,
         });
         let turn_context = Arc::new(TurnContext {
             client,
@@ -4404,6 +4431,9 @@ pub(crate) mod tests {
             sandbox_policy: config.sandbox_policy.clone(),
             shell_environment_policy: config.shell_environment_policy.clone(),
             tools_config,
+            vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+            vm_pty_open_timeout: config.vm_pty_open_timeout,
+            vm_pty_open_blocking: config.vm_pty_open_blocking,
             is_review_mode: false,
             final_output_json_schema: None,
         });

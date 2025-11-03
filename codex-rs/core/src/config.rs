@@ -76,6 +76,11 @@ const DEFAULT_MAILBOX_LIVENESS_STALLED_AFTER: Duration = Duration::from_secs(12)
 const DEFAULT_MAILBOX_LIVENESS_EMIT_INTERVAL: Duration = Duration::from_secs(5);
 const MIN_MAILBOX_LIVENESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
 
+// Defaults mirrored from vm_pty client behaviour.
+const DEFAULT_VM_PTY_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
+const DEFAULT_VM_PTY_REQUEST_TIMEOUT: Duration = Duration::from_millis(5_000);
+const DEFAULT_VM_PTY_OPEN_TIMEOUT: Duration = Duration::from_millis(90_000);
+
 pub(crate) const CONFIG_TOML_FILE: &str = "config.toml";
 
 /// Ensure the Codex home directory exists.
@@ -261,6 +266,22 @@ pub struct Config {
 
     /// Whether to expose the management-only pty_open tool.
     pub include_vm_pty_open_tool: bool,
+
+    /// When true, print enabled tool list for debugging.
+    pub debug_tools: bool,
+
+    /// Resolved vm-pty socket endpoint, if configured.
+    pub vm_pty_socket: Option<PathBuf>,
+    /// Default vm id to use when a tool call does not specify one.
+    pub vm_pty_default_vm_id: Option<String>,
+    /// Timeout for connecting to the vm-pty daemon.
+    pub vm_pty_connect_timeout: Duration,
+    /// Timeout for individual vm-pty requests.
+    pub vm_pty_request_timeout: Duration,
+    /// Timeout to use specifically for the pty_open call (can be higher on cold boots).
+    pub vm_pty_open_timeout: Duration,
+    /// If true, request a blocking open; when false (default), request nonblocking.
+    pub vm_pty_open_blocking: bool,
 
     /// The active profile name used to derive this `Config` (if any).
     pub active_profile: Option<String>,
@@ -608,6 +629,8 @@ impl Config {
         overrides: ConfigOverrides,
     ) -> std::io::Result<Self> {
         let codex_home = find_codex_home()?;
+        // Capture CLI overrides for post-profile precedence on select keys.
+        let overrides_for_resolution = cli_overrides.clone();
 
         let root_value = load_resolved_config(
             &codex_home,
@@ -621,8 +644,101 @@ impl Config {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
 
+        let mut overrides = overrides;
+        overrides.cli_resolved_overrides = extract_cli_resolved_overrides(&overrides_for_resolution);
+
         Self::load_from_base_config_with_overrides(cfg, overrides, codex_home)
     }
+}
+
+fn extract_cli_resolved_overrides(
+    cli_overrides: &[(String, TomlValue)],
+) -> Option<CliResolvedOverrides> {
+    let mut out = CliResolvedOverrides::default();
+    let mut any = false;
+
+    for (path, value) in cli_overrides.iter() {
+        match path.as_str() {
+            "tools.vm_pty.socket" => {
+                if let Some(s) = value.as_str() {
+                    out.vm_pty_socket = Some(PathBuf::from(s));
+                    any = true;
+                }
+            }
+            "vm_pty.default_vm_id" => {
+                if let Some(s) = value.as_str() {
+                    out.vm_pty_default_vm_id = Some(s.to_string());
+                    any = true;
+                }
+            }
+            "vm_pty.timeouts.connect_ms" => {
+                if let Some(v) = value.as_integer() {
+                    out.vm_pty_timeouts.connect_ms = Some(v as u64);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    if let Ok(parsed) = s.trim().parse::<u64>() {
+                        out.vm_pty_timeouts.connect_ms = Some(parsed);
+                        any = true;
+                    }
+                }
+            }
+            "vm_pty.timeouts.request_ms" => {
+                if let Some(v) = value.as_integer() {
+                    out.vm_pty_timeouts.request_ms = Some(v as u64);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    if let Ok(parsed) = s.trim().parse::<u64>() {
+                        out.vm_pty_timeouts.request_ms = Some(parsed);
+                        any = true;
+                    }
+                }
+            }
+            "vm_pty.timeouts.open_ms" => {
+                if let Some(v) = value.as_integer() {
+                    out.vm_pty_timeouts.open_ms = Some(v as u64);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    if let Ok(parsed) = s.trim().parse::<u64>() {
+                        out.vm_pty_timeouts.open_ms = Some(parsed);
+                        any = true;
+                    }
+                }
+            }
+            "vm_pty.open_blocking" => {
+                if let Some(b) = value.as_bool() {
+                    out.vm_pty_open_blocking = Some(b);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    let sl = s.trim().to_ascii_lowercase();
+                    if matches!(sl.as_str(), "1" | "true" | "yes") {
+                        out.vm_pty_open_blocking = Some(true);
+                        any = true;
+                    } else if matches!(sl.as_str(), "0" | "false" | "no") {
+                        out.vm_pty_open_blocking = Some(false);
+                        any = true;
+                    }
+                }
+            }
+            "debug.tools" => {
+                if let Some(b) = value.as_bool() {
+                    out.debug_tools = Some(b);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    let sl = s.trim().to_ascii_lowercase();
+                    if matches!(sl.as_str(), "1" | "true" | "yes") {
+                        out.debug_tools = Some(true);
+                        any = true;
+                    } else if matches!(sl.as_str(), "0" | "false" | "no") {
+                        out.debug_tools = Some(false);
+                        any = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if any { Some(out) } else { None }
 }
 
 pub async fn load_config_as_toml_with_cli_overrides(
@@ -1129,6 +1245,10 @@ pub struct ConfigToml {
     #[serde(default)]
     pub vm_pty: VmPtyToml,
 
+    /// Debug toggles.
+    #[serde(default)]
+    pub debug: Option<DebugToml>,
+
     /// When true, disables burst-paste detection for typed input entirely.
     /// All characters are inserted as they are received, and no buffering
     /// or placeholder replacement will occur for fast keypress bursts.
@@ -1199,12 +1319,36 @@ pub struct ToolsToml {
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(default)]
+pub struct DebugToml {
+    /// When true, print the enabled tool list at startup.
+    pub tools: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
 pub struct VmPtyToml {
     /// Global feature flag for the VM-backed PTY lane.
     pub enabled: Option<bool>,
     /// Active profile names that are allowed to use the PTY lane.
     #[serde(default)]
     pub allow_profiles: Vec<String>,
+    /// Optional vm-pty daemon socket path.
+    pub socket: Option<PathBuf>,
+    /// Default VM identifier to target when omitted by tool params.
+    pub default_vm_id: Option<String>,
+    /// Millisecond timeout knobs for vm-pty.
+    #[serde(default)]
+    pub timeouts: VmPtyTimeoutsToml,
+    /// Request a blocking open; defaults to nonblocking when unset.
+    pub open_blocking: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct VmPtyTimeoutsToml {
+    pub connect_ms: Option<u64>,
+    pub request_ms: Option<u64>,
+    pub open_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
@@ -1382,6 +1526,25 @@ pub struct ConfigOverrides {
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
     pub wait_policy: Option<WaitPolicyOverrides>,
+    /// High-precedence resolved overrides derived from `-c key=value` CLI flags.
+    /// These apply after profile selection to enforce CLI > profile > project > env > defaults.
+    pub cli_resolved_overrides: Option<CliResolvedOverrides>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct CliResolvedOverrides {
+    pub vm_pty_socket: Option<PathBuf>,
+    pub vm_pty_default_vm_id: Option<String>,
+    pub vm_pty_timeouts: CliVmPtyTimeouts,
+    pub vm_pty_open_blocking: Option<bool>,
+    pub debug_tools: Option<bool>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct CliVmPtyTimeouts {
+    pub connect_ms: Option<u64>,
+    pub request_ms: Option<u64>,
+    pub open_ms: Option<u64>,
 }
 
 impl Config {
@@ -1411,6 +1574,7 @@ impl Config {
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
             wait_policy: wait_policy_override,
+            cli_resolved_overrides,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -1521,11 +1685,11 @@ impl Config {
             allowed && !denied
         };
 
+        // Resolve vm-pty settings with precedence: profile > project config > env > defaults.
         let legacy_vm_pty_enabled = cfg.experimental_use_unified_exec_tool.unwrap_or(false);
         // Prefer nested tools.vm_pty if provided; fall back to top-level vm_pty for backward-compat.
-        let vm_pty_cfg = if let Some(t) = &cfg.tools {
+        let base_vm_pty_cfg = if let Some(t) = &cfg.tools {
             let mut nested = t.vm_pty.clone();
-            // If nested contains no settings, fall back to top-level.
             if nested.enabled.is_none() && nested.allow_profiles.is_empty() {
                 cfg.vm_pty.clone()
             } else {
@@ -1534,23 +1698,56 @@ impl Config {
         } else {
             cfg.vm_pty.clone()
         };
-        let mut vm_pty_allowed_profiles: Vec<String> = vm_pty_cfg
-            .allow_profiles
-            .into_iter()
-            .map(|profile| profile.trim().to_ascii_lowercase())
-            .filter(|profile| !profile.is_empty())
-            .collect();
+        let profile_vm_pty_cfg = config_profile
+            .tools
+            .as_ref()
+            .map(|t| t.vm_pty.clone())
+            .unwrap_or_default();
+        let vm_pty_enabled = profile_vm_pty_cfg
+            .enabled
+            .or(base_vm_pty_cfg.enabled)
+            .unwrap_or(legacy_vm_pty_enabled);
+        let mut vm_pty_allowed_profiles: Vec<String> = {
+            let from_profile = if !profile_vm_pty_cfg.allow_profiles.is_empty() {
+                profile_vm_pty_cfg.allow_profiles.clone()
+            } else {
+                base_vm_pty_cfg.allow_profiles.clone()
+            };
+            from_profile
+                .into_iter()
+                .map(|profile| profile.trim().to_ascii_lowercase())
+                .filter(|profile| !profile.is_empty())
+                .collect()
+        };
         vm_pty_allowed_profiles.sort_unstable();
         vm_pty_allowed_profiles.dedup();
-        let vm_pty_requested = vm_pty_cfg.enabled.unwrap_or(legacy_vm_pty_enabled);
-        let vm_pty_flag_enabled = if vm_pty_requested && !vm_pty::is_configured() {
+
+        // Socket resolution: CLI > profile > project config > env.
+        let cli_vm_pty_socket = cli_resolved_overrides
+            .as_ref()
+            .and_then(|o| o.vm_pty_socket.clone());
+        let resolved_vm_pty_socket: Option<PathBuf> = cli_vm_pty_socket
+            .or(profile_vm_pty_cfg.socket)
+            .or(base_vm_pty_cfg.socket.clone())
+            .or_else(|| {
+                if let Ok(v) = std::env::var("CODEX_VM_PTY_SOCKET") {
+                    let trimmed = v.trim();
+                    if !trimmed.is_empty() {
+                        warn!(target: "codex::config", "Using CODEX_VM_PTY_SOCKET from environment; prefer -c tools.vm_pty.socket or config.toml");
+                        return Some(PathBuf::from(trimmed));
+                    }
+                }
+                None
+            });
+
+        let vm_pty_flag_enabled = if vm_pty_enabled && resolved_vm_pty_socket.is_none() {
             warn!(
                 target: "codex::config",
-                "vm-pty lane enabled but CODEX_VM_PTY_SOCKET is not configured; disabling pty_open tool"
+                "vm-pty lane enabled but tools.vm_pty.socket is not configured; disabling pty_open tool"
             );
             false
         } else {
-            vm_pty_requested
+            vm_pty_enabled
         };
         let vm_pty_profile_allowlisted = if vm_pty_flag_enabled {
             match active_profile_name.as_ref() {
@@ -1598,6 +1795,94 @@ impl Config {
                 .apply_override(overrides)
                 .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
         }
+
+        // Resolve vm-pty timeouts with precedence: CLI > profile > project > env > default.
+        let cli_timeouts = cli_resolved_overrides.as_ref().map(|o| &o.vm_pty_timeouts);
+        let resolved_connect_timeout = cli_timeouts
+            .and_then(|t| t.connect_ms.map(Duration::from_millis))
+            .or(profile_vm_pty_cfg
+                .timeouts
+                .connect_ms
+                .map(Duration::from_millis))
+            .or(base_vm_pty_cfg
+                .timeouts
+                .connect_ms
+                .map(Duration::from_millis))
+            .or_else(|| {
+                std::env::var("CODEX_VM_PTY_CONNECT_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(Duration::from_millis)
+            })
+            .unwrap_or(DEFAULT_VM_PTY_CONNECT_TIMEOUT);
+
+        let resolved_request_timeout = cli_timeouts
+            .and_then(|t| t.request_ms.map(Duration::from_millis))
+            .or(profile_vm_pty_cfg
+                .timeouts
+                .request_ms
+                .map(Duration::from_millis))
+            .or(base_vm_pty_cfg
+                .timeouts
+                .request_ms
+                .map(Duration::from_millis))
+            .or_else(|| {
+                std::env::var("CODEX_VM_PTY_REQUEST_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(Duration::from_millis)
+            })
+            .unwrap_or(DEFAULT_VM_PTY_REQUEST_TIMEOUT);
+
+        let resolved_open_timeout = cli_timeouts
+            .and_then(|t| t.open_ms.map(Duration::from_millis))
+            .or(profile_vm_pty_cfg
+                .timeouts
+                .open_ms
+                .map(Duration::from_millis))
+            .or(base_vm_pty_cfg
+                .timeouts
+                .open_ms
+                .map(Duration::from_millis))
+            .or_else(|| {
+                std::env::var("CODEX_VM_PTY_OPEN_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(Duration::from_millis)
+            })
+            .unwrap_or(DEFAULT_VM_PTY_OPEN_TIMEOUT);
+
+        let resolved_open_blocking = cli_resolved_overrides
+            .as_ref()
+            .and_then(|o| o.vm_pty_open_blocking)
+            .or(profile_vm_pty_cfg.open_blocking)
+            .or(base_vm_pty_cfg.open_blocking)
+            .or_else(|| {
+                let v = std::env::var("CODEX_VM_PTY_OPEN_BLOCKING").unwrap_or_default();
+                let b = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+                Some(b)
+            })
+            .unwrap_or(false);
+
+        // Resolve default vm id for pty_open/attach.
+        let resolved_default_vm_id = cli_resolved_overrides
+            .as_ref()
+            .and_then(|o| o.vm_pty_default_vm_id.clone())
+            .or(profile_vm_pty_cfg.default_vm_id)
+            .or(base_vm_pty_cfg.default_vm_id)
+            .or_else(|| std::env::var("CODEX_VM_PTY_VM_ID").ok());
+
+        // Debug tools gate precedence: CLI > profile > project > env > default(false)
+        let debug_tools = cli_resolved_overrides
+            .as_ref()
+            .and_then(|o| o.debug_tools)
+            .or(config_profile
+                .debug
+                .as_ref()
+                .and_then(|d| d.tools))
+            .or(cfg.debug.as_ref().and_then(|d| d.tools))
+            .or_else(|| (std::env::var("CODEX_DEBUG_TOOLS").as_deref() == Ok("1")).then_some(true))
+            .unwrap_or(false);
 
         let mut model_family =
             find_family_for_model(&model).unwrap_or_else(|| derive_default_model_family(&model));
@@ -1716,6 +2001,13 @@ impl Config {
             include_shell_tool,
             include_vm_pty_tool,
             include_vm_pty_open_tool,
+            debug_tools,
+            vm_pty_socket: resolved_vm_pty_socket,
+            vm_pty_default_vm_id: resolved_default_vm_id,
+            vm_pty_connect_timeout: resolved_connect_timeout,
+            vm_pty_request_timeout: resolved_request_timeout,
+            vm_pty_open_timeout: resolved_open_timeout,
+            vm_pty_open_blocking: resolved_open_blocking,
             active_profile: active_profile_name,
             windows_wsl_setup_acknowledged: cfg.windows_wsl_setup_acknowledged.unwrap_or(false),
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
@@ -2124,13 +2416,13 @@ persistence = "none"
         let cwd = tempfile::tempdir().expect("cwd");
         let socket_dir = tempfile::tempdir().expect("socket_dir");
         let socket_path = socket_dir.path().join("pty.sock");
-        let _socket_guard = EnvVarGuard::set_os(
-            "CODEX_VM_PTY_SOCKET",
-            socket_path.as_os_str(),
-        );
         let mut cfg = ConfigToml::default();
         cfg.vm_pty.enabled = Some(true);
         cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(socket_path.clone()), ..Default::default() },
+            ..Default::default()
+        });
         cfg.profiles
             .insert("workers".to_string(), ConfigProfile::default());
         cfg.profiles
@@ -2163,13 +2455,13 @@ persistence = "none"
         let cwd = tempfile::tempdir().expect("cwd");
         let socket_dir = tempfile::tempdir().expect("socket_dir");
         let socket_path = socket_dir.path().join("pty.sock");
-        let _socket_guard = EnvVarGuard::set_os(
-            "CODEX_VM_PTY_SOCKET",
-            socket_path.as_os_str(),
-        );
         let mut cfg = ConfigToml::default();
         cfg.vm_pty.enabled = Some(true);
         cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(socket_path.clone()), ..Default::default() },
+            ..Default::default()
+        });
         cfg.profiles
             .insert("management".to_string(), ConfigProfile::default());
 
@@ -2963,6 +3255,13 @@ model_verbosity = "high"
                 include_shell_tool: true,
                 include_vm_pty_tool: false,
                 include_vm_pty_open_tool: false,
+                debug_tools: false,
+                vm_pty_socket: None,
+                vm_pty_default_vm_id: None,
+                vm_pty_connect_timeout: DEFAULT_VM_PTY_CONNECT_TIMEOUT,
+                vm_pty_request_timeout: DEFAULT_VM_PTY_REQUEST_TIMEOUT,
+                vm_pty_open_timeout: DEFAULT_VM_PTY_OPEN_TIMEOUT,
+                vm_pty_open_blocking: false,
                 active_profile: Some("o3".to_string()),
                 windows_wsl_setup_acknowledged: false,
                 disable_paste_burst: false,
@@ -3032,6 +3331,13 @@ model_verbosity = "high"
             include_shell_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            debug_tools: false,
+            vm_pty_socket: None,
+            vm_pty_default_vm_id: None,
+            vm_pty_connect_timeout: DEFAULT_VM_PTY_CONNECT_TIMEOUT,
+            vm_pty_request_timeout: DEFAULT_VM_PTY_REQUEST_TIMEOUT,
+            vm_pty_open_timeout: DEFAULT_VM_PTY_OPEN_TIMEOUT,
+            vm_pty_open_blocking: false,
             active_profile: Some("gpt3".to_string()),
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
@@ -3116,6 +3422,13 @@ model_verbosity = "high"
             include_shell_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            debug_tools: false,
+            vm_pty_socket: None,
+            vm_pty_default_vm_id: None,
+            vm_pty_connect_timeout: DEFAULT_VM_PTY_CONNECT_TIMEOUT,
+            vm_pty_request_timeout: DEFAULT_VM_PTY_REQUEST_TIMEOUT,
+            vm_pty_open_timeout: DEFAULT_VM_PTY_OPEN_TIMEOUT,
+            vm_pty_open_blocking: false,
             active_profile: Some("zdr".to_string()),
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
@@ -3186,6 +3499,13 @@ model_verbosity = "high"
             include_shell_tool: true,
             include_vm_pty_tool: false,
             include_vm_pty_open_tool: false,
+            debug_tools: false,
+            vm_pty_socket: None,
+            vm_pty_default_vm_id: None,
+            vm_pty_connect_timeout: DEFAULT_VM_PTY_CONNECT_TIMEOUT,
+            vm_pty_request_timeout: DEFAULT_VM_PTY_REQUEST_TIMEOUT,
+            vm_pty_open_timeout: DEFAULT_VM_PTY_OPEN_TIMEOUT,
+            vm_pty_open_blocking: false,
             active_profile: Some("gpt5".to_string()),
             windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
@@ -3335,5 +3655,191 @@ mod notifications_tests {
             parsed.tui.notifications,
             Notifications::Custom(ref v) if v == &vec!["foo".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod vm_pty_precedence_tests {
+    use super::*;
+    use serial_test::serial;
+
+    struct LocalEnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl LocalEnvGuard {
+        fn set_os(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for LocalEnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(val) => unsafe { std::env::set_var(self.key, val) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn vm_pty_socket_env_fallback_when_unset_in_config() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let socket_dir = tempfile::tempdir().expect("socket_dir");
+        let socket_path = socket_dir.path().join("env.sock");
+        let _guard = LocalEnvGuard::set_os("CODEX_VM_PTY_SOCKET", socket_path.as_os_str());
+
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.profiles
+            .insert("management".to_string(), ConfigProfile::default());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("management".to_string());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert!(config.include_vm_pty_tool);
+        assert_eq!(config.vm_pty_socket.as_deref(), Some(socket_path.as_path()));
+    }
+
+    #[test]
+    fn vm_pty_socket_profile_beats_project() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let base_socket_dir = tempfile::tempdir().expect("base_socket_dir");
+        let base_socket = base_socket_dir.path().join("base.sock");
+        let profile_socket_dir = tempfile::tempdir().expect("profile_socket_dir");
+        let profile_socket = profile_socket_dir.path().join("profile.sock");
+
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(base_socket.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        let mut profile = ConfigProfile::default();
+        profile.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(profile_socket.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        cfg.profiles.insert("management".to_string(), profile);
+        cfg.profile = Some("management".to_string());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("management".to_string());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert_eq!(config.vm_pty_socket.as_deref(), Some(profile_socket.as_path()));
+    }
+
+    #[test]
+    fn vm_pty_socket_cli_beats_profile_and_env() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let base_socket_dir = tempfile::tempdir().expect("base_socket_dir");
+        let base_socket = base_socket_dir.path().join("base.sock");
+        let profile_socket_dir = tempfile::tempdir().expect("profile_socket_dir");
+        let profile_socket = profile_socket_dir.path().join("profile.sock");
+        let cli_socket_dir = tempfile::tempdir().expect("cli_socket_dir");
+        let cli_socket = cli_socket_dir.path().join("cli.sock");
+
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(base_socket.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        let mut profile = ConfigProfile::default();
+        profile.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(profile_socket.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        cfg.profiles.insert("management".to_string(), profile);
+        cfg.profile = Some("management".to_string());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("management".to_string());
+        overrides.cli_resolved_overrides = Some(CliResolvedOverrides {
+            vm_pty_socket: Some(cli_socket.clone()),
+            vm_pty_default_vm_id: None,
+            vm_pty_timeouts: CliVmPtyTimeouts::default(),
+            vm_pty_open_blocking: None,
+            debug_tools: None,
+        });
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert_eq!(config.vm_pty_socket.as_deref(), Some(cli_socket.as_path()));
+    }
+
+    #[test]
+    #[serial]
+    fn debug_tools_env_vs_config_precedence() {
+        let _guard = LocalEnvGuard::set_os("CODEX_DEBUG_TOOLS", std::ffi::OsStr::new("1"));
+        let codex_home = tempfile::tempdir().expect("codex_home");
+
+        // Config disables debug.tools; env is set to 1, but project config should win.
+        let mut cfg = ConfigToml::default();
+        cfg.debug = Some(DebugToml { tools: Some(false) });
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+        assert_eq!(config.debug_tools, false);
+    }
+
+    #[test]
+    fn debug_tools_cli_beats_project() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let mut cfg = ConfigToml::default();
+        cfg.debug = Some(DebugToml { tools: Some(false) });
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cli_resolved_overrides = Some(CliResolvedOverrides {
+            vm_pty_socket: None,
+            vm_pty_default_vm_id: None,
+            vm_pty_timeouts: CliVmPtyTimeouts::default(),
+            vm_pty_open_blocking: None,
+            debug_tools: Some(true),
+        });
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+        assert_eq!(config.debug_tools, true);
     }
 }

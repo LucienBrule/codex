@@ -79,6 +79,23 @@ pub struct Cli {
     /// if `-` is used), instructions are read from stdin.
     #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
     pub prompt: Option<String>,
+
+    /// vm-pty: Path to the vm-pty daemon Unix socket.
+    /// Overrides `tools.vm_pty.socket` and takes precedence over env `CODEX_VM_PTY_SOCKET`.
+    /// Example: `--vm-pty-socket /tmp/vm-pty.sock`
+    #[arg(long = "vm-pty-socket", value_name = "PATH")]
+    pub vm_pty_socket: Option<PathBuf>,
+
+    /// vm-pty: Default VM id to target when omitted by tool params.
+    /// Mirrors `vm_pty.default_vm_id` and takes precedence over env `CODEX_VM_PTY_VM_ID`.
+    /// Example: `--vm-pty-vm-id worker-001`
+    #[arg(long = "vm-pty-vm-id", value_name = "ID")]
+    pub vm_pty_vm_id: Option<String>,
+
+    /// vm-pty: Enable vm-pty lane and allow the current profile without editing config files.
+    /// Injects `-c tools.vm_pty.enabled=true` and `-c tools.vm_pty.allow_profiles=["<active-profile>"]` (or `[*]` if no profile specified).
+    #[arg(long = "vm-pty-auto", default_value_t = false)]
+    pub vm_pty_auto: bool,
 }
 
 #[derive(Debug, clap::Subcommand)]

@@ -38,7 +38,7 @@ impl ToolRouter {
         let builder = build_specs(config, mcp_tools);
         let (specs, registry) = builder.build();
 
-        if std::env::var("CODEX_DEBUG_TOOLS").as_deref() == Ok("1") {
+        if config.debug_tools {
             let names: Vec<String> = specs
                 .iter()
                 .map(|c| c.spec.name().to_string())

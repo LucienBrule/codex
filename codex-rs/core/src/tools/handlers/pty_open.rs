@@ -52,16 +52,19 @@ impl ToolHandler for PtyOpenHandler {
             .as_ref()
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(
-                    "pty_open tool is disabled; set CODEX_VM_PTY_SOCKET and enable the vm-pty lane"
+                    "pty_open tool is disabled; configure tools.vm_pty.socket and enable the vm-pty lane"
                         .to_string(),
                 )
             })?
             .clone();
 
-        // Resolve vmId: use param, else CODEX_VM_PTY_VM_ID.
+        // Resolve vmId: use param, else configured default.
         let vm_id_param = params.vm_id.trim();
         let vm_id = if vm_id_param.is_empty() {
-            env::var("CODEX_VM_PTY_VM_ID").unwrap_or_default()
+            turn
+                .vm_pty_default_vm_id
+                .clone()
+                .unwrap_or_default()
         } else {
             params.vm_id.clone()
         };
@@ -95,12 +98,8 @@ impl ToolHandler for PtyOpenHandler {
         let mut request = build_open_request(&params, turn.as_ref());
         request.vm_id = vm_id;
 
-        // Bump timeout for pty_open (slow path on cold boots).
-        let open_timeout_ms: u64 = env::var("CODEX_VM_PTY_OPEN_TIMEOUT_MS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(90_000);
-        let client_open = client.with_request_timeout(Duration::from_millis(open_timeout_ms));
+        // Bump timeout for pty_open (slow path on cold boots) using configured timeout.
+        let client_open = client.with_request_timeout(turn.vm_pty_open_timeout);
         let response = client_open.pty_open(request).await.map_err(map_vm_pty_error)?;
 
         let session_id = response.session_id.clone();
@@ -169,12 +168,8 @@ fn build_open_request(params: &PtyOpenToolCallParams, turn: &TurnContext) -> VmP
         rows,
     );
 
-    // Default to nonblocking open for agent workflows so they can follow with
-    // a read-until/prompt drain. Allow overriding via env for CLI/tests.
-    // Any truthy value for CODEX_VM_PTY_OPEN_BLOCKING enforces blocking mode.
-    let blocking_env = std::env::var("CODEX_VM_PTY_OPEN_BLOCKING").unwrap_or_default();
-    let blocking = matches!(blocking_env.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
-    if !blocking {
+    // Default to nonblocking open for agent workflows; allow config override.
+    if !turn.vm_pty_open_blocking {
         req.nonblocking = Some(true);
     }
 

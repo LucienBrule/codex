@@ -31,6 +31,7 @@ use codex_protocol::config_types::SandboxMode;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
 pub use mailbox::MailboxServer;
+use toml::Value as TomlValue;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use serde_json::Value;
 use std::io::IsTerminal;
@@ -72,6 +73,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         output_schema: output_schema_path,
         include_plan_tool,
         config_overrides,
+        vm_pty_socket,
+        vm_pty_vm_id,
+        vm_pty_auto,
     } = cli;
 
     // Determine the prompt source (parent or subcommand) and read from stdin if needed.
@@ -165,6 +169,44 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         None // No specific model provider override.
     };
 
+    // Parse `-c` overrides.
+    let mut cli_kv_overrides = match config_overrides.parse_overrides() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error parsing -c overrides: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Inject vm-pty CLI flags as high-precedence overrides so they are applied after profile selection.
+    if let Some(socket) = vm_pty_socket.as_ref() {
+        cli_kv_overrides.push((
+            "tools.vm_pty.socket".to_string(),
+            TomlValue::String(socket.display().to_string()),
+        ));
+    }
+    if let Some(vm_id) = vm_pty_vm_id.as_ref() {
+        cli_kv_overrides.push((
+            "vm_pty.default_vm_id".to_string(),
+            TomlValue::String(vm_id.clone()),
+        ));
+    }
+    if vm_pty_auto {
+        cli_kv_overrides.push((
+            "tools.vm_pty.enabled".to_string(),
+            TomlValue::Boolean(true),
+        ));
+        // If a profile was explicitly provided, allow that; otherwise allow all ("*").
+        let allow_profiles: Vec<TomlValue> = match config_profile.as_ref() {
+            Some(p) => vec![TomlValue::String(p.clone())],
+            None => vec![TomlValue::String("*".to_string())],
+        };
+        cli_kv_overrides.push((
+            "tools.vm_pty.allow_profiles".to_string(),
+            TomlValue::Array(allow_profiles),
+        ));
+    }
+
     // Load configuration and determine approval policy
     let overrides = ConfigOverrides {
         model,
@@ -184,14 +226,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         show_raw_agent_reasoning: oss.then_some(true),
         tools_web_search_request: None,
         wait_policy: None,
-    };
-    // Parse `-c` overrides.
-    let cli_kv_overrides = match config_overrides.parse_overrides() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error parsing -c overrides: {e}");
-            std::process::exit(1);
-        }
+        cli_resolved_overrides: None,
     };
 
     let config = Config::load_with_cli_overrides(cli_kv_overrides, overrides).await?;

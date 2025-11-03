@@ -20,6 +20,11 @@ pub struct ConfigProfile {
     pub model_verbosity: Option<Verbosity>,
     pub chatgpt_base_url: Option<String>,
     pub experimental_instructions_file: Option<PathBuf>,
+    /// Optional nested tools overrides within a profile. This allows
+    /// profile-specific toggles for tools such as vm_pty.
+    pub tools: Option<crate::config::ToolsToml>,
+    /// Optional profile-level debug toggles.
+    pub debug: Option<crate::config::DebugToml>,
 }
 
 impl From<ConfigProfile> for codex_app_server_protocol::Profile {
