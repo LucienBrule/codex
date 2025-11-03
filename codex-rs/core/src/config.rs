@@ -1566,15 +1566,9 @@ impl Config {
             false
         };
         let include_vm_pty_tool = vm_pty_flag_enabled && vm_pty_profile_allowlisted;
-        // Enable pty_open for a small allowlist of trusted profiles.
-        let include_vm_pty_open_tool = include_vm_pty_tool
-            && active_profile_name
-                .as_ref()
-                .map(|profile| {
-                    let p = profile.to_ascii_lowercase();
-                    p == "management" || p == "worker-pty-sandbox"
-                })
-                .unwrap_or(false);
+        // Expose pty_open for any profile allow‑listed via tools.vm_pty.allow_profiles.
+        // This removes hard‑coded profile names in favor of config.
+        let include_vm_pty_open_tool = include_vm_pty_tool;
         let exec_explicit_enabled = cfg
             .tools
             .as_ref()

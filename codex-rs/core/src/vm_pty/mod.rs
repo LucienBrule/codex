@@ -362,6 +362,8 @@ pub struct VmPtyOpenRequest {
     pub shell: String,
     pub cols: u16,
     pub rows: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nonblocking: Option<bool>,
 }
 
 impl VmPtyOpenRequest {
@@ -382,6 +384,7 @@ impl VmPtyOpenRequest {
             shell,
             cols,
             rows,
+            nonblocking: None,
         }
     }
 }

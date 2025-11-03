@@ -159,7 +159,7 @@ fn build_open_request(params: &PtyOpenToolCallParams, turn: &TurnContext) -> VmP
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);
 
-    VmPtyOpenRequest::new(
+    let mut req = VmPtyOpenRequest::new(
         params.vm_id.clone(),
         workspace,
         cwd,
@@ -167,5 +167,16 @@ fn build_open_request(params: &PtyOpenToolCallParams, turn: &TurnContext) -> VmP
         shell,
         cols,
         rows,
-    )
+    );
+
+    // Default to nonblocking open for agent workflows so they can follow with
+    // a read-until/prompt drain. Allow overriding via env for CLI/tests.
+    // Any truthy value for CODEX_VM_PTY_OPEN_BLOCKING enforces blocking mode.
+    let blocking_env = std::env::var("CODEX_VM_PTY_OPEN_BLOCKING").unwrap_or_default();
+    let blocking = matches!(blocking_env.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+    if !blocking {
+        req.nonblocking = Some(true);
+    }
+
+    req
 }
