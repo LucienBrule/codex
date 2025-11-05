@@ -38,23 +38,49 @@ impl ToolHandler for PtyResizeHandler {
             ))
         })?;
 
+        // Strict schema: server requires both cols and rows
         let cols = args
             .get("cols")
             .and_then(|value| value.as_u64())
             .map(|value| value.min(u16::MAX as u64) as u16)
-            .unwrap_or(DEFAULT_COLS);
+            .ok_or_else(|| FunctionCallError::RespondToModel("pty_resize requires integer `cols`".to_string()))?;
         let rows = args
             .get("rows")
             .and_then(|value| value.as_u64())
             .map(|value| value.min(u16::MAX as u64) as u16)
-            .unwrap_or(DEFAULT_ROWS);
+            .ok_or_else(|| FunctionCallError::RespondToModel("pty_resize requires integer `rows`".to_string()))?;
         let cursor = args.get("cursor").and_then(|value| value.as_u64());
+
+        session
+            .notify_background_event(&invocation.sub_id, format!(
+                "TOOL: {} REQUEST: {}",
+                invocation.tool_name, arguments
+            ))
+            .await;
 
         let (client, session_id) = ensure_session(&session, &turn).await?;
         let result = client
             .pty_resize(&session_id, Some(cols), Some(rows), cursor)
             .await
             .map_err(map_vm_pty_error)?;
+
+        tracing::info!(
+            target = "codex::vm_pty.tools",
+            tool = "pty_resize",
+            %session_id,
+            cols,
+            rows,
+            has_cursor = cursor.is_some(),
+            result = %result,
+            "pty tool call"
+        );
+
+        // Summarize resize ack only.
+        let ack = result.get("ack_seq").cloned().unwrap_or(serde_json::json!(null));
+        let out = serde_json::json!({ "ack_seq": ack, "cols": cols, "rows": rows });
+        session
+            .notify_background_event(&invocation.sub_id, format!("TOOL: {} RESULT: {}", invocation.tool_name, out))
+            .await;
 
         Ok(ToolOutput::Function {
             content: result.to_string(),

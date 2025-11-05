@@ -38,11 +38,16 @@ impl ToolHandler for PtyReadHandler {
             ))
         })?;
 
-        let max_bytes = args
-            .get("maxBytes")
-            .or_else(|| args.get("max_bytes"))
-            .and_then(|value| value.as_u64());
+        // Strict schema: server expects `max_bytes`; omit to use server default
+        let max_bytes = args.get("max_bytes").and_then(|value| value.as_u64());
         let cursor = args.get("cursor").and_then(|value| value.as_u64());
+
+        session
+            .notify_background_event(&invocation.sub_id, format!(
+                "TOOL: {} REQUEST: {}",
+                invocation.tool_name, arguments
+            ))
+            .await;
 
         let (client, session_id) = ensure_session(&session, &turn).await?;
 
@@ -64,6 +69,38 @@ impl ToolHandler for PtyReadHandler {
             .pty_read(&session_id, max_bytes, cursor)
             .await
             .map_err(map_vm_pty_error)?;
+
+        tracing::info!(
+            target = "codex::vm_pty.tools",
+            tool = "pty_read",
+            %session_id,
+            max_bytes,
+            has_cursor = cursor.is_some(),
+            result = %result,
+            "pty tool call"
+        );
+
+        // Summarize read: seq, eof, bytes delivered, buffer depth.
+        let seq = result.get("seq").cloned().unwrap_or(serde_json::json!(null));
+        let eof = result.get("eof").cloned().unwrap_or(serde_json::json!(null));
+        let data_len = result
+            .get("data")
+            .and_then(|v| v.as_str())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let buffer_depth = result
+            .get("buffer_depth")
+            .cloned()
+            .unwrap_or(serde_json::json!(null));
+        let summary = serde_json::json!({
+            "seq": seq,
+            "eof": eof,
+            "data_len": data_len,
+            "buffer_depth": buffer_depth,
+        });
+        session
+            .notify_background_event(&invocation.sub_id, format!("TOOL: {} RESULT: {}", invocation.tool_name, summary))
+            .await;
 
         Ok(ToolOutput::Function {
             content: result.to_string(),

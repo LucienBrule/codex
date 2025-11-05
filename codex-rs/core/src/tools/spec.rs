@@ -280,7 +280,7 @@ fn create_pty_open_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "pty_open".to_string(),
-        description: "Opens an interactive PTY session inside the VM lane and returns a session handle plus initial output."
+        description: "Open an interactive PTY session in the VM backend. When `vmId` is empty or omitted, the server auto‑provisions a VM and returns the assigned `vm_id`. In nonblocking mode (default for agents), initial_output may be empty; use `pty_read_until` to wait for a prompt."
             .to_string(),
         strict: true,
         parameters: JsonSchema::Object {
@@ -314,7 +314,7 @@ fn create_pty_session_info_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "pty_session_info".to_string(),
-        description: "Returns the vm_id and session_id for the active/default PTY session; accepts optional vmId to query a specific session.".to_string(),
+        description: "Return the `vm_id` and `session_id` for the active/default PTY session. If `vmId` is provided, return info for that VM. Fails when no session is active.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -327,10 +327,10 @@ fn create_pty_session_info_tool() -> ToolSpec {
 fn create_pty_write_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
-        "text".to_string(),
+        "data".to_string(),
         JsonSchema::String {
             description: Some(
-                "Text to write to the PTY. Supports control tokens such as <C-C> or <UP>."
+                "String to write to the PTY. Supports control tokens such as <C-C> or <UP>."
                     .to_string(),
             ),
         },
@@ -346,11 +346,11 @@ fn create_pty_write_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "pty_write".to_string(),
-        description: "Writes text or control sequences to the active PTY; include a trailing newline (\"\\n\") to run shell commands.".to_string(),
+        description: "Write UTF‑8 data (supports control tokens like <C-C>, <UP>) to the active PTY. Include a trailing newline (\\n) to execute shell commands. Returns `ack_seq` and current `buffer_depth`.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: Some(vec!["text".to_string()]),
+            required: Some(vec!["data".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -359,7 +359,7 @@ fn create_pty_write_tool() -> ToolSpec {
 fn create_pty_read_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
-        "maxBytes".to_string(),
+        "max_bytes".to_string(),
         JsonSchema::Number {
             description: Some(
                 "Maximum bytes to read from the PTY (defaults to 4096).".to_string(),
@@ -377,7 +377,7 @@ fn create_pty_read_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "pty_read".to_string(),
-        description: "Reads buffered output from the active PTY session; call after pty_write and set maxBytes (for example 16384) to drain pending output.".to_string(),
+        description: "Read buffered output from the active PTY session. Returns `{ seq, data, eof, buffer_depth }`. Set `max_bytes` (e.g., 16384) to drain pending output.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
@@ -412,11 +412,11 @@ fn create_pty_resize_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "pty_resize".to_string(),
-        description: "Resizes the PTY session; follow with pty_read to confirm the remote shell observed the new size (e.g. via \"stty size\").".to_string(),
+        description: "Resize the PTY (terminal) to the requested `cols`×`rows`. Follow with `pty_read` or run `stty size` to observe effect. Returns `ack_seq` and `buffer_depth`.".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: None,
+            required: Some(vec!["cols".to_string(), "rows".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -425,21 +425,19 @@ fn create_pty_resize_tool() -> ToolSpec {
 fn create_pty_signal_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
-        "send".to_string(),
+        "signal".to_string(),
         JsonSchema::String {
-            description: Some(
-                "Signal to send (interrupt, suspend, eof, terminate).".to_string(),
-            ),
+            description: Some("Signal to send: one of 'interrupt', 'suspend', 'eof', 'terminate'.".to_string()),
         },
     );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "pty_signal".to_string(),
-        description: "Injects a control signal into the PTY (interrupt, suspend, eof, terminate).".to_string(),
+        description: "Inject a control signal into the active PTY (e.g., 'interrupt' to send Ctrl‑C).".to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
-            required: Some(vec!["send".to_string()]),
+            required: Some(vec!["signal".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -462,7 +460,7 @@ fn create_pty_read_until_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "pty_read_until".to_string(),
-        description: "Reads from the active PTY until the pattern is seen or timeout elapses.".to_string(),
+        description: "Read from the active PTY until a substring `pattern` is seen or the timeout elapses. `ansi='stripped'` removes escape sequences from the match/output.".to_string(),
         strict: false,
         parameters: JsonSchema::Object { properties, required: Some(vec!["pattern".to_string()]), additional_properties: Some(false.into()) },
     })
@@ -485,7 +483,7 @@ fn create_pty_exec_tool() -> ToolSpec {
 
     ToolSpec::Function(ResponsesApiTool {
         name: "pty_exec".to_string(),
-        description: "Executes a command inside the active PTY and returns stdout + exit code.".to_string(),
+        description: "Execute a shell command inside the active PTY and return `{ stdout, exit_code, duration_ms }`. Uses robust markers to locate command boundaries; `ansi='stripped'` removes escape sequences.".to_string(),
         strict: false,
         parameters: JsonSchema::Object { properties, required: Some(vec!["cmd".to_string()]), additional_properties: Some(false.into()) },
     })

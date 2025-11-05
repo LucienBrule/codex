@@ -37,22 +37,51 @@ impl ToolHandler for PtyWriteHandler {
             ))
         })?;
 
-        let text = args
-            .get("text")
+        // Strict schema: require `data` (server expects `data`)
+        let data = args
+            .get("data")
             .and_then(|value| value.as_str())
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(
-                    "pty_write requires a string `text` argument".to_string(),
+                    "pty_write requires a string `data` argument".to_string(),
                 )
             })?;
 
         let cursor = args.get("cursor").and_then(|value| value.as_u64());
 
+        // Emit human-output log line similar to "thinking" using background events
+        session
+            .notify_background_event(&invocation.sub_id, format!(
+                "TOOL: {} REQUEST: {}",
+                invocation.tool_name, arguments
+            ))
+            .await;
+
         let (client, session_id) = ensure_session(&session, &turn).await?;
         let result = client
-            .pty_write(&session_id, text, cursor)
+            .pty_write(&session_id, data, cursor)
             .await
             .map_err(map_vm_pty_error)?;
+
+        // Structured instrumentation for exec-mode debugging
+        tracing::info!(
+            target: "codex::vm_pty.tools",
+            tool = "pty_write",
+            %session_id,
+            has_cursor = cursor.is_some(),
+            data_len = data.len(),
+            result = %result,
+            "pty tool call"
+        );
+
+        // Summarize write ack only.
+        let ack = result.get("ack_seq").cloned().unwrap_or(serde_json::json!(null));
+        let bytes = result.get("bytes").cloned().unwrap_or(serde_json::json!(null));
+        let buffer_depth = result.get("buffer_depth").cloned().unwrap_or(serde_json::json!(null));
+        let summary = serde_json::json!({ "ack_seq": ack, "bytes": bytes, "buffer_depth": buffer_depth });
+        session
+            .notify_background_event(&invocation.sub_id, format!("TOOL: {} RESULT: {}", invocation.tool_name, summary))
+            .await;
 
         Ok(ToolOutput::Function {
             content: result.to_string(),

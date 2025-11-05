@@ -55,10 +55,18 @@ impl ToolHandler for PtySessionInfoHandler {
         };
 
         let output = json!({ "vm_id": vm_id, "session_id": session_id });
+
+        tracing::info!(
+            target = "codex::vm_pty.tools",
+            tool = "pty_session_info",
+            requested_vm = requested_vm.as_deref().unwrap_or(""),
+            vm_id = %vm_id,
+            session_id = %session_id,
+            "pty tool call"
+        );
         Ok(ToolOutput::Function {
             content: output.to_string(),
             success: Some(true),
         })
     }
 }
-

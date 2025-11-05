@@ -39,12 +39,13 @@ impl ToolHandler for PtySignalHandler {
             ))
         })?;
 
+        // Strict schema: server expects `signal`
         let send = args
-            .get("send")
+            .get("signal")
             .and_then(|value| value.as_str())
             .ok_or_else(|| {
                 FunctionCallError::RespondToModel(
-                    "pty_signal requires a string `send` argument".to_string(),
+                    "pty_signal requires a string `signal` argument".to_string(),
                 )
             })?
             .to_ascii_lowercase();
@@ -55,11 +56,34 @@ impl ToolHandler for PtySignalHandler {
             )));
         }
 
+        session
+            .notify_background_event(&invocation.sub_id, format!(
+                "TOOL: {} REQUEST: {}",
+                invocation.tool_name, arguments
+            ))
+            .await;
+
         let (client, session_id) = ensure_session(&session, &turn).await?;
         let result = client
             .pty_signal(&session_id, &send)
             .await
             .map_err(map_vm_pty_error)?;
+
+        tracing::info!(
+            target = "codex::vm_pty.tools",
+            tool = "pty_signal",
+            %session_id,
+            signal = %send,
+            result = %result,
+            "pty tool call"
+        );
+
+        // Summarize signal kind only.
+        let kind = result.get("kind").cloned().unwrap_or(serde_json::json!(null));
+        let out = serde_json::json!({ "kind": kind });
+        session
+            .notify_background_event(&invocation.sub_id, format!("TOOL: {} RESULT: {}", invocation.tool_name, out))
+            .await;
 
         Ok(ToolOutput::Function {
             content: result.to_string(),

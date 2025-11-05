@@ -43,7 +43,7 @@ impl ToolRouter {
                 .iter()
                 .map(|c| c.spec.name().to_string())
                 .collect();
-            eprintln!("[codex-tools] enabled tools: {names:?}");
+            //eprintln!("[codex-tools] enabled tools: {names:?}");
         }
 
         Self { registry, specs }

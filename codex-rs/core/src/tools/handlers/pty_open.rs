@@ -57,16 +57,17 @@ impl ToolHandler for PtyOpenHandler {
             })?
             .clone();
 
-        // Resolve vmId: use param, else configured default. Allow empty for handshake.
-        let vm_id_param = params.vm_id.trim();
-        let vm_id = if vm_id_param.is_empty() {
-            turn
-                .vm_pty_default_vm_id
-                .clone()
-                .unwrap_or_default()
-        } else {
-            params.vm_id.clone()
-        };
+        // Resolve vmId: use only the explicit parameter; if empty, request auto-provision from server.
+        // Do NOT fall back to any configured default here to avoid unintended attach-first to "default".
+        let vm_id = params.vm_id.trim().to_string();
+
+        // Emit a human-readable background log line (same channel as "thinking")
+        session
+            .notify_background_event(&invocation.sub_id, format!(
+                "TOOL: {} REQUEST: {}",
+                invocation.tool_name, arguments
+            ))
+            .await;
 
         // Attach-first: try to reattach to an existing session.
         if !vm_id.trim().is_empty() {
@@ -91,6 +92,12 @@ impl ToolHandler for PtyOpenHandler {
                     "rows": attached.rows,
                     "attached": true,
                 });
+                session
+                    .notify_background_event(
+                        &invocation.sub_id,
+                        format!("TOOL: {} RESULT: {}", invocation.tool_name, output),
+                    )
+                    .await;
                 return Ok(ToolOutput::Function { content: output.to_string(), success: Some(true) });
             }
         }
@@ -150,6 +157,33 @@ impl ToolHandler for PtyOpenHandler {
         });
 
         info!(target: "codex::vm_pty", vm_id = %assigned_vm_id, session_id = %session_id, "vm-pty session opened");
+        tracing::info!(
+            target = "codex::vm_pty.tools",
+            tool = "pty_open",
+            request = %arguments,
+            requested_vm_id = %params.vm_id,
+            assigned_vm_id = %assigned_vm_id,
+            cols = response.cols,
+            rows = response.rows,
+            nonblocking = !turn.vm_pty_open_blocking,
+            initial_output_len = initial_output.len(),
+            "pty tool call"
+        );
+
+        // Log a concise summary to avoid flooding logs with ANSI-heavy initial_output.
+        let result_summary = serde_json::json!({
+            "vm_id": assigned_vm_id,
+            "session_id": session_id,
+            "cols": response.cols,
+            "rows": response.rows,
+            "initial_output_len": initial_output.len(),
+        });
+        session
+            .notify_background_event(
+                &invocation.sub_id,
+                format!("TOOL: {} RESULT: {}", invocation.tool_name, result_summary),
+            )
+            .await;
 
         Ok(ToolOutput::Function {
             content: output.to_string(),
