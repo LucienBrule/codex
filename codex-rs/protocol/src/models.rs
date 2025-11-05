@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 
 use base64::Engine;
@@ -240,8 +241,9 @@ impl From<Vec<InputItem>> for ResponseInputItem {
     }
 }
 
-/// If the `name` of a `ResponseItem::FunctionCall` is either `container.exec`
-/// or shell`, the `arguments` field should deserialize to this struct.
+/// If the `name` of a `ResponseItem::FunctionCall` is `container_exec`
+/// (legacy alias `container.exec`) or `shell`, the `arguments` field should
+/// deserialize to this struct.
 #[derive(Deserialize, Debug, Clone, PartialEq, TS)]
 pub struct ShellToolCallParams {
     pub command: Vec<String>,
@@ -254,6 +256,24 @@ pub struct ShellToolCallParams {
     pub with_escalated_permissions: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub justification: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct PtyOpenToolCallParams {
+    pub vm_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, TS)]

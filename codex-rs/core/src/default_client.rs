@@ -1,4 +1,5 @@
 use crate::spawn::CODEX_SANDBOX_ENV_VAR;
+use codex_http_config::configure_builder;
 use reqwest::header::HeaderValue;
 use std::sync::LazyLock;
 use std::sync::Mutex;
@@ -20,7 +21,7 @@ use std::sync::OnceLock;
 /// The full user agent string is returned from the mcp initialize response.
 /// Parenthesis will be added by Codex. This should only specify what goes inside of the parenthesis.
 pub static USER_AGENT_SUFFIX: LazyLock<Mutex<Option<String>>> = LazyLock::new(|| Mutex::new(None));
-
+pub const DEFAULT_ORIGINATOR: &str = "codex_cli_rs";
 pub const CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR: &str = "CODEX_INTERNAL_ORIGINATOR_OVERRIDE";
 #[derive(Debug, Clone)]
 pub struct Originator {
@@ -35,10 +36,11 @@ pub enum SetOriginatorError {
     AlreadyInitialized,
 }
 
-fn init_originator_from_env() -> Originator {
-    let default = "codex_cli_rs";
+fn get_originator_value(provided: Option<String>) -> Originator {
     let value = std::env::var(CODEX_INTERNAL_ORIGINATOR_OVERRIDE_ENV_VAR)
-        .unwrap_or_else(|_| default.to_string());
+        .ok()
+        .or(provided)
+        .unwrap_or(DEFAULT_ORIGINATOR.to_string());
 
     match HeaderValue::from_str(&value) {
         Ok(header_value) => Originator {
@@ -48,31 +50,22 @@ fn init_originator_from_env() -> Originator {
         Err(e) => {
             tracing::error!("Unable to turn originator override {value} into header value: {e}");
             Originator {
-                value: default.to_string(),
-                header_value: HeaderValue::from_static(default),
+                value: DEFAULT_ORIGINATOR.to_string(),
+                header_value: HeaderValue::from_static(DEFAULT_ORIGINATOR),
             }
         }
     }
 }
 
-fn build_originator(value: String) -> Result<Originator, SetOriginatorError> {
-    let header_value =
-        HeaderValue::from_str(&value).map_err(|_| SetOriginatorError::InvalidHeaderValue)?;
-    Ok(Originator {
-        value,
-        header_value,
-    })
-}
-
-pub fn set_default_originator(value: &str) -> Result<(), SetOriginatorError> {
-    let originator = build_originator(value.to_string())?;
+pub fn set_default_originator(value: String) -> Result<(), SetOriginatorError> {
+    let originator = get_originator_value(Some(value));
     ORIGINATOR
         .set(originator)
         .map_err(|_| SetOriginatorError::AlreadyInitialized)
 }
 
 pub fn originator() -> &'static Originator {
-    ORIGINATOR.get_or_init(init_originator_from_env)
+    ORIGINATOR.get_or_init(|| get_originator_value(None))
 }
 
 pub fn get_codex_user_agent() -> String {
@@ -140,7 +133,7 @@ pub fn create_client() -> reqwest::Client {
     headers.insert("originator", originator().header_value.clone());
     let ua = get_codex_user_agent();
 
-    let mut builder = reqwest::Client::builder()
+    let mut builder = configure_builder(reqwest::Client::builder())
         // Set UA via dedicated helper to avoid header validation pitfalls
         .user_agent(ua)
         .default_headers(headers);

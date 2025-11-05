@@ -1,0 +1,6 @@
+# Default mailbox liveness configuration used by codex-core when no user overrides are present.
+[mailbox_liveness]
+enabled = true
+idle_after_seconds = 3
+stalled_after_seconds = 12
+emit_interval_seconds = 5

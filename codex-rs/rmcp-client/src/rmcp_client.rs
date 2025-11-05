@@ -3,10 +3,17 @@ use std::ffi::OsString;
 use std::io;
 use std::process::Stdio;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use anyhow::anyhow;
+use codex_http_config::configure_builder;
+use codex_otel::metrics;
 use futures::FutureExt;
 use mcp_types::CallToolRequestParams;
 use mcp_types::CallToolResult;
@@ -29,12 +36,16 @@ use tokio::io::AsyncBufReadExt;
 use tokio::io::BufReader;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio::time;
+use tokio::time::MissedTickBehavior;
+use tracing::event;
 use tracing::info;
 use tracing::warn;
 
 use crate::load_oauth_tokens;
 use crate::logging_client_handler::LoggingClientHandler;
+use crate::oauth::OAuthCredentialsStoreMode;
 use crate::oauth::OAuthPersistor;
 use crate::oauth::StoredOAuthTokens;
 use crate::utils::convert_call_tool_result;
@@ -68,6 +79,8 @@ enum ClientState {
 /// https://github.com/modelcontextprotocol/rust-sdk
 pub struct RmcpClient {
     state: Mutex<ClientState>,
+    last_activity: Arc<AtomicU64>,
+    keepalive_handle: StdMutex<Option<JoinHandle<()>>>,
 }
 
 impl RmcpClient {
@@ -112,6 +125,8 @@ impl RmcpClient {
             state: Mutex::new(ClientState::Connecting {
                 transport: Some(PendingTransport::ChildProcess(transport)),
             }),
+            last_activity: Arc::new(AtomicU64::new(now_millis())),
+            keepalive_handle: StdMutex::new(None),
         })
     }
 
@@ -119,17 +134,22 @@ impl RmcpClient {
         server_name: &str,
         url: &str,
         bearer_token: Option<String>,
+        store_mode: OAuthCredentialsStoreMode,
     ) -> Result<Self> {
-        let initial_tokens = match load_oauth_tokens(server_name, url) {
-            Ok(tokens) => tokens,
-            Err(err) => {
-                warn!("failed to read tokens for server `{server_name}`: {err}");
-                None
-            }
+        let initial_oauth_tokens = match bearer_token {
+            Some(_) => None,
+            None => match load_oauth_tokens(server_name, url, store_mode) {
+                Ok(tokens) => tokens,
+                Err(err) => {
+                    warn!("failed to read tokens for server `{server_name}`: {err}");
+                    None
+                }
+            },
         };
-        let transport = if let Some(initial_tokens) = initial_tokens.clone() {
+        let transport = if let Some(initial_tokens) = initial_oauth_tokens.clone() {
             let (transport, oauth_persistor) =
-                create_oauth_transport_and_runtime(server_name, url, initial_tokens).await?;
+                create_oauth_transport_and_runtime(server_name, url, initial_tokens, store_mode)
+                    .await?;
             PendingTransport::StreamableHttpWithOAuth {
                 transport,
                 oauth_persistor,
@@ -137,7 +157,7 @@ impl RmcpClient {
         } else {
             let mut http_config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
             if let Some(bearer_token) = bearer_token {
-                http_config = http_config.auth_header(format!("Bearer {bearer_token}"));
+                http_config = http_config.auth_header(bearer_token);
             }
 
             let transport = StreamableHttpClientTransport::from_config(http_config);
@@ -147,6 +167,8 @@ impl RmcpClient {
             state: Mutex::new(ClientState::Connecting {
                 transport: Some(transport),
             }),
+            last_activity: Arc::new(AtomicU64::new(now_millis())),
+            keepalive_handle: StdMutex::new(None),
         })
     }
 
@@ -215,6 +237,8 @@ impl RmcpClient {
             warn!("failed to persist OAuth tokens after initialize: {error}");
         }
 
+        self.record_activity();
+
         Ok(initialize_result)
     }
 
@@ -232,6 +256,7 @@ impl RmcpClient {
         let result = run_with_timeout(fut, timeout, "tools/list").await?;
         let converted = convert_to_mcp(result)?;
         self.persist_oauth_tokens().await;
+        self.record_activity();
         Ok(converted)
     }
 
@@ -248,6 +273,7 @@ impl RmcpClient {
         let rmcp_result = run_with_timeout(fut, timeout, "tools/call").await?;
         let converted = convert_call_tool_result(rmcp_result)?;
         self.persist_oauth_tokens().await;
+        self.record_activity();
         Ok(converted)
     }
 
@@ -277,17 +303,92 @@ impl RmcpClient {
             warn!("failed to persist OAuth tokens: {error}");
         }
     }
+
+    pub fn enable_keepalive(self: &Arc<Self>, interval: Duration, transport_label: &'static str) {
+        if interval.is_zero() {
+            return;
+        }
+
+        let weak = Arc::downgrade(self);
+        let interval_ms = interval.as_millis() as u64;
+        let label = transport_label;
+        let handle = tokio::spawn(async move {
+            let mut ticker = time::interval(interval);
+            ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+
+                let Some(client) = weak.upgrade() else {
+                    break;
+                };
+
+                let elapsed_ms = client.millis_since_last_activity();
+                if elapsed_ms < interval_ms {
+                    continue;
+                }
+
+                event!(
+                    tracing::Level::DEBUG,
+                    event.name = "codex.rmcp_keepalive",
+                    status = "emit",
+                    elapsed_ms = elapsed_ms,
+                );
+                metrics::record_heartbeat(label, "emit", Some(elapsed_ms));
+
+                match client.list_tools(None, Some(Duration::from_secs(5))).await {
+                    Ok(_) => {
+                        client.record_activity();
+                        event!(
+                            tracing::Level::DEBUG,
+                            event.name = "codex.rmcp_keepalive",
+                            status = "sent",
+                            interval_ms = interval_ms,
+                        );
+                        metrics::record_heartbeat(label, "sent", Some(interval_ms));
+                    }
+                    Err(error) => {
+                        event!(
+                            tracing::Level::WARN,
+                            event.name = "codex.rmcp_keepalive",
+                            status = "error",
+                            error.message = %error,
+                        );
+                        metrics::record_heartbeat(label, "error", Some(elapsed_ms));
+                    }
+                }
+            }
+        });
+
+        if let Ok(mut guard) = self.keepalive_handle.lock()
+            && let Some(existing) = guard.replace(handle)
+        {
+            existing.abort();
+        }
+    }
+
+    fn record_activity(&self) {
+        Self::record_activity_atomic(&self.last_activity);
+    }
+
+    fn millis_since_last_activity(&self) -> u64 {
+        now_millis().saturating_sub(self.last_activity.load(Ordering::Relaxed))
+    }
+
+    fn record_activity_atomic(activity: &AtomicU64) {
+        activity.store(now_millis(), Ordering::Relaxed);
+    }
 }
 
 async fn create_oauth_transport_and_runtime(
     server_name: &str,
     url: &str,
     initial_tokens: StoredOAuthTokens,
+    credentials_store: OAuthCredentialsStoreMode,
 ) -> Result<(
     StreamableHttpClientTransport<AuthClient<reqwest::Client>>,
     OAuthPersistor,
 )> {
-    let http_client = reqwest::Client::builder().build()?;
+    let http_client = configure_builder(reqwest::Client::builder()).build()?;
     let mut oauth_state = OAuthState::new(url.to_string(), Some(http_client.clone())).await?;
 
     oauth_state
@@ -317,8 +418,26 @@ async fn create_oauth_transport_and_runtime(
         server_name.to_string(),
         url.to_string(),
         auth_manager,
+        credentials_store,
         Some(initial_tokens),
     );
 
     Ok((transport, runtime))
+}
+
+impl Drop for RmcpClient {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.keepalive_handle.lock()
+            && let Some(handle) = guard.take()
+        {
+            handle.abort();
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }

@@ -1,8 +1,10 @@
 use super::*;
 use crate::app_event::AppEvent;
 use crate::app_event_sender::AppEventSender;
+use crate::mailbox::MailboxStore;
 use crate::test_backend::VT100Backend;
 use crate::tui::FrameRequester;
+use assert_matches::assert_matches;
 use codex_core::AuthManager;
 use codex_core::CodexAuth;
 use codex_core::config::Config;
@@ -19,6 +21,8 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecApprovalRequestEvent;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
+use codex_core::protocol::ExecCommandOutputDeltaEvent;
+use codex_core::protocol::ExecOutputStream;
 use codex_core::protocol::ExitedReviewModeEvent;
 use codex_core::protocol::FileChange;
 use codex_core::protocol::InputMessageKind;
@@ -47,6 +51,8 @@ use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Mutex;
 use tempfile::NamedTempFile;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::unbounded_channel;
@@ -271,10 +277,13 @@ fn make_chatwidget_manual() -> (
         rate_limit_warnings: RateLimitWarningState::default(),
         stream_controller: None,
         running_commands: HashMap::new(),
+        pending_exec_output: HashMap::new(),
         task_complete_pending: false,
         interrupts: InterruptManager::new(),
         reasoning_buffer: String::new(),
         full_reasoning_buffer: String::new(),
+        current_status_header: String::from("Working"),
+        retry_status_header: None,
         conversation_id: None,
         frame_requester: FrameRequester::test_dummy(),
         show_welcome_banner: true,
@@ -286,6 +295,8 @@ fn make_chatwidget_manual() -> (
         ghost_snapshots_disabled: false,
         needs_final_message_separator: false,
         last_rendered_width: std::cell::Cell::new(None),
+        current_liveness_badge: None,
+        mailbox: Arc::new(Mutex::new(MailboxStore::new())),
     };
     (widget, rx, op_rx)
 }
@@ -537,6 +548,17 @@ fn end_exec(chat: &mut ChatWidget, call_id: &str, stdout: &str, stderr: &str, ex
     });
 }
 
+fn stream_exec(chat: &mut ChatWidget, call_id: &str, stream: ExecOutputStream, chunk: &[u8]) {
+    chat.handle_codex_event(Event {
+        id: call_id.to_string(),
+        msg: EventMsg::ExecCommandOutputDelta(ExecCommandOutputDeltaEvent {
+            call_id: call_id.to_string(),
+            stream,
+            chunk: chunk.to_vec(),
+        }),
+    });
+}
+
 fn active_blob(chat: &ChatWidget) -> String {
     let lines = chat
         .active_cell
@@ -614,6 +636,35 @@ fn alt_up_edits_most_recent_queued_message() {
     );
 }
 
+/// Pressing Up to recall the most recent history entry and immediately queuing
+/// it while a task is running should always enqueue the same text, even when it
+/// is queued repeatedly.
+#[test]
+fn enqueueing_history_prompt_multiple_times_is_stable() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    // Submit an initial prompt to seed history.
+    chat.bottom_pane.set_composer_text("repeat me".to_string());
+    chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    // Simulate an active task so further submissions are queued.
+    chat.bottom_pane.set_task_running(true);
+
+    for _ in 0..3 {
+        // Recall the prompt from history and ensure it is what we expect.
+        chat.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(chat.bottom_pane.composer_text(), "repeat me");
+
+        // Queue the prompt while the task is running.
+        chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    assert_eq!(chat.queued_user_messages.len(), 3);
+    for message in chat.queued_user_messages.iter() {
+        assert_eq!(message.text, "repeat me");
+    }
+}
+
 #[test]
 fn streaming_final_answer_keeps_task_running_state() {
     let (mut chat, _rx, mut op_rx) = make_chatwidget_manual();
@@ -634,7 +685,7 @@ fn streaming_final_answer_keeps_task_running_state() {
         chat.queued_user_messages.front().unwrap().text,
         "queued submission"
     );
-    assert!(matches!(op_rx.try_recv(), Err(TryRecvError::Empty)));
+    assert_matches!(op_rx.try_recv(), Err(TryRecvError::Empty));
 
     chat.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
     match op_rx.try_recv() {
@@ -642,6 +693,18 @@ fn streaming_final_answer_keeps_task_running_state() {
         other => panic!("expected Op::Interrupt, got {other:?}"),
     }
     assert!(chat.bottom_pane.ctrl_c_quit_hint_visible());
+}
+
+#[test]
+fn ctrl_c_shutdown_ignores_caps_lock() {
+    let (mut chat, _rx, mut op_rx) = make_chatwidget_manual();
+
+    chat.handle_key_event(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL));
+
+    match op_rx.try_recv() {
+        Ok(Op::Shutdown) => {}
+        other => panic!("expected Op::Shutdown, got {other:?}"),
+    }
 }
 
 #[test]
@@ -1079,6 +1142,122 @@ fn exec_history_extends_previous_when_consecutive() {
     begin_exec(&mut chat, "call-cat-bar", "cat bar.txt");
     end_exec(&mut chat, "call-cat-bar", "hello from bar", "", 0);
     assert_snapshot!("exploring_step6_finish_cat_bar", active_blob(&chat));
+}
+
+#[test]
+fn exec_output_delta_streams_into_active_cell() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    begin_exec(&mut chat, "call-stream", "printf 'hello'");
+    stream_exec(&mut chat, "call-stream", ExecOutputStream::Stdout, b"hello");
+
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("hello"),
+        "expected streamed text, got {blob}",
+        blob = blob
+    );
+    assert!(
+        blob.contains("▹"),
+        "expected partial marker while awaiting newline, got {blob}",
+        blob = blob
+    );
+
+    stream_exec(
+        &mut chat,
+        "call-stream",
+        ExecOutputStream::Stdout,
+        b" world\nsecond\n",
+    );
+
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("hello world"),
+        "expected wrapped output, got {blob}",
+        blob = blob
+    );
+    assert!(
+        blob.contains("second"),
+        "expected tail lines, got {blob}",
+        blob = blob
+    );
+    assert!(
+        !blob.contains("▹"),
+        "partial marker should clear once newline received, blob: {blob}",
+        blob = blob
+    );
+}
+
+#[test]
+fn exec_output_delta_handles_split_multibyte_utf8() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    begin_exec(&mut chat, "call-utf8", "printf 'hello €'");
+
+    stream_exec(&mut chat, "call-utf8", ExecOutputStream::Stdout, b"hello ");
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("hello "),
+        "expected base text after first chunk, blob: {blob}",
+        blob = blob
+    );
+    assert!(
+        !blob.contains('\u{FFFD}'),
+        "replacement char should not appear after ASCII chunk, blob: {blob}",
+        blob = blob
+    );
+
+    stream_exec(&mut chat, "call-utf8", ExecOutputStream::Stdout, &[0xE2]);
+    let blob = active_blob(&chat);
+    assert!(
+        !blob.contains('\u{FFFD}'),
+        "partial multibyte chunk should not emit replacement char, blob: {blob}",
+        blob = blob
+    );
+
+    stream_exec(
+        &mut chat,
+        "call-utf8",
+        ExecOutputStream::Stdout,
+        &[0x82, 0xAC, b'\n'],
+    );
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("hello €"),
+        "expected completed multibyte character, blob: {blob}",
+        blob = blob
+    );
+    assert!(
+        !blob.contains('\u{FFFD}'),
+        "UTF-8 boundary handling should avoid replacement chars, blob: {blob}",
+        blob = blob
+    );
+}
+
+#[test]
+fn exec_output_delta_buffers_until_begin() {
+    let (mut chat, _rx, _op_rx) = make_chatwidget_manual();
+
+    stream_exec(
+        &mut chat,
+        "call-buffer",
+        ExecOutputStream::Stdout,
+        b"buffered line\n",
+    );
+
+    assert!(
+        chat.active_cell.is_none(),
+        "delta should not draw before begin"
+    );
+
+    begin_exec(&mut chat, "call-buffer", "echo buffered");
+
+    let blob = active_blob(&chat);
+    assert!(
+        blob.contains("buffered line"),
+        "pending delta should replay after begin, blob: {blob}",
+        blob = blob
+    );
 }
 
 #[test]
@@ -1791,10 +1970,7 @@ fn apply_patch_approval_sends_op_with_submission_id() {
     while let Ok(app_ev) = rx.try_recv() {
         if let AppEvent::CodexOp(Op::PatchApproval { id, decision }) = app_ev {
             assert_eq!(id, "sub-123");
-            assert!(matches!(
-                decision,
-                codex_core::protocol::ReviewDecision::Approved
-            ));
+            assert_matches!(decision, codex_core::protocol::ReviewDecision::Approved);
             found = true;
             break;
         }
@@ -1841,10 +2017,7 @@ fn apply_patch_full_flow_integration_like() {
     match forwarded {
         Op::PatchApproval { id, decision } => {
             assert_eq!(id, "sub-xyz");
-            assert!(matches!(
-                decision,
-                codex_core::protocol::ReviewDecision::Approved
-            ));
+            assert_matches!(decision, codex_core::protocol::ReviewDecision::Approved);
         }
         other => panic!("unexpected op forwarded: {other:?}"),
     }
@@ -2020,9 +2193,10 @@ fn plan_update_renders_history_cell() {
 }
 
 #[test]
-fn stream_error_is_rendered_to_history() {
+fn stream_error_updates_status_indicator() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual();
-    let msg = "stream error: stream disconnected before completion: idle timeout waiting for SSE; retrying 1/5 in 211ms…";
+    chat.bottom_pane.set_task_running(true);
+    let msg = "Re-connecting... 2/5";
     chat.handle_codex_event(Event {
         id: "sub-1".into(),
         msg: EventMsg::StreamError(StreamErrorEvent {
@@ -2031,11 +2205,15 @@ fn stream_error_is_rendered_to_history() {
     });
 
     let cells = drain_insert_history(&mut rx);
-    assert!(!cells.is_empty(), "expected a history cell for StreamError");
-    let blob = lines_to_single_string(cells.last().unwrap());
-    assert!(blob.contains('⚠'));
-    assert!(blob.contains("stream error:"));
-    assert!(blob.contains("idle timeout waiting for SSE"));
+    assert!(
+        cells.is_empty(),
+        "expected no history cell for StreamError event"
+    );
+    let status = chat
+        .bottom_pane
+        .status_widget()
+        .expect("status indicator should be visible");
+    assert_eq!(status.header(), msg);
 }
 
 #[test]

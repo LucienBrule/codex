@@ -2,6 +2,10 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::time::Duration;
+use std::time::Instant;
 
 use codex_core::config::Config;
 use codex_core::config_types::Notifications;
@@ -21,10 +25,15 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecApprovalRequestEvent;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
+use codex_core::protocol::ExecCommandOutputDeltaEvent;
 use codex_core::protocol::ExitedReviewModeEvent;
+use codex_core::protocol::HeartbeatEvent;
 use codex_core::protocol::InputItem;
 use codex_core::protocol::InputMessageKind;
 use codex_core::protocol::ListCustomPromptsResponseEvent;
+use codex_core::protocol::MailboxDeliveryEvent;
+use codex_core::protocol::MailboxDeliveryState;
+use codex_core::protocol::MailboxLivenessState;
 use codex_core::protocol::McpListToolsResponseEvent;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
@@ -43,6 +52,7 @@ use codex_core::protocol::ViewImageToolCallEvent;
 use codex_core::protocol::WebSearchBeginEvent;
 use codex_core::protocol::WebSearchEndEvent;
 use codex_protocol::ConversationId;
+use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::parse_command::ParsedCommand;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -80,9 +90,15 @@ use crate::history_cell;
 use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
+use crate::mailbox::MailboxActionKind;
+use crate::mailbox::MailboxActionOutcome;
+use crate::mailbox::MailboxStore;
+use crate::mailbox::MailboxView;
+use crate::mailbox::SharedMailboxStore;
 use crate::markdown::append_markdown;
 use crate::slash_command::SlashCommand;
 use crate::status::RateLimitSnapshotDisplay;
+use crate::status_indicator_widget::LivenessBadge;
 use crate::text_formatting::truncate_text;
 use crate::tui::FrameRequester;
 mod interrupts;
@@ -233,6 +249,7 @@ pub(crate) struct ChatWidget {
     // Stream lifecycle controller
     stream_controller: Option<StreamController>,
     running_commands: HashMap<String, RunningCommand>,
+    pending_exec_output: HashMap<String, Vec<ExecCommandOutputDeltaEvent>>,
     task_complete_pending: bool,
     // Queue of interruptive UI events deferred during an active write cycle
     interrupts: InterruptManager,
@@ -240,6 +257,10 @@ pub(crate) struct ChatWidget {
     reasoning_buffer: String,
     // Accumulates full reasoning content for transcript-only recording
     full_reasoning_buffer: String,
+    // Current status header shown in the status indicator.
+    current_status_header: String,
+    // Previous status header to restore after a transient stream retry.
+    retry_status_header: Option<String>,
     conversation_id: Option<ConversationId>,
     frame_requester: FrameRequester,
     // Whether to include the initial welcome banner on session configured
@@ -260,6 +281,8 @@ pub(crate) struct ChatWidget {
     needs_final_message_separator: bool,
 
     last_rendered_width: std::cell::Cell<Option<usize>>,
+    current_liveness_badge: Option<LivenessBadge>,
+    mailbox: SharedMailboxStore,
 }
 
 struct UserMessage {
@@ -301,6 +324,101 @@ impl ChatWidget {
         {
             self.add_boxed_history(cell);
         }
+    }
+
+    fn maybe_enqueue_summary_banner(&mut self) {
+        // Surface a concise, non-blocking banner when background summaries emit
+        // updates. Default behavior is quiet unless summaries are explicitly
+        // enabled in configuration.
+        if !self.config.summaries.enabled {
+            return;
+        }
+
+        // Throttle to avoid noisy updates if the emitter cadence is low.
+        const THROTTLE: Duration = Duration::from_secs(30);
+        static LAST_BANNER_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+        let lock = LAST_BANNER_AT.get_or_init(|| Mutex::new(None));
+        let now = Instant::now();
+        if let Ok(mut last_opt) = lock.lock() {
+            if let Some(last) = *last_opt {
+                if now.duration_since(last) < THROTTLE {
+                    return;
+                }
+            }
+            *last_opt = Some(now);
+        }
+
+        // Prepend a single banner line ahead of any queued user messages.
+        let mut messages: Vec<String> = Vec::with_capacity(self.queued_user_messages.len() + 1);
+        messages.push("summary updated".to_string());
+        messages.extend(self.queued_user_messages.iter().map(|m| m.text.clone()));
+        self.bottom_pane.set_queued_user_messages(messages);
+        self.request_redraw();
+    }
+
+    fn set_status_header(&mut self, header: String) {
+        if self.current_status_header == header {
+            return;
+        }
+        self.current_status_header = header.clone();
+        self.bottom_pane.update_status_header(header);
+    }
+
+    fn refresh_mailbox_badge(&mut self) {
+        let badge = self.mailbox.lock().ok().and_then(|store| store.badge());
+        self.bottom_pane.set_mailbox_badge(badge);
+    }
+
+    fn on_mailbox_delivery(&mut self, event: MailboxDeliveryEvent) {
+        if let Ok(mut store) = self.mailbox.lock() {
+            store.upsert_delivery(event.clone());
+        }
+        self.refresh_mailbox_badge();
+
+        if event.state == MailboxDeliveryState::Delivered {
+            let ack_hint = format!(
+                "Press Ctrl+M, then A to acknowledge {}",
+                event.message.message_id
+            );
+            self.add_to_history(history_cell::new_mailbox_event(
+                &self.config,
+                &event,
+                ack_hint,
+            ));
+            self.notify(Notification::Mailbox {
+                subject: event.message.body.subject.clone(),
+                ack_required: event.message.ack_policy.mode == MailboxAckMode::Required,
+            });
+            self.request_redraw();
+        }
+    }
+
+    fn open_mailbox_view(&mut self) {
+        let pending = self
+            .mailbox
+            .lock()
+            .map(|store| store.pending_snapshots().len())
+            .unwrap_or(0);
+        if pending == 0 {
+            self.add_info_message("Mailbox inbox is clear.".to_string(), None);
+            return;
+        }
+        let view = MailboxView::new(self.mailbox.clone(), self.app_event_tx.clone());
+        self.bottom_pane.show_view(Box::new(view));
+        self.request_redraw();
+    }
+
+    pub(crate) fn handle_mailbox_action(&mut self, outcome: MailboxActionOutcome) {
+        match outcome.action {
+            MailboxActionKind::Acked => {
+                self.add_to_history(history_cell::new_mailbox_ack(&outcome));
+            }
+            MailboxActionKind::Dismissed => {
+                self.add_to_history(history_cell::new_mailbox_dismiss(&outcome));
+            }
+        }
+        self.refresh_mailbox_badge();
+        self.request_redraw();
     }
 
     // --- Small event handlers ---
@@ -352,7 +470,7 @@ impl ChatWidget {
 
         if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
             // Update the shimmer header to the extracted reasoning chunk header.
-            self.bottom_pane.update_status_header(header);
+            self.set_status_header(header);
         } else {
             // Fallback while we don't yet have a bold header: leave existing header as-is.
         }
@@ -381,11 +499,36 @@ impl ChatWidget {
         self.reasoning_buffer.clear();
     }
 
+    fn on_heartbeat(&mut self, event: HeartbeatEvent) {
+        if let Some(state) = event.liveness {
+            let badge = LivenessBadge {
+                state,
+                transport_lag: event.transport_lag_ms.map(Duration::from_millis),
+                queue_depth: event.queue_depth,
+            };
+            let should_display = state != MailboxLivenessState::Active;
+            let next_badge = if should_display {
+                Some(badge.clone())
+            } else {
+                None
+            };
+            self.current_liveness_badge = next_badge.clone();
+            self.bottom_pane.update_liveness_indicator(next_badge);
+        } else {
+            self.current_liveness_badge = None;
+            self.bottom_pane.update_liveness_indicator(None);
+        }
+    }
+
     // Raw reasoning uses the same flow as summarized reasoning
 
     fn on_task_started(&mut self) {
         self.bottom_pane.clear_ctrl_c_quit_hint();
         self.bottom_pane.set_task_running(true);
+        self.current_liveness_badge = None;
+        self.bottom_pane.update_liveness_indicator(None);
+        self.retry_status_header = None;
+        self.set_status_header(String::from("Working"));
         self.full_reasoning_buffer.clear();
         self.reasoning_buffer.clear();
         self.request_redraw();
@@ -395,8 +538,11 @@ impl ChatWidget {
         // If a stream is currently active, finalize it.
         self.flush_answer_stream_with_separator();
         // Mark task stopped and request redraw now that all content is in history.
+        self.current_liveness_badge = None;
+        self.bottom_pane.update_liveness_indicator(None);
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
+        self.pending_exec_output.clear();
         self.request_redraw();
 
         // If there is a queued user message, send exactly one now to begin the next turn.
@@ -459,6 +605,7 @@ impl ChatWidget {
         // Reset running state and clear streaming buffers.
         self.bottom_pane.set_task_running(false);
         self.running_commands.clear();
+        self.pending_exec_output.clear();
         self.stream_controller = None;
     }
 
@@ -537,11 +684,58 @@ impl ChatWidget {
         self.defer_or_handle(|q| q.push_exec_begin(ev), |s| s.handle_exec_begin_now(ev2));
     }
 
-    fn on_exec_command_output_delta(
-        &mut self,
-        _ev: codex_core::protocol::ExecCommandOutputDeltaEvent,
-    ) {
-        // TODO: Handle streaming exec output if/when implemented
+    fn on_exec_command_output_delta(&mut self, ev: ExecCommandOutputDeltaEvent) {
+        let call_id = ev.call_id.clone();
+        if !self.apply_exec_output_delta(&ev) {
+            self.pending_exec_output
+                .entry(call_id)
+                .or_default()
+                .push(ev);
+        }
+    }
+
+    fn apply_exec_output_delta(&mut self, ev: &ExecCommandOutputDeltaEvent) -> bool {
+        if ev.chunk.is_empty() {
+            return true;
+        }
+
+        let Some(cell) = self.exec_cell_for_call_mut(&ev.call_id) else {
+            return false;
+        };
+
+        if cell.append_live_output(&ev.call_id, ev.stream.clone(), &ev.chunk) {
+            self.request_redraw();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn exec_cell_for_call_mut(&mut self, call_id: &str) -> Option<&mut ExecCell> {
+        let has_call = self
+            .active_cell
+            .as_ref()
+            .and_then(|cell| cell.as_any().downcast_ref::<ExecCell>())
+            .map(|exec| exec.iter_calls().any(|c| c.call_id == call_id))
+            .unwrap_or(false);
+
+        if !has_call {
+            let (command, parsed) = match self.running_commands.get(call_id) {
+                Some(running) => (running.command.clone(), running.parsed_cmd.clone()),
+                None => return None,
+            };
+
+            self.flush_active_cell();
+            self.active_cell = Some(Box::new(new_active_exec_command(
+                call_id.to_string(),
+                command,
+                parsed,
+            )));
+        }
+
+        self.active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
     }
 
     fn on_patch_apply_begin(&mut self, event: PatchApplyBeginEvent) {
@@ -620,10 +814,16 @@ impl ChatWidget {
         debug!("BackgroundEvent: {message}");
     }
 
+    fn on_summary_updated(&mut self) {
+        // Non-blocking: just push a banner into the status indicator with throttle.
+        self.maybe_enqueue_summary_banner();
+    }
+
     fn on_stream_error(&mut self, message: String) {
-        // Show stream errors in the transcript so users see retry/backoff info.
-        self.add_to_history(history_cell::new_stream_error_event(message));
-        self.request_redraw();
+        if self.retry_status_header.is_none() {
+            self.retry_status_header = Some(self.current_status_header.clone());
+        }
+        self.set_status_header(message);
     }
 
     /// Periodic tick to commit at most one queued line to history with a small delay,
@@ -701,6 +901,7 @@ impl ChatWidget {
 
     pub(crate) fn handle_exec_end_now(&mut self, ev: ExecCommandEndEvent) {
         let running = self.running_commands.remove(&ev.call_id);
+        self.pending_exec_output.remove(&ev.call_id);
         let (command, parsed) = match running {
             Some(rc) => (rc.command, rc.parsed_cmd),
             None => (vec![ev.call_id.clone()], Vec::new()),
@@ -818,6 +1019,12 @@ impl ChatWidget {
             )));
         }
 
+        if let Some(pending) = self.pending_exec_output.remove(&ev.call_id) {
+            for delta in pending {
+                let _ = self.apply_exec_output_delta(&delta);
+            }
+        }
+
         self.request_redraw();
     }
 
@@ -898,6 +1105,7 @@ impl ChatWidget {
         let mut rng = rand::rng();
         let placeholder = EXAMPLE_PROMPTS[rng.random_range(0..EXAMPLE_PROMPTS.len())].to_string();
         let codex_op_tx = spawn_agent(config.clone(), app_event_tx.clone(), conversation_manager);
+        let mailbox = Arc::new(Mutex::new(MailboxStore::new()));
 
         Self {
             app_event_tx: app_event_tx.clone(),
@@ -924,10 +1132,13 @@ impl ChatWidget {
             rate_limit_warnings: RateLimitWarningState::default(),
             stream_controller: None,
             running_commands: HashMap::new(),
+            pending_exec_output: HashMap::new(),
             task_complete_pending: false,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            current_status_header: String::from("Working"),
+            retry_status_header: None,
             conversation_id: None,
             queued_user_messages: VecDeque::new(),
             show_welcome_banner: true,
@@ -938,6 +1149,8 @@ impl ChatWidget {
             ghost_snapshots_disabled: true,
             needs_final_message_separator: false,
             last_rendered_width: std::cell::Cell::new(None),
+            current_liveness_badge: None,
+            mailbox,
         }
     }
 
@@ -961,6 +1174,7 @@ impl ChatWidget {
 
         let codex_op_tx =
             spawn_agent_from_existing(conversation, session_configured, app_event_tx.clone());
+        let mailbox = Arc::new(Mutex::new(MailboxStore::new()));
 
         Self {
             app_event_tx: app_event_tx.clone(),
@@ -987,10 +1201,13 @@ impl ChatWidget {
             rate_limit_warnings: RateLimitWarningState::default(),
             stream_controller: None,
             running_commands: HashMap::new(),
+            pending_exec_output: HashMap::new(),
             task_complete_pending: false,
             interrupts: InterruptManager::new(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            current_status_header: String::from("Working"),
+            retry_status_header: None,
             conversation_id: None,
             queued_user_messages: VecDeque::new(),
             show_welcome_banner: true,
@@ -1001,6 +1218,8 @@ impl ChatWidget {
             ghost_snapshots_disabled: true,
             needs_final_message_separator: false,
             last_rendered_width: std::cell::Cell::new(None),
+            current_liveness_badge: None,
+            mailbox,
         }
     }
 
@@ -1015,23 +1234,32 @@ impl ChatWidget {
     pub(crate) fn handle_key_event(&mut self, key_event: KeyEvent) {
         match key_event {
             KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                code: KeyCode::Char(c),
+                modifiers,
                 kind: KeyEventKind::Press,
                 ..
-            } => {
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
                 self.on_ctrl_c();
                 return;
             }
             KeyEvent {
-                code: KeyCode::Char('v'),
-                modifiers: KeyModifiers::CONTROL,
+                code: KeyCode::Char(c),
+                modifiers,
                 kind: KeyEventKind::Press,
                 ..
-            } => {
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'v') => {
                 if let Ok((path, info)) = paste_image_to_temp_png() {
                     self.attach_image(path, info.width, info.height, info.encoded_format.label());
                 }
+                return;
+            }
+            KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                kind: KeyEventKind::Press,
+                ..
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'m') => {
+                self.open_mailbox_view();
                 return;
             }
             other if other.kind == KeyEventKind::Press => {
@@ -1123,6 +1351,9 @@ impl ChatWidget {
             }
             SlashCommand::Approvals => {
                 self.open_approvals_popup();
+            }
+            SlashCommand::Mailbox => {
+                self.open_mailbox_view();
             }
             SlashCommand::Quit => {
                 self.app_event_tx.send(AppEvent::ExitRequest);
@@ -1373,6 +1604,7 @@ impl ChatWidget {
 
         match msg {
             EventMsg::SessionConfigured(e) => self.on_session_configured(e),
+            EventMsg::SummaryUpdated(_) => self.on_summary_updated(),
             EventMsg::AgentMessage(AgentMessageEvent { message }) => self.on_agent_message(message),
             EventMsg::AgentMessageDelta(AgentMessageDeltaEvent { delta }) => {
                 self.on_agent_message_delta(delta)
@@ -1447,6 +1679,8 @@ impl ChatWidget {
                 self.on_entered_review_mode(review_request)
             }
             EventMsg::ExitedReviewMode(review) => self.on_exited_review_mode(review),
+            EventMsg::MailboxDelivery(event) => self.on_mailbox_delivery(event),
+            EventMsg::Heartbeat(ev) => self.on_heartbeat(ev),
         }
     }
 
@@ -1906,7 +2140,11 @@ impl ChatWidget {
     }
 
     fn on_list_mcp_tools(&mut self, ev: McpListToolsResponseEvent) {
-        self.add_to_history(history_cell::new_mcp_tools_output(&self.config, ev.tools));
+        self.add_to_history(history_cell::new_mcp_tools_output(
+            &self.config,
+            ev.tools,
+            &ev.auth_statuses,
+        ));
     }
 
     fn on_list_custom_prompts(&mut self, ev: ListCustomPromptsResponseEvent) {
@@ -2135,9 +2373,20 @@ impl WidgetRef for &ChatWidget {
 }
 
 enum Notification {
-    AgentTurnComplete { response: String },
-    ExecApprovalRequested { command: String },
-    EditApprovalRequested { cwd: PathBuf, changes: Vec<PathBuf> },
+    AgentTurnComplete {
+        response: String,
+    },
+    ExecApprovalRequested {
+        command: String,
+    },
+    EditApprovalRequested {
+        cwd: PathBuf,
+        changes: Vec<PathBuf>,
+    },
+    Mailbox {
+        subject: Option<String>,
+        ack_required: bool,
+    },
 }
 
 impl Notification {
@@ -2161,6 +2410,19 @@ impl Notification {
                     }
                 )
             }
+            Notification::Mailbox {
+                subject,
+                ack_required,
+            } => {
+                let headline = subject
+                    .clone()
+                    .unwrap_or_else(|| "New mailbox message".to_string());
+                if *ack_required {
+                    format!("Mailbox (ack required): {headline}")
+                } else {
+                    format!("Mailbox: {headline}")
+                }
+            }
         }
     }
 
@@ -2169,6 +2431,7 @@ impl Notification {
             Notification::AgentTurnComplete { .. } => "agent-turn-complete",
             Notification::ExecApprovalRequested { .. }
             | Notification::EditApprovalRequested { .. } => "approval-requested",
+            Notification::Mailbox { .. } => "mailbox",
         }
     }
 

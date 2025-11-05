@@ -12,6 +12,9 @@ dist/
 build/
 out/
 storybook-static/
+target/
+docker-data/
+docker/fedora42-mail-server/codex-mail-server
 
 # ignore README for publishing
 codex-cli/README.md

@@ -14,6 +14,7 @@ use crate::ConversationId;
 use crate::config_types::ReasoningEffort as ReasoningEffortConfig;
 use crate::config_types::ReasoningSummary as ReasoningSummaryConfig;
 use crate::custom_prompts::CustomPrompt;
+use crate::mailbox::MailboxMessage;
 use crate::message_history::HistoryEntry;
 use crate::models::ContentItem;
 use crate::models::ResponseItem;
@@ -27,6 +28,7 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_with::serde_as;
 use strum_macros::Display;
+use time::OffsetDateTime;
 use ts_rs::TS;
 
 /// Open/close tags for special user-input blocks. Used across crates to avoid
@@ -91,6 +93,11 @@ pub enum Op {
         // The JSON schema to use for the final assistant message
         final_output_json_schema: Option<Value>,
     },
+
+    /// Enqueue an out-of-band mailbox envelope for delivery while the session
+    /// is idle or processing another turn. Experimental and guarded by the
+    /// `CODEX_MAILBOX_OOB` feature flag.
+    MailboxEnvelope { envelope: MailboxMessage },
 
     /// Override parts of the persistent turn context for subsequent turns.
     ///
@@ -486,6 +493,9 @@ pub enum EventMsg {
 
     BackgroundEvent(BackgroundEventEvent),
 
+    /// Delivery lifecycle update for an out-of-band mailbox message.
+    MailboxDelivery(MailboxDeliveryEvent),
+
     /// Notification that a model stream experienced an error or disconnect
     /// and the system is handling it (e.g., retrying with backoff).
     StreamError(StreamErrorEvent),
@@ -508,12 +518,21 @@ pub enum EventMsg {
     /// List of custom prompts available to the agent.
     ListCustomPromptsResponse(ListCustomPromptsResponseEvent),
 
+    /// Background conversation summary update produced by the SummariesService.
+    ///
+    /// This event is emitted opportunistically in the background to provide
+    /// a compact, human-readable running summary of the conversation.
+    SummaryUpdated(SummaryUpdatedEvent),
+
     PlanUpdate(UpdatePlanArgs),
 
     TurnAborted(TurnAbortedEvent),
 
     /// Notification that the agent is shutting down.
     ShutdownComplete,
+
+    /// Transport heartbeat emitted while streaming model output.
+    Heartbeat(HeartbeatEvent),
 
     ConversationPath(ConversationPathResponseEvent),
 
@@ -548,10 +567,15 @@ pub struct TaskStartedEvent {
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default, TS)]
 pub struct TokenUsage {
+    #[ts(type = "number")]
     pub input_tokens: u64,
+    #[ts(type = "number")]
     pub cached_input_tokens: u64,
+    #[ts(type = "number")]
     pub output_tokens: u64,
+    #[ts(type = "number")]
     pub reasoning_output_tokens: u64,
+    #[ts(type = "number")]
     pub total_tokens: u64,
 }
 
@@ -559,6 +583,7 @@ pub struct TokenUsage {
 pub struct TokenUsageInfo {
     pub total_token_usage: TokenUsage,
     pub last_token_usage: TokenUsage,
+    #[ts(type = "number | null")]
     pub model_context_window: Option<u64>,
 }
 
@@ -590,6 +615,31 @@ impl TokenUsageInfo {
         self.total_token_usage.add_assign(last);
         self.last_token_usage = last.clone();
     }
+
+    pub fn fill_to_context_window(&mut self, context_window: u64) {
+        let previous_total = self.total_token_usage.total_tokens;
+        let delta = context_window.saturating_sub(previous_total);
+
+        self.model_context_window = Some(context_window);
+        self.total_token_usage = TokenUsage {
+            total_tokens: context_window,
+            ..TokenUsage::default()
+        };
+        self.last_token_usage = TokenUsage {
+            total_tokens: delta,
+            ..TokenUsage::default()
+        };
+    }
+
+    pub fn full_context_window(context_window: u64) -> Self {
+        let mut info = Self {
+            total_token_usage: TokenUsage::default(),
+            last_token_usage: TokenUsage::default(),
+            model_context_window: Some(context_window),
+        };
+        info.fill_to_context_window(context_window);
+        info
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -609,8 +659,10 @@ pub struct RateLimitWindow {
     /// Percentage (0-100) of the window that has been consumed.
     pub used_percent: f64,
     /// Rolling window duration, in minutes.
+    #[ts(type = "number | null")]
     pub window_minutes: Option<u64>,
     /// Seconds until the window resets.
+    #[ts(type = "number | null")]
     pub resets_in_seconds: Option<u64>,
 }
 
@@ -974,6 +1026,8 @@ pub enum RolloutItem {
     Compacted(CompactedItem),
     TurnContext(TurnContextItem),
     EventMsg(EventMsg),
+    /// Durable background summary snapshot emitted by the summaries service.
+    SummarySnapshot(SummarySnapshotItem),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, TS)]
@@ -1002,6 +1056,23 @@ pub struct TurnContextItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffortConfig>,
     pub summary: ReasoningSummaryConfig,
+}
+
+/// A durable snapshot of the current conversation summary.
+///
+/// This is written to rollout files so that background summary updates can be
+/// recovered on resume and inspected offline without relying on transient UI
+/// state.
+#[derive(Serialize, Deserialize, Clone, Debug, TS)]
+pub struct SummarySnapshotItem {
+    /// Human‑readable running summary of the conversation so far.
+    pub summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct SummaryUpdatedEvent {
+    /// Human‑readable running summary of the conversation so far.
+    pub summary: String,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1165,9 +1236,83 @@ pub struct BackgroundEventEvent {
     pub message: String,
 }
 
+/// Structured mailbox delivery payload that downstream clients can consume.
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct MailboxDeliveryEvent {
+    pub message: MailboxMessage,
+    pub state: MailboxDeliveryState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null")]
+    pub queue_depth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(with = "time::serde::rfc3339::option")]
+    #[ts(type = "string | null")]
+    pub observed_at: Option<OffsetDateTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | null")]
+    pub correlation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub ingress: Option<MailboxDeliveryIngress>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub delivery_latency_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum MailboxDeliveryState {
+    Enqueued,
+    Delivered,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum MailboxDeliveryIngress {
+    Cli,
+    Script,
+    Mcp,
+    Vscode,
+    Api,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 pub struct StreamErrorEvent {
     pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+pub struct StreamInfoEvent {
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, TS)]
+#[ts(export)]
+pub struct HeartbeatEvent {
+    #[serde(with = "time::serde::rfc3339")]
+    #[ts(type = "string")]
+    pub observed_at: OffsetDateTime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub transport_lag_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub queue_depth: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub liveness: Option<MailboxLivenessState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, TS)]
+#[ts(export)]
+#[ts(rename_all = "snake_case")]
+pub enum MailboxLivenessState {
+    Active,
+    Idle,
+    Stalled,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
@@ -1210,6 +1355,30 @@ pub struct GetHistoryEntryResponseEvent {
 pub struct McpListToolsResponseEvent {
     /// Fully qualified tool name -> tool definition.
     pub tools: std::collections::HashMap<String, McpTool>,
+    /// Authentication status for each configured MCP server.
+    pub auth_statuses: std::collections::HashMap<String, McpAuthStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename_all = "snake_case")]
+pub enum McpAuthStatus {
+    Unsupported,
+    NotLoggedIn,
+    BearerToken,
+    OAuth,
+}
+
+impl fmt::Display for McpAuthStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            McpAuthStatus::Unsupported => "Unsupported",
+            McpAuthStatus::NotLoggedIn => "Not logged in",
+            McpAuthStatus::BearerToken => "Bearer token",
+            McpAuthStatus::OAuth => "OAuth",
+        };
+        f.write_str(text)
+    }
 }
 
 /// Response payload for `Op::ListCustomPrompts`.
@@ -1359,6 +1528,43 @@ mod tests {
 
         let deserialized: ExecCommandOutputDeltaEvent = serde_json::from_str(&serialized)?;
         assert_eq!(deserialized, event);
+        Ok(())
+    }
+
+    #[test]
+    fn heartbeat_event_ts_decl_includes_liveness() {
+        use ts_rs::TS;
+        let decl = HeartbeatEvent::decl();
+        assert!(decl.contains("transport_lag_ms"), "{decl}");
+        assert!(decl.contains("queue_depth"), "{decl}");
+        assert!(decl.contains("liveness"), "{decl}");
+    }
+
+    #[test]
+    fn rollout_summary_snapshot_roundtrip() -> Result<()> {
+        let item = RolloutItem::SummarySnapshot(SummarySnapshotItem {
+            summary: "hello world".to_string(),
+        });
+        let line = RolloutLine {
+            timestamp: "2025-10-17T00:00:00.000Z".to_string(),
+            item,
+        };
+
+        let json = serde_json::to_value(&line)?;
+        assert_eq!(
+            json,
+            json!({
+                "timestamp": "2025-10-17T00:00:00.000Z",
+                "type": "summary_snapshot",
+                "payload": {"summary": "hello world"}
+            })
+        );
+
+        let back: RolloutLine = serde_json::from_value(json)?;
+        match back.item {
+            RolloutItem::SummarySnapshot(s) => assert_eq!(s.summary, "hello world"),
+            other => panic!("unexpected variant: {other:?}"),
+        }
         Ok(())
     }
 }

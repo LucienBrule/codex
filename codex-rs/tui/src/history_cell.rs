@@ -6,13 +6,16 @@ use crate::exec_cell::TOOL_CALL_MAX_LINES;
 use crate::exec_cell::output_lines;
 use crate::exec_cell::spinner;
 use crate::exec_command::relativize_to_home;
+use crate::exec_command::strip_bash_lc_and_escape;
+use crate::mailbox::MailboxActionOutcome;
 use crate::markdown::MarkdownCitationContext;
 use crate::markdown::append_markdown;
 use crate::render::line_utils::line_to_static;
 use crate::render::line_utils::prefix_lines;
+use crate::render::line_utils::push_owned_lines;
 use crate::style::user_message_style;
-use crate::terminal_palette::default_bg;
 use crate::text_formatting::format_and_truncate_tool_result;
+use crate::text_formatting::truncate_text;
 use crate::ui_consts::LIVE_PREFIX_COLS;
 use crate::wrapping::RtOptions;
 use crate::wrapping::word_wrap_line;
@@ -22,13 +25,17 @@ use codex_core::config::Config;
 use codex_core::config_types::McpServerTransportConfig;
 use codex_core::config_types::ReasoningSummaryFormat;
 use codex_core::protocol::FileChange;
+use codex_core::protocol::MailboxDeliveryEvent;
+use codex_core::protocol::McpAuthStatus;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol_config_types::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::plan_tool::PlanItemArg;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
 use image::DynamicImage;
+use image::ImageFormat;
 use image::ImageReader;
 use mcp_types::EmbeddedResourceResource;
 use mcp_types::ResourceLink;
@@ -47,6 +54,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
 use std::time::Instant;
+use textwrap::wrap;
 use tracing::error;
 use unicode_width::UnicodeWidthStr;
 
@@ -56,12 +64,31 @@ use unicode_width::UnicodeWidthStr;
 pub(crate) trait HistoryCell: std::fmt::Debug + Send + Sync + Any {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>>;
 
-    fn transcript_lines(&self) -> Vec<Line<'static>> {
-        self.display_lines(u16::MAX)
-    }
-
     fn desired_height(&self, width: u16) -> u16 {
         Paragraph::new(Text::from(self.display_lines(width)))
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .try_into()
+            .unwrap_or(0)
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.display_lines(width)
+    }
+
+    fn desired_transcript_height(&self, width: u16) -> u16 {
+        let lines = self.transcript_lines(width);
+        // Workaround for ratatui bug: if there's only one line and it's whitespace-only, ratatui gives 2 lines.
+        if let [line] = &lines[..]
+            && line
+                .spans
+                .iter()
+                .all(|s| s.content.chars().all(char::is_whitespace))
+        {
+            return 1;
+        }
+
+        Paragraph::new(Text::from(lines))
             .wrap(Wrap { trim: false })
             .line_count(width)
             .try_into()
@@ -92,31 +119,23 @@ impl HistoryCell for UserHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
 
-        // Use ratatui-aware word wrapping and prefixing to avoid lifetime issues.
-        let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS); // account for the ▌ prefix and trailing space
+        let wrap_width = width.saturating_sub(LIVE_PREFIX_COLS);
 
-        let style = user_message_style(default_bg());
+        let style = user_message_style();
 
-        // Use our ratatui wrapping helpers for correct styling and lifetimes.
         let wrapped = word_wrap_lines(
             &self
                 .message
                 .lines()
                 .map(|l| Line::from(l).style(style))
                 .collect::<Vec<_>>(),
-            RtOptions::new(wrap_width as usize),
+            // Wrap algorithm matches textarea.rs.
+            RtOptions::new(wrap_width as usize).wrap_algorithm(textwrap::WrapAlgorithm::FirstFit),
         );
 
         lines.push(Line::from("").style(style));
         lines.extend(prefix_lines(wrapped, "› ".bold().dim(), "  ".into()));
         lines.push(Line::from("").style(style));
-        lines
-    }
-
-    fn transcript_lines(&self) -> Vec<Line<'static>> {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        lines.push("user".cyan().bold().into());
-        lines.extend(self.message.lines().map(|l| l.to_string().into()));
         lines
     }
 }
@@ -126,6 +145,7 @@ pub(crate) struct ReasoningSummaryCell {
     _header: String,
     content: String,
     citation_context: MarkdownCitationContext,
+    transcript_only: bool,
 }
 
 impl ReasoningSummaryCell {
@@ -133,17 +153,17 @@ impl ReasoningSummaryCell {
         header: String,
         content: String,
         citation_context: MarkdownCitationContext,
+        transcript_only: bool,
     ) -> Self {
         Self {
             _header: header,
             content,
             citation_context,
+            transcript_only,
         }
     }
-}
 
-impl HistoryCell for ReasoningSummaryCell {
-    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+    fn lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         append_markdown(
             &self.content,
@@ -151,7 +171,7 @@ impl HistoryCell for ReasoningSummaryCell {
             &mut lines,
             self.citation_context.clone(),
         );
-        let summary_style = Style::default().add_modifier(Modifier::DIM | Modifier::ITALIC);
+        let summary_style = Style::default().dim().italic();
         let summary_lines = lines
             .into_iter()
             .map(|mut line| {
@@ -171,19 +191,31 @@ impl HistoryCell for ReasoningSummaryCell {
                 .subsequent_indent("  ".into()),
         )
     }
+}
 
-    fn transcript_lines(&self) -> Vec<Line<'static>> {
-        let mut out: Vec<Line<'static>> = Vec::new();
-        out.push("thinking".magenta().bold().into());
-        let mut lines = Vec::new();
-        append_markdown(
-            &self.content,
-            None,
-            &mut lines,
-            self.citation_context.clone(),
-        );
-        out.extend(lines);
-        out
+impl HistoryCell for ReasoningSummaryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if self.transcript_only {
+            Vec::new()
+        } else {
+            self.lines(width)
+        }
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        if self.transcript_only {
+            0
+        } else {
+            self.lines(width).len() as u16
+        }
+    }
+
+    fn transcript_lines(&self, width: u16) -> Vec<Line<'static>> {
+        self.lines(width)
+    }
+
+    fn desired_transcript_height(&self, width: u16) -> u16 {
+        self.lines(width).len() as u16
     }
 }
 
@@ -216,15 +248,6 @@ impl HistoryCell for AgentMessageCell {
         )
     }
 
-    fn transcript_lines(&self) -> Vec<Line<'static>> {
-        let mut out: Vec<Line<'static>> = Vec::new();
-        if self.is_first_line {
-            out.push("codex".magenta().bold().into());
-        }
-        out.extend(self.lines.clone());
-        out
-    }
-
     fn is_stream_continuation(&self) -> bool {
         !self.is_first_line
     }
@@ -248,18 +271,151 @@ impl HistoryCell for PlainHistoryCell {
 }
 
 #[derive(Debug)]
-pub(crate) struct TranscriptOnlyHistoryCell {
-    lines: Vec<Line<'static>>,
+pub(crate) struct PrefixedWrappedHistoryCell {
+    text: Text<'static>,
+    initial_prefix: Line<'static>,
+    subsequent_prefix: Line<'static>,
 }
 
-impl HistoryCell for TranscriptOnlyHistoryCell {
-    fn display_lines(&self, _width: u16) -> Vec<Line<'static>> {
-        Vec::new()
+impl PrefixedWrappedHistoryCell {
+    pub(crate) fn new(
+        text: impl Into<Text<'static>>,
+        initial_prefix: impl Into<Line<'static>>,
+        subsequent_prefix: impl Into<Line<'static>>,
+    ) -> Self {
+        Self {
+            text: text.into(),
+            initial_prefix: initial_prefix.into(),
+            subsequent_prefix: subsequent_prefix.into(),
+        }
+    }
+}
+
+impl HistoryCell for PrefixedWrappedHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let opts = RtOptions::new(width.max(1) as usize)
+            .initial_indent(self.initial_prefix.clone())
+            .subsequent_indent(self.subsequent_prefix.clone());
+        let wrapped = word_wrap_lines(&self.text, opts);
+        let mut out = Vec::new();
+        push_owned_lines(&wrapped, &mut out);
+        out
     }
 
-    fn transcript_lines(&self) -> Vec<Line<'static>> {
-        self.lines.clone()
+    fn desired_height(&self, width: u16) -> u16 {
+        self.display_lines(width).len() as u16
     }
+}
+
+#[derive(Debug)]
+struct MailboxHistoryCell {
+    lines: Vec<String>,
+}
+
+impl MailboxHistoryCell {
+    fn new(lines: Vec<String>) -> Self {
+        Self { lines }
+    }
+}
+
+impl HistoryCell for MailboxHistoryCell {
+    fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let max_width = width.max(1) as usize;
+        let mut out = Vec::new();
+        for raw in &self.lines {
+            if raw.is_empty() {
+                out.push(Line::from(""));
+                continue;
+            }
+            for wrapped in wrap(raw, max_width) {
+                out.push(Line::from(wrapped.to_string()));
+            }
+        }
+        out
+    }
+}
+
+fn truncate_exec_snippet(full_cmd: &str) -> String {
+    let mut snippet = match full_cmd.split_once('\n') {
+        Some((first, _)) => format!("{first} ..."),
+        None => full_cmd.to_string(),
+    };
+    snippet = truncate_text(&snippet, 80);
+    snippet
+}
+
+fn exec_snippet(command: &[String]) -> String {
+    let full_cmd = strip_bash_lc_and_escape(command);
+    truncate_exec_snippet(&full_cmd)
+}
+
+pub fn new_approval_decision_cell(
+    command: Vec<String>,
+    decision: codex_core::protocol::ReviewDecision,
+) -> Box<dyn HistoryCell> {
+    use codex_core::protocol::ReviewDecision::*;
+
+    let (symbol, summary): (Span<'static>, Vec<Span<'static>>) = match decision {
+        Approved => {
+            let snippet = Span::from(exec_snippet(&command)).dim();
+            (
+                "✔ ".green(),
+                vec![
+                    "You ".into(),
+                    "approved".bold(),
+                    " codex to run ".into(),
+                    snippet,
+                    " this time".bold(),
+                ],
+            )
+        }
+        ApprovedForSession => {
+            let snippet = Span::from(exec_snippet(&command)).dim();
+            (
+                "✔ ".green(),
+                vec![
+                    "You ".into(),
+                    "approved".bold(),
+                    " codex to run ".into(),
+                    snippet,
+                    " every time this session".bold(),
+                ],
+            )
+        }
+        Denied => {
+            let snippet = Span::from(exec_snippet(&command)).dim();
+            (
+                "✗ ".red(),
+                vec![
+                    "You ".into(),
+                    "did not approve".bold(),
+                    " codex to run ".into(),
+                    snippet,
+                ],
+            )
+        }
+        Abort => {
+            let snippet = Span::from(exec_snippet(&command)).dim();
+            (
+                "✗ ".red(),
+                vec![
+                    "You ".into(),
+                    "canceled".bold(),
+                    " the request to run ".into(),
+                    snippet,
+                ],
+            )
+        }
+    };
+
+    Box::new(PrefixedWrappedHistoryCell::new(
+        Line::from(summary),
+        symbol,
+        "  ",
+    ))
 }
 
 /// Cyan history cell line showing the current review status.
@@ -445,10 +601,6 @@ pub(crate) fn new_session_info(
 
 pub(crate) fn new_user_prompt(message: String) -> UserHistoryCell {
     UserHistoryCell { message }
-}
-
-pub(crate) fn new_user_approval_decision(lines: Vec<Line<'static>>) -> PlainHistoryCell {
-    PlainHistoryCell { lines }
 }
 
 #[derive(Debug)]
@@ -781,14 +933,22 @@ pub(crate) fn new_web_search_call(query: String) -> PlainHistoryCell {
     PlainHistoryCell { lines }
 }
 
-/// If the first content is an image, return a new cell with the image.
-/// TODO(rgwood-dd): Handle images properly even if they're not the first result.
+/// If any content block is an image, return a new cell with the first image found.
+///
+/// Previously this only handled images when they were the first content block,
+/// which meant mixed‑content tool results like `[Text, Image]` did not surface
+/// an image cell. Scan all blocks to find the first `ImageContent` so images
+/// render even when not first.
 fn try_new_completed_mcp_tool_call_with_image_output(
     result: &Result<mcp_types::CallToolResult, String>,
 ) -> Option<CompletedMcpToolCallWithImageOutput> {
     match result {
         Ok(mcp_types::CallToolResult { content, .. }) => {
-            if let Some(mcp_types::ContentBlock::ImageContent(image)) = content.first() {
+            // Find the first image anywhere in the returned content blocks.
+            if let Some(image) = content.iter().find_map(|block| match block {
+                mcp_types::ContentBlock::ImageContent(img) => Some(img),
+                _ => None,
+            }) {
                 let raw_data = match base64::engine::general_purpose::STANDARD.decode(&image.data) {
                     Ok(data) => data,
                     Err(e) => {
@@ -796,11 +956,20 @@ fn try_new_completed_mcp_tool_call_with_image_output(
                         return None;
                     }
                 };
-                let reader = match ImageReader::new(Cursor::new(raw_data)).with_guessed_format() {
-                    Ok(reader) => reader,
-                    Err(e) => {
-                        error!("Failed to guess image format: {e}");
-                        return None;
+                // Prefer the declared MIME type when available; fall back to format guessing.
+                let reader = if image.mime_type.eq_ignore_ascii_case("image/png") {
+                    ImageReader::with_format(Cursor::new(&raw_data), ImageFormat::Png)
+                } else if image.mime_type.eq_ignore_ascii_case("image/jpeg")
+                    || image.mime_type.eq_ignore_ascii_case("image/jpg")
+                {
+                    ImageReader::with_format(Cursor::new(&raw_data), ImageFormat::Jpeg)
+                } else {
+                    match ImageReader::new(Cursor::new(&raw_data)).with_guessed_format() {
+                        Ok(reader) => reader,
+                        Err(e) => {
+                            error!("Failed to guess image format: {e}");
+                            return None;
+                        }
                     }
                 };
 
@@ -820,6 +989,8 @@ fn try_new_completed_mcp_tool_call_with_image_output(
         _ => None,
     }
 }
+
+// tests live below in the main tests module
 
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn new_warning_event(message: String) -> PlainHistoryCell {
@@ -850,7 +1021,8 @@ pub(crate) fn empty_mcp_output() -> PlainHistoryCell {
 /// Render MCP tools grouped by connection using the fully-qualified tool names.
 pub(crate) fn new_mcp_tools_output(
     config: &Config,
-    tools: std::collections::HashMap<String, mcp_types::Tool>,
+    tools: HashMap<String, mcp_types::Tool>,
+    auth_statuses: &HashMap<String, McpAuthStatus>,
 ) -> PlainHistoryCell {
     let mut lines: Vec<Line<'static>> = vec![
         "/mcp".magenta().into(),
@@ -874,7 +1046,18 @@ pub(crate) fn new_mcp_tools_output(
             .collect();
         names.sort();
 
+        let status = auth_statuses
+            .get(server.as_str())
+            .copied()
+            .unwrap_or(McpAuthStatus::Unsupported);
         lines.push(vec!["  • Server: ".into(), server.clone().into()].into());
+        let status_line = if cfg.enabled {
+            vec!["    • Status: ".into(), "enabled".green()].into()
+        } else {
+            vec!["    • Status: ".into(), "disabled".red()].into()
+        };
+        lines.push(status_line);
+        lines.push(vec!["    • Auth: ".into(), status.to_string().into()].into());
 
         match &cfg.transport {
             McpServerTransportConfig::Stdio { command, args, env } => {
@@ -900,7 +1083,9 @@ pub(crate) fn new_mcp_tools_output(
             }
         }
 
-        if names.is_empty() {
+        if !cfg.enabled {
+            lines.push(vec!["    • Tools: ".into(), "(disabled)".red()].into());
+        } else if names.is_empty() {
             lines.push("    • Tools: (none)".into());
         } else {
             lines.push(vec!["    • Tools: ".into(), names.join(", ").into()].into());
@@ -926,11 +1111,6 @@ pub(crate) fn new_error_event(message: String) -> PlainHistoryCell {
     // before the text. VS16 is intentionally omitted to keep spacing tighter
     // in terminals like Ghostty.
     let lines: Vec<Line<'static>> = vec![vec![format!("■ {message}").red()].into()];
-    PlainHistoryCell { lines }
-}
-
-pub(crate) fn new_stream_error_event(message: String) -> PlainHistoryCell {
-    let lines: Vec<Line<'static>> = vec![vec![padded_emoji("⚠️").into(), message.dim()].into()];
     PlainHistoryCell { lines }
 }
 
@@ -1049,16 +1229,6 @@ pub(crate) fn new_view_image_tool_call(path: PathBuf, cwd: &Path) -> PlainHistor
     PlainHistoryCell { lines }
 }
 
-pub(crate) fn new_reasoning_block(
-    full_reasoning_buffer: String,
-    config: &Config,
-) -> TranscriptOnlyHistoryCell {
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    lines.push(Line::from("thinking".magenta().italic()));
-    append_markdown(&full_reasoning_buffer, None, &mut lines, config);
-    TranscriptOnlyHistoryCell { lines }
-}
-
 pub(crate) fn new_reasoning_summary_block(
     full_reasoning_buffer: String,
     config: &Config,
@@ -1084,12 +1254,18 @@ pub(crate) fn new_reasoning_summary_block(
                         header_buffer,
                         summary_buffer,
                         config.into(),
+                        false,
                     ));
                 }
             }
         }
     }
-    Box::new(new_reasoning_block(full_reasoning_buffer, config))
+    Box::new(ReasoningSummaryCell::new(
+        "".to_string(),
+        full_reasoning_buffer,
+        config.into(),
+        true,
+    ))
 }
 
 #[derive(Debug)]
@@ -1120,10 +1296,6 @@ impl HistoryCell for FinalMessageSeparator {
             vec![Line::from_iter(["─".repeat(width as usize).dim()])]
         }
     }
-
-    fn transcript_lines(&self) -> Vec<Line<'static>> {
-        vec![]
-    }
 }
 
 fn format_mcp_invocation<'a>(invocation: McpInvocation) -> Line<'a> {
@@ -1147,6 +1319,86 @@ fn format_mcp_invocation<'a>(invocation: McpInvocation) -> Line<'a> {
     invocation_spans.into()
 }
 
+pub(crate) fn new_mailbox_event(
+    _config: &Config,
+    delivery: &MailboxDeliveryEvent,
+    ack_hint: String,
+) -> impl HistoryCell {
+    let subject = delivery
+        .message
+        .body
+        .subject
+        .clone()
+        .unwrap_or_else(|| "(no subject)".to_string());
+    let sender = delivery
+        .message
+        .sender
+        .display_name
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| delivery.message.sender.id.clone());
+    let priority = format!("{:?}", delivery.message.priority).to_lowercase();
+    let mut lines: Vec<String> = Vec::new();
+    let header = if delivery.message.ack_policy.mode == MailboxAckMode::Required {
+        format!("[mailbox] {subject} (from {sender}, priority {priority}, ACK required)")
+    } else {
+        format!("[mailbox] {subject} (from {sender}, priority {priority})")
+    };
+    lines.push(header);
+    if let Some(request_id) = delivery.message.audit.request_id.clone() {
+        lines.push(format!("Request ID: {request_id}"));
+    }
+    lines.push(format!("Message ID: {}", delivery.message.message_id));
+    if let Some(observed) = delivery.observed_at {
+        lines.push(format!("Observed at: {observed}"));
+    }
+    if let Some(expires) = delivery.message.expires_at {
+        lines.push(format!("Expires at: {expires}"));
+    }
+    lines.push(String::new());
+    if delivery.message.body.content.trim().is_empty() {
+        lines.push("(empty mailbox message body)".to_string());
+    } else {
+        for row in delivery.message.body.content.lines() {
+            lines.push(row.to_string());
+        }
+    }
+    lines.push(String::new());
+    lines.push(format!("Action: {ack_hint}"));
+    MailboxHistoryCell::new(lines)
+}
+
+pub(crate) fn new_mailbox_ack(outcome: &MailboxActionOutcome) -> impl HistoryCell {
+    let subject = outcome
+        .subject
+        .clone()
+        .unwrap_or_else(|| outcome.message_id.to_string());
+    let mut line = Line::from(vec![
+        "[mailbox]".dim(),
+        " acknowledged ".into(),
+        subject.into(),
+    ]);
+    if outcome.ack_required {
+        line.push_span(" (required)".bold().fg(ratatui::style::Color::Red));
+    }
+    line.push_span(format!(" [{}]", truncate_text(&outcome.message_id.to_string(), 8)).dim());
+    PlainHistoryCell::new(vec![line])
+}
+
+pub(crate) fn new_mailbox_dismiss(outcome: &MailboxActionOutcome) -> impl HistoryCell {
+    let subject = outcome
+        .subject
+        .clone()
+        .unwrap_or_else(|| outcome.message_id.to_string());
+    let mut line = Line::from(vec![
+        "[mailbox]".dim(),
+        " dismissed ".into(),
+        subject.into(),
+    ]);
+    line.push_span(format!(" [{}]", truncate_text(&outcome.message_id.to_string(), 8)).dim());
+    PlainHistoryCell::new(vec![line])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,6 +1415,7 @@ mod tests {
 
     use mcp_types::CallToolResult;
     use mcp_types::ContentBlock;
+    use mcp_types::ImageContent;
     use mcp_types::TextContent;
 
     fn test_config() -> Config {
@@ -1187,7 +1440,37 @@ mod tests {
     }
 
     fn render_transcript(cell: &dyn HistoryCell) -> Vec<String> {
-        render_lines(&cell.transcript_lines())
+        render_lines(&cell.transcript_lines(u16::MAX))
+    }
+
+    #[test]
+    fn empty_agent_message_cell_transcript() {
+        let cell = AgentMessageCell::new(vec![Line::default()], false);
+        assert_eq!(cell.transcript_lines(80), vec![Line::from("  ")]);
+        assert_eq!(cell.desired_transcript_height(80), 1);
+    }
+
+    #[test]
+    fn prefixed_wrapped_history_cell_indents_wrapped_lines() {
+        let summary = Line::from(vec![
+            "You ".into(),
+            "approved".bold(),
+            " codex to run ".into(),
+            "echo something really long to ensure wrapping happens".dim(),
+            " this time".bold(),
+        ]);
+        let cell = PrefixedWrappedHistoryCell::new(summary, "✔ ".green(), "  ");
+        let rendered = render_lines(&cell.display_lines(24));
+        assert_eq!(
+            rendered,
+            vec![
+                "✔ You approved codex".to_string(),
+                "  to run echo something".to_string(),
+                "  really long to ensure".to_string(),
+                "  wrapping happens this".to_string(),
+                "  time".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -1444,6 +1727,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         // Mark call complete so markers are ✓
         cell.complete_call(
@@ -1475,6 +1759,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         // Call 1: Search only
         cell.complete_call(
@@ -1557,6 +1842,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             "c1",
@@ -1585,6 +1871,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         // Mark call complete so it renders as "Ran"
         cell.complete_call(
@@ -1615,6 +1902,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             &call_id,
@@ -1643,6 +1931,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             &call_id,
@@ -1670,6 +1959,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             &call_id,
@@ -1698,6 +1988,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         cell.complete_call(
             &call_id,
@@ -1714,6 +2005,76 @@ mod tests {
         insta::assert_snapshot!(rendered);
     }
 
+    // --- Image handling tests ---
+    fn make_png_base64() -> String {
+        use image::Rgba;
+        use image::RgbaImage;
+        let img: RgbaImage = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 0]));
+        let dyn_img = image::DynamicImage::ImageRgba8(img);
+        let mut bytes = Vec::new();
+        {
+            let mut writer = std::io::Cursor::new(&mut bytes);
+            dyn_img
+                .write_to(&mut writer, image::ImageFormat::Png)
+                .expect("encode png");
+        }
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    #[test]
+    fn image_not_first_block_emits_image_cell() {
+        // Sanity: verify the embedded PNG decodes and the image crate can read it.
+        let b64 = make_png_base64();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .expect("base64 decode");
+        let _img =
+            image::load_from_memory_with_format(&raw, image::ImageFormat::Png).expect("png decode");
+
+        let result = Ok(CallToolResult {
+            content: vec![
+                ContentBlock::TextContent(TextContent {
+                    annotations: None,
+                    text: "hello".to_string(),
+                    r#type: "text".to_string(),
+                }),
+                ContentBlock::ImageContent(ImageContent {
+                    annotations: None,
+                    data: b64,
+                    mime_type: "image/png".to_string(),
+                    r#type: "image".to_string(),
+                }),
+            ],
+            is_error: None,
+            structured_content: None,
+        });
+
+        let cell = super::try_new_completed_mcp_tool_call_with_image_output(&result);
+        assert!(
+            cell.is_some(),
+            "expected image cell when image is not first block"
+        );
+    }
+
+    #[test]
+    fn text_only_result_emits_no_image_cell() {
+        let result = Ok(CallToolResult {
+            content: vec![ContentBlock::TextContent(TextContent {
+                annotations: None,
+                text: "only text".to_string(),
+                r#type: "text".to_string(),
+            })],
+            is_error: None,
+            structured_content: None,
+        });
+
+        let cell = super::try_new_completed_mcp_tool_call_with_image_output(&result);
+        assert!(
+            cell.is_none(),
+            "no image cell expected for text-only result"
+        );
+    }
+
     #[test]
     fn stderr_tail_more_than_five_lines_snapshot() {
         // Build an exec cell with a non-zero exit and 10 lines on stderr to exercise
@@ -1726,6 +2087,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
         let stderr: String = (1..=10)
             .map(|n| n.to_string())
@@ -1772,6 +2134,7 @@ mod tests {
             output: None,
             start_time: Some(Instant::now()),
             duration: None,
+            live_output: Default::default(),
         });
 
         let stderr = "error: first line on stderr\nerror: second line on stderr".to_string();
@@ -1882,10 +2245,7 @@ mod tests {
         assert_eq!(rendered_display, vec!["• Detailed reasoning goes here."]);
 
         let rendered_transcript = render_transcript(cell.as_ref());
-        assert_eq!(
-            rendered_transcript,
-            vec!["thinking", "Detailed reasoning goes here."]
-        );
+        assert_eq!(rendered_transcript, vec!["• Detailed reasoning goes here."]);
     }
 
     #[test]
@@ -1897,7 +2257,7 @@ mod tests {
             new_reasoning_summary_block("Detailed reasoning goes here.".to_string(), &config);
 
         let rendered = render_transcript(cell.as_ref());
-        assert_eq!(rendered, vec!["thinking", "Detailed reasoning goes here."]);
+        assert_eq!(rendered, vec!["• Detailed reasoning goes here."]);
     }
 
     #[test]
@@ -1911,10 +2271,7 @@ mod tests {
         );
 
         let rendered = render_transcript(cell.as_ref());
-        assert_eq!(
-            rendered,
-            vec!["thinking", "**High level reasoning without closing"]
-        );
+        assert_eq!(rendered, vec!["• **High level reasoning without closing"]);
     }
 
     #[test]
@@ -1928,10 +2285,7 @@ mod tests {
         );
 
         let rendered = render_transcript(cell.as_ref());
-        assert_eq!(
-            rendered,
-            vec!["thinking", "High level reasoning without closing"]
-        );
+        assert_eq!(rendered, vec!["• High level reasoning without closing"]);
 
         let cell = new_reasoning_summary_block(
             "**High level reasoning without closing**\n\n  ".to_string(),
@@ -1939,10 +2293,7 @@ mod tests {
         );
 
         let rendered = render_transcript(cell.as_ref());
-        assert_eq!(
-            rendered,
-            vec!["thinking", "High level reasoning without closing"]
-        );
+        assert_eq!(rendered, vec!["• High level reasoning without closing"]);
     }
 
     #[test]
@@ -1959,9 +2310,6 @@ mod tests {
         assert_eq!(rendered_display, vec!["• We should fix the bug next."]);
 
         let rendered_transcript = render_transcript(cell.as_ref());
-        assert_eq!(
-            rendered_transcript,
-            vec!["thinking", "We should fix the bug next."]
-        );
+        assert_eq!(rendered_transcript, vec!["• We should fix the bug next."]);
     }
 }

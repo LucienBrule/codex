@@ -390,7 +390,7 @@ async fn process_chat_sse<S>(
 
     loop {
         let sse = match otel_event_manager
-            .log_sse_event(|| timeout(idle_timeout, stream.next()))
+            .log_sse_event(|| timeout(idle_timeout, stream.next()), false)
             .await
         {
             Ok(Some(Ok(ev))) => ev,
@@ -834,6 +834,9 @@ where
                     continue;
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::ReasoningSummaryPartAdded))) => {
+                    continue;
+                }
+                Poll::Ready(Some(Ok(ResponseEvent::Heartbeat(_)))) => {
                     continue;
                 }
                 Poll::Ready(Some(Ok(ResponseEvent::WebSearchCallBegin { call_id }))) => {

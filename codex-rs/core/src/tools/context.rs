@@ -5,6 +5,7 @@ use crate::tools::TELEMETRY_PREVIEW_MAX_LINES;
 use crate::tools::TELEMETRY_PREVIEW_TRUNCATION_NOTICE;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use codex_otel::otel_event_manager::OtelEventManager;
+use codex_protocol::mailbox::MailboxMessage;
 use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ShellToolCallParams;
@@ -14,12 +15,22 @@ use mcp_types::CallToolResult;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::Weak;
+use thiserror::Error;
+use time::OffsetDateTime;
+use tokio::sync::Mutex;
+use tokio::sync::oneshot;
+use uuid::Uuid;
 
-pub struct ToolInvocation<'a> {
-    pub session: &'a Session,
-    pub turn: &'a TurnContext,
-    pub tracker: &'a mut TurnDiffTracker,
-    pub sub_id: &'a str,
+pub type SharedTurnDiffTracker = Arc<Mutex<TurnDiffTracker>>;
+
+#[derive(Clone)]
+pub struct ToolInvocation {
+    pub session: Arc<Session>,
+    pub turn: Arc<TurnContext>,
+    pub tracker: SharedTurnDiffTracker,
+    pub sub_id: String,
     pub call_id: String,
     pub tool_name: String,
     pub payload: ToolPayload,
@@ -58,7 +69,17 @@ impl ToolPayload {
     }
 }
 
-#[derive(Clone)]
+impl ToolInvocation {
+    pub fn wait_triggers(&self) -> WaitTriggerContext {
+        WaitTriggerContext {
+            session: Arc::clone(&self.session),
+            sub_id: self.sub_id.clone(),
+            call_id: self.call_id.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum ToolOutput {
     Function {
         content: String,
@@ -104,6 +125,165 @@ impl ToolOutput {
                 result,
             },
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WaitTriggerSpec {
+    pub predicate_id: String,
+    pub wake_deadline: Option<OffsetDateTime>,
+    pub fire_quota: u32,
+    pub request_id: Option<String>,
+}
+
+impl WaitTriggerSpec {
+    pub fn new(predicate_id: impl Into<String>) -> Self {
+        Self {
+            predicate_id: predicate_id.into(),
+            wake_deadline: None,
+            fire_quota: 1,
+            request_id: None,
+        }
+    }
+
+    pub fn with_deadline(mut self, deadline: OffsetDateTime) -> Self {
+        self.wake_deadline = Some(deadline);
+        self
+    }
+
+    pub fn with_fire_quota(mut self, quota: u32) -> Self {
+        self.fire_quota = quota.max(1);
+        self
+    }
+
+    pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
+        self.request_id = Some(request_id.into());
+        self
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WaitTriggerCompletion {
+    pub inputs: Vec<ResponseInputItem>,
+    pub mailbox_message: Option<MailboxMessage>,
+    pub summary: Option<String>,
+}
+
+impl WaitTriggerCompletion {
+    pub fn with_inputs(mut self, inputs: Vec<ResponseInputItem>) -> Self {
+        self.inputs = inputs;
+        self
+    }
+
+    pub fn with_mailbox(mut self, message: MailboxMessage) -> Self {
+        self.mailbox_message = Some(message);
+        self
+    }
+
+    pub fn with_summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum WaitTriggerCancelReason {
+    Explicit,
+    TurnShutdown,
+    Dropped,
+}
+
+#[derive(Debug, Error)]
+pub enum WaitTriggerError {
+    #[error("wait trigger requires an active turn")]
+    InactiveTurn,
+    #[error("wait trigger quota exceeded (limit {limit})")]
+    QuotaExceeded { limit: usize },
+    #[error("wait trigger already completed or cancelled")]
+    AlreadyCompleted,
+    #[error("wait trigger channel closed")]
+    TriggerClosed,
+    #[error("session context dropped")]
+    SessionDropped,
+    #[error("wait trigger not found")]
+    NotFound,
+}
+
+#[derive(Clone)]
+pub struct WaitTriggerHandle {
+    inner: Arc<WaitTriggerHandleInner>,
+}
+
+struct WaitTriggerHandleInner {
+    trigger_id: Uuid,
+    session: Weak<Session>,
+    completion_tx: Mutex<Option<oneshot::Sender<WaitTriggerCompletion>>>,
+}
+
+impl WaitTriggerHandle {
+    pub(crate) fn new(
+        session: &Arc<Session>,
+        trigger_id: Uuid,
+        sender: oneshot::Sender<WaitTriggerCompletion>,
+    ) -> Self {
+        Self {
+            inner: Arc::new(WaitTriggerHandleInner {
+                trigger_id,
+                session: Arc::downgrade(session),
+                completion_tx: Mutex::new(Some(sender)),
+            }),
+        }
+    }
+
+    pub fn id(&self) -> Uuid {
+        self.inner.trigger_id
+    }
+
+    pub async fn complete(
+        &self,
+        completion: WaitTriggerCompletion,
+    ) -> Result<(), WaitTriggerError> {
+        let sender = {
+            let mut guard = self.inner.completion_tx.lock().await;
+            guard.take().ok_or(WaitTriggerError::AlreadyCompleted)?
+        };
+        sender
+            .send(completion)
+            .map_err(|_| WaitTriggerError::TriggerClosed)
+    }
+
+    pub async fn cancel(&self) -> Result<(), WaitTriggerError> {
+        let session = self
+            .inner
+            .session
+            .upgrade()
+            .ok_or(WaitTriggerError::SessionDropped)?;
+        {
+            let mut guard = self.inner.completion_tx.lock().await;
+            guard.take();
+        }
+        session
+            .cancel_wait_trigger(self.inner.trigger_id, WaitTriggerCancelReason::Explicit)
+            .await
+    }
+}
+
+#[derive(Clone)]
+pub struct WaitTriggerContext {
+    session: Arc<Session>,
+    sub_id: String,
+    call_id: String,
+}
+
+impl WaitTriggerContext {
+    pub async fn schedule(
+        &self,
+        spec: WaitTriggerSpec,
+    ) -> Result<WaitTriggerHandle, WaitTriggerError> {
+        let session = Arc::clone(&self.session);
+        session
+            .schedule_wait_trigger(&self.sub_id, &self.call_id, spec)
+            .await
     }
 }
 
@@ -191,6 +371,15 @@ mod tests {
             }
             other => panic!("expected FunctionCallOutput, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn wait_trigger_spec_defaults() {
+        let spec = WaitTriggerSpec::new("timer");
+        assert_eq!(spec.predicate_id, "timer");
+        assert_eq!(spec.fire_quota, 1);
+        assert!(spec.wake_deadline.is_none());
+        assert!(spec.request_id.is_none());
     }
 
     #[test]

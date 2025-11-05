@@ -1,0 +1,6 @@
+---
+source: tui/src/status_indicator_widget.rs
+expression: terminal.backend()
+---
+"• Working [idle lag 4.2s queue 3] (0s • esc to interrupt)                       "
+"                                                                                "

@@ -1,0 +1,24 @@
+{
+  "tool_name": "mailbox_send",
+  "arguments": {
+    "to": "story.peer",
+    "timeout_seconds": 30,
+    "wait_for_delivery": true,
+    "message": {
+      "sender": {
+        "id": "management.codex",
+        "role": "orchestrator",
+        "display_name": "Story Dispatcher"
+      },
+      "body": {
+        "subject": "REPLACE_WITH_SUBJECT",
+        "content": "Replace with the story content to share.",
+        "content_type": "text/plain"
+      },
+      "audit": {
+        "request_id": "REQ-REPLACE",
+        "created_by": "management.codex"
+      }
+    }
+  }
+}

@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::env;
 use std::ffi::OsString;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,11 +17,14 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use codex_mcp_client::McpClient;
+use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_rmcp_client::RmcpClient;
 use mcp_types::ClientCapabilities;
 use mcp_types::Implementation;
 use mcp_types::Tool;
 
+use crate::tools::spec::is_valid_tool_name;
+use crate::tools::spec::sanitize_tool_name;
 use serde_json::json;
 use sha1::Digest;
 use sha1::Sha1;
@@ -40,11 +44,6 @@ const MCP_TOOL_NAME_DELIMITER: &str = "__";
 const MAX_TOOL_NAME_LENGTH: usize = 64;
 
 /// Default timeout for initializing MCP server & initially listing tools.
-const DEFAULT_STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Default timeout for individual tool calls.
-const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Map that holds a startup error for every MCP server that could **not** be
 /// spawned successfully.
 pub type ClientStartErrors = HashMap<String, anyhow::Error>;
@@ -69,13 +68,25 @@ fn qualify_tools(tools: Vec<ToolInfo>) -> HashMap<String, ToolInfo> {
             qualified_name = format!("{}{}", &qualified_name[..prefix_len], sha1_str);
         }
 
-        if used_names.contains(&qualified_name) {
-            warn!("skipping duplicated tool {}", qualified_name);
+        let sanitized_name = sanitize_tool_name(&qualified_name);
+        if sanitized_name != qualified_name {
+            warn!(
+                server = %tool.server_name,
+                tool = %tool.tool_name,
+                original = %qualified_name,
+                sanitized = %sanitized_name,
+                "sanitizing MCP tool name"
+            );
+        }
+        debug_assert!(is_valid_tool_name(&sanitized_name));
+
+        if used_names.contains(&sanitized_name) {
+            warn!("skipping duplicated tool {}", sanitized_name);
             continue;
         }
 
-        used_names.insert(qualified_name.clone());
-        qualified_tools.insert(qualified_name, tool);
+        used_names.insert(sanitized_name.clone());
+        qualified_tools.insert(sanitized_name, tool);
     }
 
     qualified_tools
@@ -91,6 +102,7 @@ struct ManagedClient {
     client: McpClientAdapter,
     startup_timeout: Duration,
     tool_timeout: Option<Duration>,
+    _keepalive_interval: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -107,14 +119,21 @@ impl McpClientAdapter {
         env: Option<HashMap<String, String>>,
         params: mcp_types::InitializeRequestParams,
         startup_timeout: Duration,
+        keepalive_interval: Option<Duration>,
     ) -> Result<Self> {
         if use_rmcp_client {
             let client = Arc::new(RmcpClient::new_stdio_client(program, args, env).await?);
             client.initialize(params, Some(startup_timeout)).await?;
+            if let Some(interval) = keepalive_interval {
+                client.enable_keepalive(interval, "rmcp_stdio");
+            }
             Ok(McpClientAdapter::Rmcp(client))
         } else {
             let client = Arc::new(McpClient::new_stdio_client(program, args, env).await?);
             client.initialize(params, Some(startup_timeout)).await?;
+            if let Some(interval) = keepalive_interval {
+                client.enable_keepalive(interval, "mcp_stdio");
+            }
             Ok(McpClientAdapter::Legacy(client))
         }
     }
@@ -125,11 +144,17 @@ impl McpClientAdapter {
         bearer_token: Option<String>,
         params: mcp_types::InitializeRequestParams,
         startup_timeout: Duration,
+        store_mode: OAuthCredentialsStoreMode,
+        keepalive_interval: Option<Duration>,
     ) -> Result<Self> {
         let client = Arc::new(
-            RmcpClient::new_streamable_http_client(&server_name, &url, bearer_token).await?,
+            RmcpClient::new_streamable_http_client(&server_name, &url, bearer_token, store_mode)
+                .await?,
         );
         client.initialize(params, Some(startup_timeout)).await?;
+        if let Some(interval) = keepalive_interval {
+            client.enable_keepalive(interval, "rmcp_http");
+        }
         Ok(McpClientAdapter::Rmcp(client))
     }
 
@@ -182,6 +207,7 @@ impl McpConnectionManager {
     pub async fn new(
         mcp_servers: HashMap<String, McpServerConfig>,
         use_rmcp_client: bool,
+        store_mode: OAuthCredentialsStoreMode,
     ) -> Result<(Self, ClientStartErrors)> {
         // Early exit if no servers are configured.
         if mcp_servers.is_empty() {
@@ -202,8 +228,21 @@ impl McpConnectionManager {
                 continue;
             }
 
-            let startup_timeout = cfg.startup_timeout_sec.unwrap_or(DEFAULT_STARTUP_TIMEOUT);
-            let tool_timeout = cfg.tool_timeout_sec.unwrap_or(DEFAULT_TOOL_TIMEOUT);
+            if !cfg.enabled {
+                continue;
+            }
+
+            let keepalive_interval = cfg.keepalive_interval();
+            let startup_timeout = cfg.startup_timeout();
+            let tool_timeout = cfg.tool_timeout(keepalive_interval);
+
+            let resolved_bearer_token = match &cfg.transport {
+                McpServerTransportConfig::StreamableHttp {
+                    bearer_token_env_var,
+                    ..
+                } => resolve_bearer_token(&server_name, bearer_token_env_var.as_deref()),
+                _ => Ok(None),
+            };
 
             join_set.spawn(async move {
                 let McpServerConfig { transport, .. } = cfg;
@@ -239,30 +278,33 @@ impl McpConnectionManager {
                             env,
                             params,
                             startup_timeout,
+                            keepalive_interval,
                         )
                         .await
                     }
-                    McpServerTransportConfig::StreamableHttp { url, bearer_token } => {
+                    McpServerTransportConfig::StreamableHttp { url, .. } => {
                         McpClientAdapter::new_streamable_http_client(
                             server_name.clone(),
                             url,
-                            bearer_token,
+                            resolved_bearer_token.unwrap_or_default(),
                             params,
                             startup_timeout,
+                            store_mode,
+                            keepalive_interval,
                         )
                         .await
                     }
                 }
                 .map(|c| (c, startup_timeout));
 
-                ((server_name, tool_timeout), client)
+                ((server_name, tool_timeout, keepalive_interval), client)
             });
         }
 
         let mut clients: HashMap<String, ManagedClient> = HashMap::with_capacity(join_set.len());
 
         while let Some(res) = join_set.join_next().await {
-            let ((server_name, tool_timeout), client_res) = match res {
+            let ((server_name, tool_timeout, keepalive_interval), client_res) = match res {
                 Ok(result) => result,
                 Err(e) => {
                     warn!("Task panic when starting MCP server: {e:#}");
@@ -278,6 +320,7 @@ impl McpConnectionManager {
                             client,
                             startup_timeout,
                             tool_timeout: Some(tool_timeout),
+                            _keepalive_interval: keepalive_interval,
                         },
                     );
                 }
@@ -333,6 +376,33 @@ impl McpConnectionManager {
         self.tools
             .get(tool_name)
             .map(|tool| (tool.server_name.clone(), tool.tool_name.clone()))
+    }
+}
+
+fn resolve_bearer_token(
+    server_name: &str,
+    bearer_token_env_var: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(env_var) = bearer_token_env_var else {
+        return Ok(None);
+    };
+
+    match env::var(env_var) {
+        Ok(value) => {
+            if value.is_empty() {
+                Err(anyhow!(
+                    "Environment variable {env_var} for MCP server '{server_name}' is empty"
+                ))
+            } else {
+                Ok(Some(value))
+            }
+        }
+        Err(env::VarError::NotPresent) => Err(anyhow!(
+            "Environment variable {env_var} for MCP server '{server_name}' is not set"
+        )),
+        Err(env::VarError::NotUnicode(_)) => Err(anyhow!(
+            "Environment variable {env_var} for MCP server '{server_name}' contains invalid Unicode"
+        )),
     }
 }
 

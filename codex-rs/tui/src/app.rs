@@ -400,6 +400,9 @@ impl App {
                     ));
                 }
             },
+            AppEvent::MailboxAction(outcome) => {
+                self.chat_widget.handle_mailbox_action(outcome);
+            }
         }
         Ok(true)
     }

@@ -14,6 +14,9 @@ path = "src/lib.rs"
 [lints]
 workspace = true
 
+[features]
+otel = []
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
@@ -26,18 +29,28 @@ codex-common = { workspace = true, features = [
 codex-core = { workspace = true }
 codex-ollama = { workspace = true }
 codex-protocol = { workspace = true }
+codex-otel = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
 owo-colors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 shlex = { workspace = true }
 supports-color = { workspace = true }
+libc = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+bytecount = { workspace = true }
+fs2 = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true, features = [
     "io-std",
     "macros",
+    "net",
     "process",
     "rt-multi-thread",
     "signal",
+    "sync",
+    "time",
 ] }
 tracing = { workspace = true, features = ["log"] }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }

@@ -10,14 +10,11 @@ use codex_core::protocol::InputItem;
 use codex_core::protocol::Op;
 use core_test_support::load_default_config_for_test;
 use core_test_support::load_sse_fixture_with_id;
+use core_test_support::responses;
 use core_test_support::skip_if_no_network;
 use core_test_support::wait_for_event;
 use tempfile::TempDir;
-use wiremock::Mock;
 use wiremock::MockServer;
-use wiremock::ResponseTemplate;
-use wiremock::matchers::method;
-use wiremock::matchers::path;
 
 fn sse_completed(id: &str) -> String {
     load_sse_fixture_with_id("tests/fixtures/completed_template.json", id)
@@ -44,16 +41,7 @@ async fn collect_tool_identifiers_for_model(model: &str) -> Vec<String> {
     let server = MockServer::start().await;
 
     let sse = sse_completed(model);
-    let template = ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_raw(sse, "text/event-stream");
-
-    Mock::given(method("POST"))
-        .and(path("/v1/responses"))
-        .respond_with(template)
-        .expect(1)
-        .mount(&server)
-        .await;
+    let resp_mock = responses::mount_sse_once_match(&server, wiremock::matchers::any(), sse).await;
 
     let model_provider = ModelProviderInfo {
         base_url: Some(format!("{}/v1", server.uri())),
@@ -93,13 +81,7 @@ async fn collect_tool_identifiers_for_model(model: &str) -> Vec<String> {
         .unwrap();
     wait_for_event(&codex, |ev| matches!(ev, EventMsg::TaskComplete(_))).await;
 
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests.len(),
-        1,
-        "expected a single request for model {model}"
-    );
-    let body = requests[0].body_json::<serde_json::Value>().unwrap();
+    let body = resp_mock.single_request().body_json();
     tool_identifiers(&body)
 }
 
@@ -111,21 +93,43 @@ async fn model_selects_expected_tools() {
     let codex_tools = collect_tool_identifiers_for_model("codex-mini-latest").await;
     assert_eq!(
         codex_tools,
-        vec!["local_shell".to_string()],
-        "codex-mini-latest should expose the local shell tool",
+        vec![
+            "local_shell".to_string(),
+            "mailbox_send".to_string(),
+            "codex_mailbox_send".to_string(),
+            "mailbox_wait".to_string(),
+            "mailbox_read".to_string(),
+            "wait_with_predicate".to_string(),
+        ],
+        "codex-mini-latest should expose local shell, mailbox, and wait tools",
     );
 
     let o3_tools = collect_tool_identifiers_for_model("o3").await;
     assert_eq!(
         o3_tools,
-        vec!["shell".to_string()],
-        "o3 should expose the generic shell tool",
+        vec![
+            "shell".to_string(),
+            "mailbox_send".to_string(),
+            "codex_mailbox_send".to_string(),
+            "mailbox_wait".to_string(),
+            "mailbox_read".to_string(),
+            "wait_with_predicate".to_string(),
+        ],
+        "o3 should expose shell, mailbox, and wait tools",
     );
 
     let gpt5_codex_tools = collect_tool_identifiers_for_model("gpt-5-codex").await;
     assert_eq!(
         gpt5_codex_tools,
-        vec!["shell".to_string(), "read_file".to_string()],
-        "gpt-5-codex should expose the beta read_file tool",
+        vec![
+            "shell".to_string(),
+            "mailbox_send".to_string(),
+            "codex_mailbox_send".to_string(),
+            "mailbox_wait".to_string(),
+            "mailbox_read".to_string(),
+            "wait_with_predicate".to_string(),
+            "apply_patch".to_string(),
+        ],
+        "gpt-5-codex should expose shell, mailbox, wait, and apply_patch tools",
     );
 }

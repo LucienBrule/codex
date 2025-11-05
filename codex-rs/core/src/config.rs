@@ -26,19 +26,32 @@ use crate::model_provider_info::built_in_model_providers;
 use crate::openai_model_info::get_model_info;
 use crate::protocol::AskForApproval;
 use crate::protocol::SandboxPolicy;
-use anyhow::Context;
+use crate::vm_pty;
 use codex_app_server_protocol::Tools;
 use codex_app_server_protocol::UserSavedConfig;
 use codex_protocol::config_types::ReasoningEffort;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::Verbosity;
+use codex_rmcp_client::OAuthCredentialsStoreMode;
 use dirs::home_dir;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::fmt;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
+use std::str::FromStr;
+use std::sync::OnceLock;
+use std::sync::RwLock;
+use std::time::Duration;
+use tracing::warn;
+
+use crate::config_edit::CONFIG_KEY_EFFORT;
+use crate::config_edit::CONFIG_KEY_MODEL;
+use crate::config_edit::persist_overrides_and_clear_if_none;
 use tempfile::NamedTempFile;
 use toml::Value as TomlValue;
 use toml_edit::Array as TomlArray;
@@ -58,7 +71,37 @@ pub const GPT_5_CODEX_MEDIUM_MODEL: &str = "gpt-5-codex";
 /// the context window.
 pub(crate) const PROJECT_DOC_MAX_BYTES: usize = 32 * 1024; // 32 KiB
 
+const DEFAULT_MAILBOX_LIVENESS_IDLE_AFTER: Duration = Duration::from_secs(3);
+const DEFAULT_MAILBOX_LIVENESS_STALLED_AFTER: Duration = Duration::from_secs(12);
+const DEFAULT_MAILBOX_LIVENESS_EMIT_INTERVAL: Duration = Duration::from_secs(5);
+const MIN_MAILBOX_LIVENESS_EMIT_INTERVAL: Duration = Duration::from_millis(500);
+
+// Defaults mirrored from vm_pty client behaviour.
+const DEFAULT_VM_PTY_CONNECT_TIMEOUT: Duration = Duration::from_millis(1_500);
+const DEFAULT_VM_PTY_REQUEST_TIMEOUT: Duration = Duration::from_millis(5_000);
+const DEFAULT_VM_PTY_OPEN_TIMEOUT: Duration = Duration::from_millis(90_000);
+
 pub(crate) const CONFIG_TOML_FILE: &str = "config.toml";
+
+/// Ensure the Codex home directory exists.
+fn ensure_codex_home(codex_home: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(codex_home)
+}
+
+/// Atomically write `contents` to `config.toml` at `config_path`.
+fn write_config_toml_atomic(config_path: &Path, contents: &str) -> std::io::Result<()> {
+    let Some(parent) = config_path.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "config path has no parent directory",
+        ));
+    };
+    ensure_codex_home(parent)?;
+    let tmp_file = NamedTempFile::new_in(parent)?;
+    std::fs::write(tmp_file.path(), contents)?;
+    tmp_file.persist(config_path).map_err(|err| err.error)?;
+    Ok(())
+}
 
 /// Application configuration loaded from disk and merged with overrides.
 #[derive(Debug, Clone, PartialEq)]
@@ -142,6 +185,15 @@ pub struct Config {
     /// Definition for MCP servers that Codex can reach out to for tool calls.
     pub mcp_servers: HashMap<String, McpServerConfig>,
 
+    /// Preferred store for MCP OAuth credentials.
+    /// keyring: Use an OS-specific keyring service.
+    ///          Credentials stored in the keyring will only be readable by Codex unless the user explicitly grants access via OS-level keyring access.
+    ///          https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/oauth.rs#L2
+    /// file: CODEX_HOME/.credentials.json
+    ///       This file will be readable to Codex and other applications running as the same user.
+    /// auto (default): keyring if available, otherwise file.
+    pub mcp_oauth_credentials_store_mode: OAuthCredentialsStoreMode,
+
     /// Combined provider map (defaults merged with user-defined overrides).
     pub model_providers: HashMap<String, ModelProviderInfo>,
 
@@ -206,8 +258,38 @@ pub struct Config {
     /// Include the `view_image` tool that lets the agent attach a local image path to context.
     pub include_view_image_tool: bool,
 
+    /// Whether to include host shell tools for this session.
+    pub include_shell_tool: bool,
+
+    /// Whether to attempt to include the VM-backed PTY tool for this session.
+    pub include_vm_pty_tool: bool,
+
+    /// Whether to expose the management-only pty_open tool.
+    pub include_vm_pty_open_tool: bool,
+
+    /// When true, print enabled tool list for debugging.
+    pub debug_tools: bool,
+
+    /// Resolved vm-pty socket endpoint, if configured.
+    pub vm_pty_socket: Option<PathBuf>,
+    /// Default vm id to use when a tool call does not specify one.
+    pub vm_pty_default_vm_id: Option<String>,
+    /// Timeout for connecting to the vm-pty daemon.
+    pub vm_pty_connect_timeout: Duration,
+    /// Timeout for individual vm-pty requests.
+    pub vm_pty_request_timeout: Duration,
+    /// Timeout to use specifically for the pty_open call (can be higher on cold boots).
+    pub vm_pty_open_timeout: Duration,
+    /// If true, request a blocking open; when false (default), request nonblocking.
+    pub vm_pty_open_blocking: bool,
+    /// Optional per-worker cap on concurrently open VM PTY sessions. When None or 0, unlimited.
+    pub vm_pty_max_concurrent_per_worker: Option<usize>,
+
     /// The active profile name used to derive this `Config` (if any).
     pub active_profile: Option<String>,
+
+    /// Tracks whether the Windows onboarding screen has been acknowledged.
+    pub windows_wsl_setup_acknowledged: bool,
 
     /// When true, disables burst-paste detection for typed input entirely.
     /// All characters are inserted as they are received, and no buffering
@@ -216,6 +298,331 @@ pub struct Config {
 
     /// OTEL configuration (exporter type, endpoint, headers, etc.).
     pub otel: crate::config_types::OtelConfig,
+
+    /// Settings controlling how mailbox heartbeats are promoted to liveness telemetry.
+    pub mailbox_liveness: MailboxLivenessSettings,
+
+    /// Settings controlling background conversation summaries.
+    pub summaries: SummariesSettings,
+
+    /// Wait predicate policy enforcement knobs.
+    pub wait: WaitPolicySettings,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MailboxLivenessSettings {
+    pub enabled: bool,
+    pub idle_after: Duration,
+    pub stalled_after: Duration,
+    pub emit_interval: Duration,
+}
+
+impl Default for MailboxLivenessSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle_after: DEFAULT_MAILBOX_LIVENESS_IDLE_AFTER,
+            stalled_after: DEFAULT_MAILBOX_LIVENESS_STALLED_AFTER,
+            emit_interval: DEFAULT_MAILBOX_LIVENESS_EMIT_INTERVAL,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummariesSettings {
+    pub enabled: bool,
+    pub emit_interval: Duration,
+    pub initial_delay: Duration,
+    /// Optional base directory override for summary checkpoints.
+    pub base_dir: Option<PathBuf>,
+}
+
+const DEFAULT_SUMMARIES_EMIT_INTERVAL: Duration = Duration::from_secs(60);
+const DEFAULT_SUMMARIES_INITIAL_DELAY: Duration = Duration::from_secs(10);
+const MIN_SUMMARIES_EMIT_INTERVAL: Duration = Duration::from_millis(500);
+
+impl Default for SummariesSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            emit_interval: DEFAULT_SUMMARIES_EMIT_INTERVAL,
+            initial_delay: DEFAULT_SUMMARIES_INITIAL_DELAY,
+            base_dir: None,
+        }
+    }
+}
+
+impl SummariesSettings {
+    pub fn from_toml(toml: Option<SummariesToml>) -> Self {
+        let raw = toml.unwrap_or_default();
+        let mut s = Self::default();
+        if let Some(enabled) = raw.enabled {
+            s.enabled = enabled;
+        }
+        if let Some(secs) = raw.emit_interval_seconds {
+            if let Ok(d) = Duration::try_from_secs_f64(secs) {
+                s.emit_interval = d;
+            }
+        }
+        if let Some(secs) = raw.initial_delay_seconds {
+            if let Ok(d) = Duration::try_from_secs_f64(secs) {
+                s.initial_delay = d;
+            }
+        }
+        if let Some(base) = raw.base_dir {
+            s.base_dir = Some(base);
+        }
+        s.normalize();
+        s
+    }
+
+    fn normalize(&mut self) {
+        if self.emit_interval < MIN_SUMMARIES_EMIT_INTERVAL {
+            self.emit_interval = MIN_SUMMARIES_EMIT_INTERVAL;
+        }
+    }
+}
+
+const DEFAULT_WAIT_MAX_DURATION: Duration = Duration::from_secs(3_600);
+const MAX_WAIT_DURATION_LIMIT: Duration = Duration::from_secs(86_400);
+const DEFAULT_MAX_WAITS_PER_TURN: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WaitPredicateKind {
+    Timer,
+    Filesystem,
+    Shell,
+    Mailbox,
+}
+
+impl WaitPredicateKind {
+    fn all() -> [Self; 4] {
+        [Self::Timer, Self::Filesystem, Self::Shell, Self::Mailbox]
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Timer => "timer",
+            Self::Filesystem => "filesystem",
+            Self::Shell => "shell",
+            Self::Mailbox => "mailbox",
+        }
+    }
+}
+
+impl fmt::Display for WaitPredicateKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WaitPredicateKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "timer" => Ok(Self::Timer),
+            "filesystem" => Ok(Self::Filesystem),
+            "shell" => Ok(Self::Shell),
+            "mailbox" => Ok(Self::Mailbox),
+            other => Err(format!("invalid wait predicate `{other}`")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaitPolicySettings {
+    pub allowed_predicates: BTreeSet<WaitPredicateKind>,
+    pub max_duration: Duration,
+    pub max_waits_per_turn: usize,
+    pub require_shell_approval: bool,
+}
+
+impl Default for WaitPolicySettings {
+    fn default() -> Self {
+        Self {
+            allowed_predicates: WaitPredicateKind::all().into_iter().collect(),
+            max_duration: DEFAULT_WAIT_MAX_DURATION,
+            max_waits_per_turn: DEFAULT_MAX_WAITS_PER_TURN,
+            require_shell_approval: false,
+        }
+    }
+}
+
+impl WaitPolicySettings {
+    fn parse_allowed(predicates: &[String]) -> Result<BTreeSet<WaitPredicateKind>, String> {
+        let mut set = BTreeSet::new();
+        for raw in predicates {
+            let parsed = WaitPredicateKind::from_str(raw)?;
+            set.insert(parsed);
+        }
+        Ok(set)
+    }
+
+    pub fn from_toml(toml: Option<&WaitPolicyToml>) -> Result<Self, String> {
+        let mut settings = Self::default();
+        if let Some(config) = toml {
+            settings = settings.apply_toml(config)?;
+        }
+        settings.normalize();
+        Ok(settings)
+    }
+
+    fn apply_toml(mut self, toml: &WaitPolicyToml) -> Result<Self, String> {
+        if let Some(predicates) = &toml.allowed_predicates {
+            let parsed = Self::parse_allowed(predicates)?;
+            self.allowed_predicates = parsed;
+        }
+        if let Some(seconds) = toml.max_duration_seconds {
+            if seconds == 0 {
+                return Err("wait.max_duration_seconds must be positive".to_string());
+            }
+            self.max_duration = Duration::from_secs(seconds);
+        }
+        if let Some(limit) = toml.max_waits_per_turn {
+            if limit == 0 {
+                return Err("wait.max_waits_per_turn must be >= 1".to_string());
+            }
+            self.max_waits_per_turn = limit;
+        }
+        if let Some(require) = toml.require_shell_approval {
+            self.require_shell_approval = require;
+        }
+        Ok(self)
+    }
+
+    pub fn apply_override(&mut self, overrides: &WaitPolicyOverrides) -> Result<(), String> {
+        if let Some(predicates) = &overrides.allowed_predicates {
+            self.allowed_predicates = predicates.iter().copied().collect();
+        }
+        if let Some(seconds) = overrides.max_duration_seconds {
+            if seconds == 0 {
+                return Err(
+                    "wait policy override max_duration_seconds must be positive".to_string()
+                );
+            }
+            self.max_duration = Duration::from_secs(seconds);
+        }
+        if let Some(limit) = overrides.max_waits_per_turn {
+            if limit == 0 {
+                return Err("wait policy override max_waits_per_turn must be >= 1".to_string());
+            }
+            self.max_waits_per_turn = limit;
+        }
+        if let Some(require) = overrides.require_shell_approval {
+            self.require_shell_approval = require;
+        }
+        self.normalize();
+        Ok(())
+    }
+
+    fn normalize(&mut self) {
+        if self.max_duration.is_zero() {
+            self.max_duration = DEFAULT_WAIT_MAX_DURATION;
+        }
+
+        if self.max_duration > MAX_WAIT_DURATION_LIMIT {
+            self.max_duration = MAX_WAIT_DURATION_LIMIT;
+        }
+
+        if self.max_waits_per_turn == 0 {
+            self.max_waits_per_turn = 1;
+        }
+    }
+
+    pub fn is_allowed(&self, kind: WaitPredicateKind) -> bool {
+        self.allowed_predicates.contains(&kind)
+    }
+
+    pub fn max_duration(&self) -> Duration {
+        self.max_duration
+    }
+
+    pub fn max_waits_per_turn(&self) -> usize {
+        self.max_waits_per_turn
+    }
+
+    pub fn require_shell_approval(&self) -> bool {
+        self.require_shell_approval
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct WaitPolicyToml {
+    pub allowed_predicates: Option<Vec<String>>,
+    #[serde(rename = "max_duration_seconds")]
+    pub max_duration_seconds: Option<u64>,
+    pub max_waits_per_turn: Option<usize>,
+    pub require_shell_approval: Option<bool>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct WaitPolicyOverrides {
+    pub allowed_predicates: Option<Vec<WaitPredicateKind>>,
+    pub max_duration_seconds: Option<u64>,
+    pub max_waits_per_turn: Option<usize>,
+    pub require_shell_approval: Option<bool>,
+}
+
+static WAIT_POLICY_GLOBAL: OnceLock<RwLock<WaitPolicySettings>> = OnceLock::new();
+
+fn wait_policy_slot() -> &'static RwLock<WaitPolicySettings> {
+    WAIT_POLICY_GLOBAL.get_or_init(|| RwLock::new(WaitPolicySettings::default()))
+}
+
+pub fn wait_policy_settings() -> WaitPolicySettings {
+    wait_policy_slot()
+        .read()
+        .map(|guard| guard.clone())
+        .unwrap_or_else(|_| WaitPolicySettings::default())
+}
+
+fn update_wait_policy(settings: &WaitPolicySettings) {
+    if let Ok(mut guard) = wait_policy_slot().write() {
+        *guard = settings.clone();
+    }
+}
+
+impl MailboxLivenessSettings {
+    pub fn from_toml(toml: Option<MailboxLivenessToml>) -> Self {
+        let raw = toml.unwrap_or_default();
+        let mut settings = Self::default();
+        if let Some(enabled) = raw.enabled {
+            settings.enabled = enabled;
+        }
+        if let Some(idle_after) = raw.idle_after_seconds {
+            if let Ok(duration) = Duration::try_from_secs_f64(idle_after) {
+                settings.idle_after = duration;
+            }
+        }
+        if let Some(stalled_after) = raw.stalled_after_seconds {
+            if let Ok(duration) = Duration::try_from_secs_f64(stalled_after) {
+                settings.stalled_after = duration;
+            }
+        }
+        if let Some(emit_interval) = raw.emit_interval_seconds {
+            if let Ok(duration) = Duration::try_from_secs_f64(emit_interval) {
+                settings.emit_interval = duration;
+            }
+        }
+        settings.normalize();
+        settings
+    }
+
+    pub fn normalize(&mut self) {
+        if self.idle_after.is_zero() {
+            self.idle_after = DEFAULT_MAILBOX_LIVENESS_IDLE_AFTER;
+        }
+
+        if self.stalled_after <= self.idle_after {
+            self.stalled_after = self.idle_after + Duration::from_secs(1);
+        }
+
+        if self.emit_interval < MIN_MAILBOX_LIVENESS_EMIT_INTERVAL {
+            self.emit_interval = MIN_MAILBOX_LIVENESS_EMIT_INTERVAL;
+        }
+    }
 }
 
 impl Config {
@@ -224,6 +631,8 @@ impl Config {
         overrides: ConfigOverrides,
     ) -> std::io::Result<Self> {
         let codex_home = find_codex_home()?;
+        // Capture CLI overrides for post-profile precedence on select keys.
+        let overrides_for_resolution = cli_overrides.clone();
 
         let root_value = load_resolved_config(
             &codex_home,
@@ -237,8 +646,101 @@ impl Config {
             std::io::Error::new(std::io::ErrorKind::InvalidData, e)
         })?;
 
+        let mut overrides = overrides;
+        overrides.cli_resolved_overrides = extract_cli_resolved_overrides(&overrides_for_resolution);
+
         Self::load_from_base_config_with_overrides(cfg, overrides, codex_home)
     }
+}
+
+fn extract_cli_resolved_overrides(
+    cli_overrides: &[(String, TomlValue)],
+) -> Option<CliResolvedOverrides> {
+    let mut out = CliResolvedOverrides::default();
+    let mut any = false;
+
+    for (path, value) in cli_overrides.iter() {
+        match path.as_str() {
+            "tools.vm_pty.socket" => {
+                if let Some(s) = value.as_str() {
+                    out.vm_pty_socket = Some(PathBuf::from(s));
+                    any = true;
+                }
+            }
+            "vm_pty.default_vm_id" => {
+                if let Some(s) = value.as_str() {
+                    out.vm_pty_default_vm_id = Some(s.to_string());
+                    any = true;
+                }
+            }
+            "vm_pty.timeouts.connect_ms" => {
+                if let Some(v) = value.as_integer() {
+                    out.vm_pty_timeouts.connect_ms = Some(v as u64);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    if let Ok(parsed) = s.trim().parse::<u64>() {
+                        out.vm_pty_timeouts.connect_ms = Some(parsed);
+                        any = true;
+                    }
+                }
+            }
+            "vm_pty.timeouts.request_ms" => {
+                if let Some(v) = value.as_integer() {
+                    out.vm_pty_timeouts.request_ms = Some(v as u64);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    if let Ok(parsed) = s.trim().parse::<u64>() {
+                        out.vm_pty_timeouts.request_ms = Some(parsed);
+                        any = true;
+                    }
+                }
+            }
+            "vm_pty.timeouts.open_ms" => {
+                if let Some(v) = value.as_integer() {
+                    out.vm_pty_timeouts.open_ms = Some(v as u64);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    if let Ok(parsed) = s.trim().parse::<u64>() {
+                        out.vm_pty_timeouts.open_ms = Some(parsed);
+                        any = true;
+                    }
+                }
+            }
+            "vm_pty.open_blocking" => {
+                if let Some(b) = value.as_bool() {
+                    out.vm_pty_open_blocking = Some(b);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    let sl = s.trim().to_ascii_lowercase();
+                    if matches!(sl.as_str(), "1" | "true" | "yes") {
+                        out.vm_pty_open_blocking = Some(true);
+                        any = true;
+                    } else if matches!(sl.as_str(), "0" | "false" | "no") {
+                        out.vm_pty_open_blocking = Some(false);
+                        any = true;
+                    }
+                }
+            }
+            "debug.tools" => {
+                if let Some(b) = value.as_bool() {
+                    out.debug_tools = Some(b);
+                    any = true;
+                } else if let Some(s) = value.as_str() {
+                    let sl = s.trim().to_ascii_lowercase();
+                    if matches!(sl.as_str(), "1" | "true" | "yes") {
+                        out.debug_tools = Some(true);
+                        any = true;
+                    } else if matches!(sl.as_str(), "0" | "false" | "no") {
+                        out.debug_tools = Some(false);
+                        any = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if any { Some(out) } else { None }
 }
 
 pub async fn load_config_as_toml_with_cli_overrides(
@@ -298,10 +800,33 @@ pub async fn load_global_mcp_servers(
         return Ok(BTreeMap::new());
     };
 
+    ensure_no_inline_bearer_tokens(servers_value)?;
+
     servers_value
         .clone()
         .try_into()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// We briefly allowed plain text bearer_token fields in MCP server configs.
+/// We want to warn people who recently added these fields but can remove this after a few months.
+fn ensure_no_inline_bearer_tokens(value: &TomlValue) -> std::io::Result<()> {
+    let Some(servers_table) = value.as_table() else {
+        return Ok(());
+    };
+
+    for (server_name, server_value) in servers_table {
+        if let Some(server_table) = server_value.as_table()
+            && server_table.contains_key("bearer_token")
+        {
+            let message = format!(
+                "mcp_servers.{server_name} uses unsupported `bearer_token`; set `bearer_token_env_var`."
+            );
+            return Err(std::io::Error::new(ErrorKind::InvalidData, message));
+        }
+    }
+
+    Ok(())
 }
 
 pub fn write_global_mcp_servers(
@@ -352,12 +877,19 @@ pub fn write_global_mcp_servers(
                         entry["env"] = TomlItem::Table(env_table);
                     }
                 }
-                McpServerTransportConfig::StreamableHttp { url, bearer_token } => {
+                McpServerTransportConfig::StreamableHttp {
+                    url,
+                    bearer_token_env_var,
+                } => {
                     entry["url"] = toml_edit::value(url.clone());
-                    if let Some(token) = bearer_token {
-                        entry["bearer_token"] = toml_edit::value(token.clone());
+                    if let Some(env_var) = bearer_token_env_var {
+                        entry["bearer_token_env_var"] = toml_edit::value(env_var.clone());
                     }
                 }
+            }
+
+            if !config.enabled {
+                entry["enabled"] = toml_edit::value(false);
             }
 
             if let Some(timeout) = config.startup_timeout_sec {
@@ -372,12 +904,7 @@ pub fn write_global_mcp_servers(
         }
     }
 
-    std::fs::create_dir_all(codex_home)?;
-    let tmp_file = NamedTempFile::new_in(codex_home)?;
-    std::fs::write(tmp_file.path(), doc.to_string())?;
-    tmp_file.persist(config_path).map_err(|err| err.error)?;
-
-    Ok(())
+    write_config_toml_atomic(&config_path, &doc.to_string())
 }
 
 fn set_project_trusted_inner(doc: &mut DocumentMut, project_path: &Path) -> anyhow::Result<()> {
@@ -457,17 +984,25 @@ pub fn set_project_trusted(codex_home: &Path, project_path: &Path) -> anyhow::Re
     };
 
     set_project_trusted_inner(&mut doc, project_path)?;
+    write_config_toml_atomic(&config_path, &doc.to_string())?;
+    Ok(())
+}
 
-    // ensure codex_home exists
-    std::fs::create_dir_all(codex_home)?;
+/// Persist the acknowledgement flag for the Windows onboarding screen.
+pub fn set_windows_wsl_setup_acknowledged(
+    codex_home: &Path,
+    acknowledged: bool,
+) -> anyhow::Result<()> {
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let mut doc = match std::fs::read_to_string(config_path.clone()) {
+        Ok(s) => s.parse::<DocumentMut>()?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DocumentMut::new(),
+        Err(e) => return Err(e.into()),
+    };
 
-    // create a tmp_file
-    let tmp_file = NamedTempFile::new_in(codex_home)?;
-    std::fs::write(tmp_file.path(), doc.to_string())?;
+    doc["windows_wsl_setup_acknowledged"] = toml_edit::value(acknowledged);
 
-    // atomically move the tmp file into config.toml
-    tmp_file.persist(config_path)?;
-
+    write_config_toml_atomic(&config_path, &doc.to_string())?;
     Ok(())
 }
 
@@ -528,58 +1063,18 @@ pub async fn persist_model_selection(
     model: &str,
     effort: Option<ReasoningEffort>,
 ) -> anyhow::Result<()> {
-    let config_path = codex_home.join(CONFIG_TOML_FILE);
-    let serialized = match tokio::fs::read_to_string(&config_path).await {
-        Ok(contents) => contents,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => return Err(err.into()),
-    };
+    let effort_string = effort.as_ref().map(|e| e.to_string());
+    let effort_ref = effort_string.as_deref();
 
-    let mut doc = if serialized.is_empty() {
-        DocumentMut::new()
-    } else {
-        serialized.parse::<DocumentMut>()?
-    };
-
-    if let Some(profile_name) = active_profile {
-        let profile_table = ensure_profile_table(&mut doc, profile_name)?;
-        profile_table["model"] = toml_edit::value(model);
-        match effort {
-            Some(effort) => {
-                profile_table["model_reasoning_effort"] = toml_edit::value(effort.to_string());
-            }
-            None => {
-                profile_table.remove("model_reasoning_effort");
-            }
-        }
-    } else {
-        let table = doc.as_table_mut();
-        table["model"] = toml_edit::value(model);
-        match effort {
-            Some(effort) => {
-                table["model_reasoning_effort"] = toml_edit::value(effort.to_string());
-            }
-            None => {
-                table.remove("model_reasoning_effort");
-            }
-        }
-    }
-
-    // TODO(jif) refactor the home creation
-    tokio::fs::create_dir_all(codex_home)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create Codex home directory at {}",
-                codex_home.display()
-            )
-        })?;
-
-    tokio::fs::write(&config_path, doc.to_string())
-        .await
-        .with_context(|| format!("failed to persist config.toml at {}", config_path.display()))?;
-
-    Ok(())
+    persist_overrides_and_clear_if_none(
+        codex_home,
+        active_profile,
+        &[
+            (&[CONFIG_KEY_MODEL], Some(model)),
+            (&[CONFIG_KEY_EFFORT], effort_ref),
+        ],
+    )
+    .await
 }
 
 /// Apply a single dotted-path override onto a TOML value.
@@ -668,6 +1163,14 @@ pub struct ConfigToml {
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
 
+    /// Preferred backend for storing MCP OAuth credentials.
+    /// keyring: Use an OS-specific keyring service.
+    ///          https://github.com/openai/codex/blob/main/codex-rs/rmcp-client/src/oauth.rs#L2
+    /// file: Use a file in the Codex home directory.
+    /// auto (default): Use the OS-specific keyring service if available, otherwise use a file.
+    #[serde(default)]
+    pub mcp_oauth_credentials_store: Option<OAuthCredentialsStoreMode>,
+
     /// User-defined provider entries that extend/override the built-in list.
     #[serde(default)]
     pub model_providers: HashMap<String, ModelProviderInfo>,
@@ -695,6 +1198,15 @@ pub struct ConfigToml {
 
     /// Collection of settings that are specific to the TUI.
     pub tui: Option<Tui>,
+
+    #[serde(default)]
+    pub mailbox_liveness: Option<MailboxLivenessToml>,
+
+    #[serde(default)]
+    pub wait: Option<WaitPolicyToml>,
+
+    #[serde(default)]
+    pub wait_profiles: HashMap<String, WaitPolicyToml>,
 
     /// When set to `true`, `AgentReasoning` events will be hidden from the
     /// UI/output. Defaults to `false`.
@@ -724,11 +1236,20 @@ pub struct ConfigToml {
     pub experimental_use_exec_command_tool: Option<bool>,
     pub experimental_use_unified_exec_tool: Option<bool>,
     pub experimental_use_rmcp_client: Option<bool>,
+    pub experimental_use_freeform_apply_patch: Option<bool>,
 
     pub projects: Option<HashMap<String, ProjectConfig>>,
 
     /// Nested tools section for feature toggles
     pub tools: Option<ToolsToml>,
+
+    /// VM-backed PTY feature flag configuration.
+    #[serde(default)]
+    pub vm_pty: VmPtyToml,
+
+    /// Debug toggles.
+    #[serde(default)]
+    pub debug: Option<DebugToml>,
 
     /// When true, disables burst-paste detection for typed input entirely.
     /// All characters are inserted as they are received, and no buffering
@@ -737,6 +1258,13 @@ pub struct ConfigToml {
 
     /// OTEL configuration.
     pub otel: Option<crate::config_types::OtelConfigToml>,
+
+    /// Background conversation summaries configuration.
+    #[serde(default)]
+    pub summaries: Option<SummariesToml>,
+
+    /// Tracks whether the Windows onboarding screen has been acknowledged.
+    pub windows_wsl_setup_acknowledged: Option<bool>,
 }
 
 impl From<ConfigToml> for UserSavedConfig {
@@ -775,6 +1303,69 @@ pub struct ToolsToml {
     /// Enable the `view_image` tool that lets the agent attach local images.
     #[serde(default)]
     pub view_image: Option<bool>,
+
+    /// Shell tool configuration and profile gating.
+    #[serde(default)]
+    pub shell: Option<ShellToolsToml>,
+
+    /// Experimental VM-backed PTY lane configuration.
+    #[serde(default)]
+    pub vm_pty: VmPtyToml,
+
+    /// Explicit toggle for the unified_exec tool. When absent, defaults to false.
+    /// This allows enabling the VM PTY lane without automatically exposing a
+    /// general-purpose exec tool to the agent.
+    #[serde(default)]
+    pub unified_exec_enabled: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct DebugToml {
+    /// When true, print the enabled tool list at startup.
+    pub tools: Option<bool>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct VmPtyToml {
+    /// Global feature flag for the VM-backed PTY lane.
+    pub enabled: Option<bool>,
+    /// Active profile names that are allowed to use the PTY lane.
+    #[serde(default)]
+    pub allow_profiles: Vec<String>,
+    /// Optional vm-pty daemon socket path.
+    pub socket: Option<PathBuf>,
+    /// Default VM identifier to target when omitted by tool params.
+    pub default_vm_id: Option<String>,
+    /// Millisecond timeout knobs for vm-pty.
+    #[serde(default)]
+    pub timeouts: VmPtyTimeoutsToml,
+    /// Request a blocking open; defaults to nonblocking when unset.
+    pub open_blocking: Option<bool>,
+    /// Optional per-worker cap on concurrently open VM PTY sessions.
+    pub max_concurrent_per_worker: Option<usize>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct VmPtyTimeoutsToml {
+    pub connect_ms: Option<u64>,
+    pub request_ms: Option<u64>,
+    pub open_ms: Option<u64>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct ShellToolsToml {
+    /// Enable the `shell`/`container_exec` tools (default: true).
+    pub enabled: Option<bool>,
+    /// Profiles explicitly allowed to use the shell tool. Empty → allow all.
+    #[serde(default)]
+    pub allow_profiles: Vec<String>,
+    /// Profiles explicitly disallowed from using the shell tool.
+    #[serde(default)]
+    pub disallow_profiles: Vec<String>,
 }
 
 impl From<ToolsToml> for Tools {
@@ -782,8 +1373,69 @@ impl From<ToolsToml> for Tools {
         Self {
             web_search: tools_toml.web_search,
             view_image: tools_toml.view_image,
+            vm_pty_lane: tools_toml.vm_pty.enabled,
         }
     }
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct MailboxLivenessToml {
+    pub enabled: Option<bool>,
+    #[serde(rename = "idle_after_seconds")]
+    pub idle_after_seconds: Option<f64>,
+    #[serde(rename = "stalled_after_seconds")]
+    pub stalled_after_seconds: Option<f64>,
+    #[serde(rename = "emit_interval_seconds")]
+    pub emit_interval_seconds: Option<f64>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(default)]
+pub struct SummariesToml {
+    pub enabled: Option<bool>,
+    /// Interval between background summary updates, in seconds.
+    #[serde(rename = "emit_interval_seconds")]
+    pub emit_interval_seconds: Option<f64>,
+    /// Initial startup delay before emitting the first summary, in seconds.
+    #[serde(rename = "initial_delay_seconds")]
+    pub initial_delay_seconds: Option<f64>,
+    /// Optional base directory for summary checkpoints.
+    pub base_dir: Option<PathBuf>,
+}
+
+/// Return a configured base directory for summaries if overridden by
+/// environment or config. Precedence:
+/// 1) CODEX_SUMMARIES_BASE_DIR env (non-empty)
+/// 2) CODEX_HOME/config.toml [summaries].base_dir
+pub fn summaries_base_dir_override() -> Option<PathBuf> {
+    if let Ok(val) = std::env::var("CODEX_SUMMARIES_BASE_DIR") {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            return Some(PathBuf::from(trimmed));
+        }
+    }
+
+    let codex_home = match find_codex_home() {
+        Ok(p) => p,
+        Err(_) => return None,
+    };
+    let config_path = codex_home.join(CONFIG_TOML_FILE);
+    let contents = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    #[derive(Deserialize)]
+    struct PartialConfig {
+        summaries: Option<SummariesToml>,
+    }
+
+    let cfg: PartialConfig = match toml::from_str(&contents) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
+    cfg.summaries.and_then(|s| s.base_dir)
 }
 
 impl ConfigToml {
@@ -877,6 +1529,26 @@ pub struct ConfigOverrides {
     pub include_view_image_tool: Option<bool>,
     pub show_raw_agent_reasoning: Option<bool>,
     pub tools_web_search_request: Option<bool>,
+    pub wait_policy: Option<WaitPolicyOverrides>,
+    /// High-precedence resolved overrides derived from `-c key=value` CLI flags.
+    /// These apply after profile selection to enforce CLI > profile > project > env > defaults.
+    pub cli_resolved_overrides: Option<CliResolvedOverrides>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct CliResolvedOverrides {
+    pub vm_pty_socket: Option<PathBuf>,
+    pub vm_pty_default_vm_id: Option<String>,
+    pub vm_pty_timeouts: CliVmPtyTimeouts,
+    pub vm_pty_open_blocking: Option<bool>,
+    pub debug_tools: Option<bool>,
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct CliVmPtyTimeouts {
+    pub connect_ms: Option<u64>,
+    pub request_ms: Option<u64>,
+    pub open_ms: Option<u64>,
 }
 
 impl Config {
@@ -905,6 +1577,8 @@ impl Config {
             include_view_image_tool,
             show_raw_agent_reasoning,
             tools_web_search_request: override_tools_web_search_request,
+            wait_policy: wait_policy_override,
+            cli_resolved_overrides,
         } = overrides;
 
         let active_profile_name = config_profile_key
@@ -978,10 +1652,247 @@ impl Config {
             .or(cfg.tools.as_ref().and_then(|t| t.view_image))
             .unwrap_or(true);
 
+        let shell_settings = cfg
+            .tools
+            .as_ref()
+            .and_then(|t| t.shell.clone())
+            .unwrap_or_default();
+        let shell_enabled = shell_settings.enabled.unwrap_or(true);
+        let normalize_profiles = |profiles: Vec<String>| {
+            profiles
+                .into_iter()
+                .map(|entry| entry.trim().to_ascii_lowercase())
+                .filter(|entry| !entry.is_empty())
+                .collect::<Vec<_>>()
+        };
+        let shell_allow = normalize_profiles(shell_settings.allow_profiles);
+        let shell_deny = normalize_profiles(shell_settings.disallow_profiles);
+        let include_shell_tool = if !shell_enabled {
+            false
+        } else if let Some(profile) = active_profile_name.as_ref() {
+            let profile = profile.trim().to_ascii_lowercase();
+            let allowed = if shell_allow.is_empty() {
+                true
+            } else {
+                shell_allow
+                    .iter()
+                    .any(|entry| entry == "*" || entry == &profile)
+            };
+            let denied = shell_deny
+                .iter()
+                .any(|entry| entry == "*" || entry == &profile);
+            allowed && !denied
+        } else {
+            let allowed = shell_allow.is_empty()
+                || shell_allow.iter().any(|entry| entry == "*");
+            let denied = shell_deny.iter().any(|entry| entry == "*");
+            allowed && !denied
+        };
+
+        // Resolve vm-pty settings with precedence: profile > project config > env > defaults.
+        let legacy_vm_pty_enabled = cfg.experimental_use_unified_exec_tool.unwrap_or(false);
+        // Prefer nested tools.vm_pty if provided; fall back to top-level vm_pty for backward-compat.
+        let base_vm_pty_cfg = if let Some(t) = &cfg.tools {
+            let mut nested = t.vm_pty.clone();
+            if nested.enabled.is_none() && nested.allow_profiles.is_empty() {
+                cfg.vm_pty.clone()
+            } else {
+                nested
+            }
+        } else {
+            cfg.vm_pty.clone()
+        };
+        let profile_vm_pty_cfg = config_profile
+            .tools
+            .as_ref()
+            .map(|t| t.vm_pty.clone())
+            .unwrap_or_default();
+        let vm_pty_enabled = profile_vm_pty_cfg
+            .enabled
+            .or(base_vm_pty_cfg.enabled)
+            .unwrap_or(legacy_vm_pty_enabled);
+        let mut vm_pty_allowed_profiles: Vec<String> = {
+            let from_profile = if !profile_vm_pty_cfg.allow_profiles.is_empty() {
+                profile_vm_pty_cfg.allow_profiles.clone()
+            } else {
+                base_vm_pty_cfg.allow_profiles.clone()
+            };
+            from_profile
+                .into_iter()
+                .map(|profile| profile.trim().to_ascii_lowercase())
+                .filter(|profile| !profile.is_empty())
+                .collect()
+        };
+        vm_pty_allowed_profiles.sort_unstable();
+        vm_pty_allowed_profiles.dedup();
+
+        // Socket resolution: CLI > profile > project config > env.
+        let cli_vm_pty_socket = cli_resolved_overrides
+            .as_ref()
+            .and_then(|o| o.vm_pty_socket.clone());
+        let resolved_vm_pty_socket: Option<PathBuf> = cli_vm_pty_socket
+            .or(profile_vm_pty_cfg.socket)
+            .or(base_vm_pty_cfg.socket.clone())
+            .or_else(|| {
+                if let Ok(v) = std::env::var("CODEX_VM_PTY_SOCKET") {
+                    let trimmed = v.trim();
+                    if !trimmed.is_empty() {
+                        warn!(target: "codex::config", "Using CODEX_VM_PTY_SOCKET from environment; prefer -c tools.vm_pty.socket or config.toml");
+                        return Some(PathBuf::from(trimmed));
+                    }
+                }
+                None
+            });
+
+        let vm_pty_flag_enabled = if vm_pty_enabled && resolved_vm_pty_socket.is_none() {
+            warn!(
+                target: "codex::config",
+                "vm-pty lane enabled but tools.vm_pty.socket is not configured; disabling pty_open tool"
+            );
+            false
+        } else {
+            vm_pty_enabled
+        };
+        let vm_pty_profile_allowlisted = if vm_pty_flag_enabled {
+            match active_profile_name.as_ref() {
+                Some(profile) => {
+                    let normalized = profile.to_ascii_lowercase();
+                    vm_pty_allowed_profiles
+                        .iter()
+                        .any(|allowed| allowed == "*" || allowed == &normalized)
+                }
+                None => false,
+            }
+        } else {
+            false
+        };
+        let include_vm_pty_tool = vm_pty_flag_enabled && vm_pty_profile_allowlisted;
+        // Expose pty_open for any profile allow‑listed via tools.vm_pty.allow_profiles.
+        // This removes hard‑coded profile names in favor of config.
+        let include_vm_pty_open_tool = include_vm_pty_tool;
+        let exec_explicit_enabled = cfg
+            .tools
+            .as_ref()
+            .and_then(|t| t.unified_exec_enabled)
+            .unwrap_or(false);
+        let use_experimental_unified_exec_tool = include_vm_pty_tool && exec_explicit_enabled;
+
         let model = model
             .or(config_profile.model)
             .or(cfg.model)
             .unwrap_or_else(default_model);
+
+        let mut wait_settings = WaitPolicySettings::from_toml(cfg.wait.as_ref())
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+
+        if let Some(profile_name) = active_profile_name.as_ref() {
+            if let Some(profile_wait) = cfg.wait_profiles.get(profile_name) {
+                wait_settings = wait_settings
+                    .apply_toml(profile_wait)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+                wait_settings.normalize();
+            }
+        }
+
+        if let Some(overrides) = wait_policy_override.as_ref() {
+            wait_settings
+                .apply_override(overrides)
+                .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        }
+
+        // Resolve vm-pty timeouts with precedence: CLI > profile > project > env > default.
+        let cli_timeouts = cli_resolved_overrides.as_ref().map(|o| &o.vm_pty_timeouts);
+        let resolved_connect_timeout = cli_timeouts
+            .and_then(|t| t.connect_ms.map(Duration::from_millis))
+            .or(profile_vm_pty_cfg
+                .timeouts
+                .connect_ms
+                .map(Duration::from_millis))
+            .or(base_vm_pty_cfg
+                .timeouts
+                .connect_ms
+                .map(Duration::from_millis))
+            .or_else(|| {
+                std::env::var("CODEX_VM_PTY_CONNECT_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(Duration::from_millis)
+            })
+            .unwrap_or(DEFAULT_VM_PTY_CONNECT_TIMEOUT);
+
+        let resolved_request_timeout = cli_timeouts
+            .and_then(|t| t.request_ms.map(Duration::from_millis))
+            .or(profile_vm_pty_cfg
+                .timeouts
+                .request_ms
+                .map(Duration::from_millis))
+            .or(base_vm_pty_cfg
+                .timeouts
+                .request_ms
+                .map(Duration::from_millis))
+            .or_else(|| {
+                std::env::var("CODEX_VM_PTY_REQUEST_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(Duration::from_millis)
+            })
+            .unwrap_or(DEFAULT_VM_PTY_REQUEST_TIMEOUT);
+
+        let resolved_open_timeout = cli_timeouts
+            .and_then(|t| t.open_ms.map(Duration::from_millis))
+            .or(profile_vm_pty_cfg
+                .timeouts
+                .open_ms
+                .map(Duration::from_millis))
+            .or(base_vm_pty_cfg
+                .timeouts
+                .open_ms
+                .map(Duration::from_millis))
+            .or_else(|| {
+                std::env::var("CODEX_VM_PTY_OPEN_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(Duration::from_millis)
+            })
+            .unwrap_or(DEFAULT_VM_PTY_OPEN_TIMEOUT);
+
+        let resolved_open_blocking = cli_resolved_overrides
+            .as_ref()
+            .and_then(|o| o.vm_pty_open_blocking)
+            .or(profile_vm_pty_cfg.open_blocking)
+            .or(base_vm_pty_cfg.open_blocking)
+            .or_else(|| {
+                let v = std::env::var("CODEX_VM_PTY_OPEN_BLOCKING").unwrap_or_default();
+                let b = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes");
+                Some(b)
+            })
+            .unwrap_or(false);
+
+        // Resolve optional per-worker concurrency cap for VM PTY sessions
+        let resolved_max_concurrent_per_worker = profile_vm_pty_cfg
+            .max_concurrent_per_worker
+            .or(base_vm_pty_cfg.max_concurrent_per_worker)
+            .filter(|n| *n > 0);
+
+        // Resolve default vm id for pty_open/attach.
+        let resolved_default_vm_id = cli_resolved_overrides
+            .as_ref()
+            .and_then(|o| o.vm_pty_default_vm_id.clone())
+            .or(profile_vm_pty_cfg.default_vm_id)
+            .or(base_vm_pty_cfg.default_vm_id)
+            .or_else(|| std::env::var("CODEX_VM_PTY_VM_ID").ok());
+
+        // Debug tools gate precedence: CLI > profile > project > env > default(false)
+        let debug_tools = cli_resolved_overrides
+            .as_ref()
+            .and_then(|o| o.debug_tools)
+            .or(config_profile
+                .debug
+                .as_ref()
+                .and_then(|d| d.tools))
+            .or(cfg.debug.as_ref().and_then(|d| d.tools))
+            .or_else(|| (std::env::var("CODEX_DEBUG_TOOLS").as_deref() == Ok("1")).then_some(true))
+            .unwrap_or(false);
 
         let mut model_family =
             find_family_for_model(&model).unwrap_or_else(|| derive_default_model_family(&model));
@@ -1024,6 +1935,8 @@ impl Config {
             .or(cfg.review_model)
             .unwrap_or_else(default_review_model);
 
+        let mailbox_liveness = MailboxLivenessSettings::from_toml(cfg.mailbox_liveness.clone());
+
         let config = Self {
             model,
             review_model,
@@ -1044,6 +1957,9 @@ impl Config {
             user_instructions,
             base_instructions,
             mcp_servers: cfg.mcp_servers,
+            // The config.toml omits "_mode" because it's a config file. However, "_mode"
+            // is important in code to differentiate the mode from the store implementation.
+            mcp_oauth_credentials_store_mode: cfg.mcp_oauth_credentials_store.unwrap_or_default(),
             model_providers,
             project_doc_max_bytes: cfg.project_doc_max_bytes.unwrap_or(PROJECT_DOC_MAX_BYTES),
             project_doc_fallback_filenames: cfg
@@ -1082,17 +1998,29 @@ impl Config {
                 .or(cfg.chatgpt_base_url)
                 .unwrap_or("https://chatgpt.com/backend-api/".to_string()),
             include_plan_tool: include_plan_tool.unwrap_or(false),
-            include_apply_patch_tool: include_apply_patch_tool.unwrap_or(false),
+            include_apply_patch_tool: include_apply_patch_tool
+                .or(cfg.experimental_use_freeform_apply_patch)
+                .unwrap_or(false),
             tools_web_search_request,
             use_experimental_streamable_shell_tool: cfg
                 .experimental_use_exec_command_tool
                 .unwrap_or(false),
-            use_experimental_unified_exec_tool: cfg
-                .experimental_use_unified_exec_tool
-                .unwrap_or(false),
+            use_experimental_unified_exec_tool,
             use_experimental_use_rmcp_client: cfg.experimental_use_rmcp_client.unwrap_or(false),
             include_view_image_tool,
+            include_shell_tool,
+            include_vm_pty_tool,
+            include_vm_pty_open_tool,
+            debug_tools,
+            vm_pty_socket: resolved_vm_pty_socket,
+            vm_pty_default_vm_id: resolved_default_vm_id,
+            vm_pty_connect_timeout: resolved_connect_timeout,
+            vm_pty_request_timeout: resolved_request_timeout,
+            vm_pty_open_timeout: resolved_open_timeout,
+            vm_pty_open_blocking: resolved_open_blocking,
+            vm_pty_max_concurrent_per_worker: resolved_max_concurrent_per_worker,
             active_profile: active_profile_name,
+            windows_wsl_setup_acknowledged: cfg.windows_wsl_setup_acknowledged.unwrap_or(false),
             disable_paste_burst: cfg.disable_paste_burst.unwrap_or(false),
             tui_notifications: cfg
                 .tui
@@ -1112,7 +2040,11 @@ impl Config {
                     exporter,
                 }
             },
+            summaries: SummariesSettings::from_toml(cfg.summaries.clone()),
+            mailbox_liveness,
+            wait: wait_settings.clone(),
         };
+        update_wait_policy(&config.wait);
         Ok(config)
     }
 
@@ -1188,17 +2120,25 @@ fn default_review_model() -> String {
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
 /// `~/.codex`.
 ///
-/// - If `CODEX_HOME` is set, the value will be canonicalized and this
-///   function will Err if the path does not exist.
-/// - If `CODEX_HOME` is not set, this function does not verify that the
-///   directory exists.
+/// This helper ensures the directory exists before returning. When
+/// `CODEX_HOME` is provided, the directory will be created on-demand (to
+/// restore the historical behaviour where new installs worked with no manual
+/// setup) and the resulting path is canonicalized when possible.
 pub fn find_codex_home() -> std::io::Result<PathBuf> {
     // Honor the `CODEX_HOME` environment variable when it is set to allow users
     // (and tests) to override the default location.
     if let Ok(val) = std::env::var("CODEX_HOME")
         && !val.is_empty()
     {
-        return PathBuf::from(val).canonicalize();
+        let path = PathBuf::from(val);
+        std::fs::create_dir_all(&path)?;
+        return path.canonicalize().or_else(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Ok(path)
+            } else {
+                Err(err)
+            }
+        });
     }
 
     let mut p = home_dir().ok_or_else(|| {
@@ -1208,6 +2148,7 @@ pub fn find_codex_home() -> std::io::Result<PathBuf> {
         )
     })?;
     p.push(".codex");
+    std::fs::create_dir_all(&p)?;
     Ok(p)
 }
 
@@ -1227,8 +2168,71 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
+    use serial_test::serial;
+    use std::ffi::OsString;
     use std::time::Duration;
     use tempfile::TempDir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_os(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: tests serialize access to these env vars via the
+            // serial_test attribute, so we can mutate process-global state.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: see comment in set_os.
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn find_codex_home_creates_default_directory() {
+        let temp_home = TempDir::new().expect("tempdir");
+        let _home_guard = EnvVarGuard::set_os("HOME", temp_home.path().as_os_str());
+        let _codex_guard = EnvVarGuard::unset("CODEX_HOME");
+
+        let codex_home = find_codex_home().expect("find codex home");
+        assert_eq!(codex_home, temp_home.path().join(".codex"));
+        assert!(codex_home.is_dir());
+    }
+
+    #[test]
+    #[serial]
+    fn find_codex_home_creates_env_override_directory() {
+        let temp_home = TempDir::new().expect("tempdir");
+        let override_dir = temp_home.path().join("custom-codex-home");
+        let _home_guard = EnvVarGuard::set_os("HOME", temp_home.path().as_os_str());
+        let _codex_guard = EnvVarGuard::set_os("CODEX_HOME", override_dir.as_os_str());
+
+        let codex_home = find_codex_home().expect("find codex home");
+        assert_eq!(
+            codex_home,
+            override_dir
+                .canonicalize()
+                .expect("canonical override exists"),
+        );
+        assert!(codex_home.is_dir());
+    }
 
     #[test]
     fn test_toml_parsing() {
@@ -1273,6 +2277,224 @@ persistence = "none"
         let tui = parsed.tui.expect("config should include tui section");
 
         assert_eq!(tui.notifications, Notifications::Enabled(false));
+    }
+
+    #[test]
+    fn wait_policy_defaults_apply() {
+        let settings = WaitPolicySettings::from_toml(None).expect("defaults");
+        assert!(settings.is_allowed(WaitPredicateKind::Timer));
+        assert!(settings.is_allowed(WaitPredicateKind::Filesystem));
+        assert!(settings.is_allowed(WaitPredicateKind::Shell));
+        assert_eq!(settings.max_waits_per_turn(), DEFAULT_MAX_WAITS_PER_TURN);
+        assert_eq!(settings.max_duration(), DEFAULT_WAIT_MAX_DURATION);
+        assert!(!settings.require_shell_approval());
+    }
+
+    #[test]
+    fn wait_policy_allows_disabling_all_predicates_via_config() {
+        let settings = WaitPolicySettings::from_toml(Some(&WaitPolicyToml {
+            allowed_predicates: Some(vec![]),
+            ..Default::default()
+        }))
+        .expect("empty allow-list should parse");
+
+        assert!(!settings.is_allowed(WaitPredicateKind::Timer));
+        assert!(!settings.is_allowed(WaitPredicateKind::Filesystem));
+        assert!(!settings.is_allowed(WaitPredicateKind::Shell));
+    }
+
+    #[test]
+    fn wait_policy_rejects_invalid_predicates() {
+        let result = WaitPolicySettings::from_toml(Some(&WaitPolicyToml {
+            allowed_predicates: Some(vec!["unknown".to_string()]),
+            ..Default::default()
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn wait_policy_profile_override_applies() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = ConfigToml::default();
+        cfg.profiles
+            .insert("dev".to_string(), ConfigProfile::default());
+        cfg.profile = Some("dev".to_string());
+        cfg.wait = Some(WaitPolicyToml {
+            allowed_predicates: Some(vec!["timer".to_string()]),
+            ..Default::default()
+        });
+        cfg.wait_profiles.insert(
+            "dev".to_string(),
+            WaitPolicyToml {
+                allowed_predicates: Some(vec!["shell".to_string()]),
+                max_waits_per_turn: Some(2),
+                require_shell_approval: Some(true),
+                ..Default::default()
+            },
+        );
+
+        let overrides = ConfigOverrides {
+            config_profile: Some("dev".to_string()),
+            ..Default::default()
+        };
+
+        let config =
+            Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+                .expect("config");
+
+        assert!(config.wait.is_allowed(WaitPredicateKind::Shell));
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
+        assert_eq!(config.wait.max_waits_per_turn(), 2);
+        assert!(config.wait.require_shell_approval());
+    }
+
+    #[test]
+    fn wait_policy_cli_override_wins() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut cfg = ConfigToml::default();
+        cfg.wait = Some(WaitPolicyToml {
+            max_duration_seconds: Some(120),
+            ..Default::default()
+        });
+
+        let overrides = ConfigOverrides {
+            wait_policy: Some(WaitPolicyOverrides {
+                max_duration_seconds: Some(10),
+                allowed_predicates: Some(vec![WaitPredicateKind::Filesystem]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config =
+            Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+                .expect("config");
+
+        assert_eq!(config.wait.max_duration(), Duration::from_secs(10));
+        assert!(config.wait.is_allowed(WaitPredicateKind::Filesystem));
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
+    }
+
+    #[test]
+    fn wait_policy_cli_override_can_disable_all_predicates() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cfg = ConfigToml::default();
+
+        let overrides = ConfigOverrides {
+            wait_policy: Some(WaitPolicyOverrides {
+                allowed_predicates: Some(Vec::<WaitPredicateKind>::new()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let config =
+            Config::load_from_base_config_with_overrides(cfg, overrides, temp.path().into())
+                .expect("config");
+
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Timer));
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Filesystem));
+        assert!(!config.wait.is_allowed(WaitPredicateKind::Shell));
+    }
+
+    #[test]
+    fn vm_pty_disabled_by_default() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+
+        let config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert!(
+            !config.use_experimental_unified_exec_tool,
+            "unified_exec should be disabled unless the VM PTY feature flag and allowlist are set"
+        );
+        assert!(
+            !config.include_vm_pty_tool,
+            "vm-pty tool must be disabled unless the feature flag, allowlist, and socket are configured"
+        );
+    }
+
+    #[test]
+    fn vm_pty_requires_allowlisted_profile() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let socket_dir = tempfile::tempdir().expect("socket_dir");
+        let socket_path = socket_dir.path().join("pty.sock");
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(socket_path.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        cfg.profiles
+            .insert("workers".to_string(), ConfigProfile::default());
+        cfg.profiles
+            .insert("management".to_string(), ConfigProfile::default());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("workers".to_string());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert!(
+            !config.use_experimental_unified_exec_tool,
+            "non-allowlisted profiles must not receive the unified_exec tool"
+        );
+        assert!(
+            !config.include_vm_pty_tool,
+            "non-allowlisted profiles must not receive the vm-pty tool"
+        );
+    }
+
+    #[test]
+    fn vm_pty_enabled_for_management_profile() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let socket_dir = tempfile::tempdir().expect("socket_dir");
+        let socket_path = socket_dir.path().join("pty.sock");
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(socket_path.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        cfg.profiles
+            .insert("management".to_string(), ConfigProfile::default());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("management".to_string());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert!(
+            config.use_experimental_unified_exec_tool,
+            "allowlisted Management profile should receive the unified_exec tool"
+        );
+        assert!(
+            config.include_vm_pty_tool,
+            "allowlisted Management profile should receive the vm-pty tool"
+        );
     }
 
     #[test]
@@ -1331,6 +2553,85 @@ exclude_slash_tmp = true
         );
     }
 
+    #[test]
+    fn config_defaults_to_auto_oauth_store_mode() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml::default();
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.mcp_oauth_credentials_store_mode,
+            OAuthCredentialsStoreMode::Auto,
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn config_honors_explicit_file_oauth_store_mode() -> std::io::Result<()> {
+        let codex_home = TempDir::new()?;
+        let cfg = ConfigToml {
+            mcp_oauth_credentials_store: Some(OAuthCredentialsStoreMode::File),
+            ..Default::default()
+        };
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+
+        assert_eq!(
+            config.mcp_oauth_credentials_store_mode,
+            OAuthCredentialsStoreMode::File,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn managed_config_overrides_oauth_store_mode() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let managed_path = codex_home.path().join("managed_config.toml");
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(&config_path, "mcp_oauth_credentials_store = \"file\"\n")?;
+        std::fs::write(&managed_path, "mcp_oauth_credentials_store = \"keyring\"\n")?;
+
+        let overrides = crate::config_loader::LoaderOverrides {
+            managed_config_path: Some(managed_path.clone()),
+            #[cfg(target_os = "macos")]
+            managed_preferences_base64: None,
+        };
+
+        let root_value = load_resolved_config(codex_home.path(), Vec::new(), overrides).await?;
+        let cfg: ConfigToml = root_value.try_into().map_err(|e| {
+            tracing::error!("Failed to deserialize overridden config: {e}");
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+        })?;
+        assert_eq!(
+            cfg.mcp_oauth_credentials_store,
+            Some(OAuthCredentialsStoreMode::Keyring),
+        );
+
+        let final_config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )?;
+        assert_eq!(
+            final_config.mcp_oauth_credentials_store_mode,
+            OAuthCredentialsStoreMode::Keyring,
+        );
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn load_global_mcp_servers_returns_empty_if_missing() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
@@ -1354,8 +2655,10 @@ exclude_slash_tmp = true
                     args: vec!["hello".to_string()],
                     env: None,
                 },
+                enabled: true,
                 startup_timeout_sec: Some(Duration::from_secs(3)),
                 tool_timeout_sec: Some(Duration::from_secs(5)),
+                keepalive_interval_sec: None,
             },
         );
 
@@ -1374,6 +2677,7 @@ exclude_slash_tmp = true
         }
         assert_eq!(docs.startup_timeout_sec, Some(Duration::from_secs(3)));
         assert_eq!(docs.tool_timeout_sec, Some(Duration::from_secs(5)));
+        assert!(docs.enabled);
 
         let empty = BTreeMap::new();
         write_global_mcp_servers(codex_home.path(), &empty)?;
@@ -1439,6 +2743,31 @@ startup_timeout_ms = 2500
     }
 
     #[tokio::test]
+    async fn load_global_mcp_servers_rejects_inline_bearer_token() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+
+        std::fs::write(
+            &config_path,
+            r#"
+[mcp_servers.docs]
+url = "https://example.com/mcp"
+bearer_token = "secret"
+"#,
+        )?;
+
+        let err = load_global_mcp_servers(codex_home.path())
+            .await
+            .expect_err("bearer_token entries should be rejected");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("bearer_token"));
+        assert!(err.to_string().contains("bearer_token_env_var"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn write_global_mcp_servers_serializes_env_sorted() -> anyhow::Result<()> {
         let codex_home = TempDir::new()?;
 
@@ -1453,8 +2782,10 @@ startup_timeout_ms = 2500
                         ("ALPHA_VAR".to_string(), "1".to_string()),
                     ])),
                 },
+                enabled: true,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
+                keepalive_interval_sec: None,
             },
         )]);
 
@@ -1501,10 +2832,12 @@ ZIG_VAR = "3"
             McpServerConfig {
                 transport: McpServerTransportConfig::StreamableHttp {
                     url: "https://example.com/mcp".to_string(),
-                    bearer_token: Some("secret-token".to_string()),
+                    bearer_token_env_var: Some("MCP_TOKEN".to_string()),
                 },
+                enabled: true,
                 startup_timeout_sec: Some(Duration::from_secs(2)),
                 tool_timeout_sec: None,
+                keepalive_interval_sec: None,
             },
         )]);
 
@@ -1516,7 +2849,7 @@ ZIG_VAR = "3"
             serialized,
             r#"[mcp_servers.docs]
 url = "https://example.com/mcp"
-bearer_token = "secret-token"
+bearer_token_env_var = "MCP_TOKEN"
 startup_timeout_sec = 2.0
 "#
         );
@@ -1524,9 +2857,12 @@ startup_timeout_sec = 2.0
         let loaded = load_global_mcp_servers(codex_home.path()).await?;
         let docs = loaded.get("docs").expect("docs entry");
         match &docs.transport {
-            McpServerTransportConfig::StreamableHttp { url, bearer_token } => {
+            McpServerTransportConfig::StreamableHttp {
+                url,
+                bearer_token_env_var,
+            } => {
                 assert_eq!(url, "https://example.com/mcp");
-                assert_eq!(bearer_token.as_deref(), Some("secret-token"));
+                assert_eq!(bearer_token_env_var.as_deref(), Some("MCP_TOKEN"));
             }
             other => panic!("unexpected transport {other:?}"),
         }
@@ -1537,10 +2873,12 @@ startup_timeout_sec = 2.0
             McpServerConfig {
                 transport: McpServerTransportConfig::StreamableHttp {
                     url: "https://example.com/mcp".to_string(),
-                    bearer_token: None,
+                    bearer_token_env_var: None,
                 },
+                enabled: true,
                 startup_timeout_sec: None,
                 tool_timeout_sec: None,
+                keepalive_interval_sec: None,
             },
         );
         write_global_mcp_servers(codex_home.path(), &servers)?;
@@ -1556,12 +2894,50 @@ url = "https://example.com/mcp"
         let loaded = load_global_mcp_servers(codex_home.path()).await?;
         let docs = loaded.get("docs").expect("docs entry");
         match &docs.transport {
-            McpServerTransportConfig::StreamableHttp { url, bearer_token } => {
+            McpServerTransportConfig::StreamableHttp {
+                url,
+                bearer_token_env_var,
+            } => {
                 assert_eq!(url, "https://example.com/mcp");
-                assert!(bearer_token.is_none());
+                assert!(bearer_token_env_var.is_none());
             }
             other => panic!("unexpected transport {other:?}"),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn write_global_mcp_servers_serializes_disabled_flag() -> anyhow::Result<()> {
+        let codex_home = TempDir::new()?;
+
+        let servers = BTreeMap::from([(
+            "docs".to_string(),
+            McpServerConfig {
+                transport: McpServerTransportConfig::Stdio {
+                    command: "docs-server".to_string(),
+                    args: Vec::new(),
+                    env: None,
+                },
+                enabled: false,
+                startup_timeout_sec: None,
+                tool_timeout_sec: None,
+                keepalive_interval_sec: None,
+            },
+        )]);
+
+        write_global_mcp_servers(codex_home.path(), &servers)?;
+
+        let config_path = codex_home.path().join(CONFIG_TOML_FILE);
+        let serialized = std::fs::read_to_string(&config_path)?;
+        assert!(
+            serialized.contains("enabled = false"),
+            "serialized config missing disabled flag:\n{serialized}"
+        );
+
+        let loaded = load_global_mcp_servers(codex_home.path()).await?;
+        let docs = loaded.get("docs").expect("docs entry");
+        assert!(!docs.enabled);
 
         Ok(())
     }
@@ -1794,6 +3170,7 @@ model_verbosity = "high"
             request_max_retries: Some(4),
             stream_max_retries: Some(10),
             stream_idle_timeout_ms: Some(300_000),
+            stream_heartbeat_interval_ms: None,
             requires_openai_auth: false,
         };
         let model_provider_map = {
@@ -1863,6 +3240,7 @@ model_verbosity = "high"
                 notify: None,
                 cwd: fixture.cwd(),
                 mcp_servers: HashMap::new(),
+                mcp_oauth_credentials_store_mode: Default::default(),
                 model_providers: fixture.model_provider_map.clone(),
                 project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
                 project_doc_fallback_filenames: Vec::new(),
@@ -1870,6 +3248,7 @@ model_verbosity = "high"
                 history: History::default(),
                 file_opener: UriBasedFileOpener::VsCode,
                 codex_linux_sandbox_exe: None,
+                mailbox_liveness: MailboxLivenessSettings::default(),
                 hide_agent_reasoning: false,
                 show_raw_agent_reasoning: false,
                 model_reasoning_effort: Some(ReasoningEffort::High),
@@ -1884,9 +3263,22 @@ model_verbosity = "high"
                 use_experimental_unified_exec_tool: false,
                 use_experimental_use_rmcp_client: false,
                 include_view_image_tool: true,
+                include_shell_tool: true,
+                include_vm_pty_tool: false,
+                include_vm_pty_open_tool: false,
+                debug_tools: false,
+                vm_pty_socket: None,
+                vm_pty_default_vm_id: None,
+                vm_pty_connect_timeout: DEFAULT_VM_PTY_CONNECT_TIMEOUT,
+                vm_pty_request_timeout: DEFAULT_VM_PTY_REQUEST_TIMEOUT,
+                vm_pty_open_timeout: DEFAULT_VM_PTY_OPEN_TIMEOUT,
+                vm_pty_open_blocking: false,
                 active_profile: Some("o3".to_string()),
+                windows_wsl_setup_acknowledged: false,
                 disable_paste_burst: false,
                 tui_notifications: Default::default(),
+                summaries: SummariesSettings::default(),
+                wait: WaitPolicySettings::default(),
                 otel: OtelConfig::default(),
             },
             o3_profile_config
@@ -1924,6 +3316,7 @@ model_verbosity = "high"
             notify: None,
             cwd: fixture.cwd(),
             mcp_servers: HashMap::new(),
+            mcp_oauth_credentials_store_mode: Default::default(),
             model_providers: fixture.model_provider_map.clone(),
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
@@ -1931,6 +3324,7 @@ model_verbosity = "high"
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
+            mailbox_liveness: MailboxLivenessSettings::default(),
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: None,
@@ -1945,9 +3339,22 @@ model_verbosity = "high"
             use_experimental_unified_exec_tool: false,
             use_experimental_use_rmcp_client: false,
             include_view_image_tool: true,
+            include_shell_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            debug_tools: false,
+            vm_pty_socket: None,
+            vm_pty_default_vm_id: None,
+            vm_pty_connect_timeout: DEFAULT_VM_PTY_CONNECT_TIMEOUT,
+            vm_pty_request_timeout: DEFAULT_VM_PTY_REQUEST_TIMEOUT,
+            vm_pty_open_timeout: DEFAULT_VM_PTY_OPEN_TIMEOUT,
+            vm_pty_open_blocking: false,
             active_profile: Some("gpt3".to_string()),
+            windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
+            summaries: SummariesSettings::default(),
+            wait: WaitPolicySettings::default(),
             otel: OtelConfig::default(),
         };
 
@@ -2000,6 +3407,7 @@ model_verbosity = "high"
             notify: None,
             cwd: fixture.cwd(),
             mcp_servers: HashMap::new(),
+            mcp_oauth_credentials_store_mode: Default::default(),
             model_providers: fixture.model_provider_map.clone(),
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
@@ -2007,6 +3415,7 @@ model_verbosity = "high"
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
+            mailbox_liveness: MailboxLivenessSettings::default(),
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: None,
@@ -2021,9 +3430,22 @@ model_verbosity = "high"
             use_experimental_unified_exec_tool: false,
             use_experimental_use_rmcp_client: false,
             include_view_image_tool: true,
+            include_shell_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            debug_tools: false,
+            vm_pty_socket: None,
+            vm_pty_default_vm_id: None,
+            vm_pty_connect_timeout: DEFAULT_VM_PTY_CONNECT_TIMEOUT,
+            vm_pty_request_timeout: DEFAULT_VM_PTY_REQUEST_TIMEOUT,
+            vm_pty_open_timeout: DEFAULT_VM_PTY_OPEN_TIMEOUT,
+            vm_pty_open_blocking: false,
             active_profile: Some("zdr".to_string()),
+            windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
+            summaries: SummariesSettings::default(),
+            wait: WaitPolicySettings::default(),
             otel: OtelConfig::default(),
         };
 
@@ -2062,6 +3484,7 @@ model_verbosity = "high"
             notify: None,
             cwd: fixture.cwd(),
             mcp_servers: HashMap::new(),
+            mcp_oauth_credentials_store_mode: Default::default(),
             model_providers: fixture.model_provider_map.clone(),
             project_doc_max_bytes: PROJECT_DOC_MAX_BYTES,
             project_doc_fallback_filenames: Vec::new(),
@@ -2069,6 +3492,7 @@ model_verbosity = "high"
             history: History::default(),
             file_opener: UriBasedFileOpener::VsCode,
             codex_linux_sandbox_exe: None,
+            mailbox_liveness: MailboxLivenessSettings::default(),
             hide_agent_reasoning: false,
             show_raw_agent_reasoning: false,
             model_reasoning_effort: Some(ReasoningEffort::High),
@@ -2083,9 +3507,22 @@ model_verbosity = "high"
             use_experimental_unified_exec_tool: false,
             use_experimental_use_rmcp_client: false,
             include_view_image_tool: true,
+            include_shell_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            debug_tools: false,
+            vm_pty_socket: None,
+            vm_pty_default_vm_id: None,
+            vm_pty_connect_timeout: DEFAULT_VM_PTY_CONNECT_TIMEOUT,
+            vm_pty_request_timeout: DEFAULT_VM_PTY_REQUEST_TIMEOUT,
+            vm_pty_open_timeout: DEFAULT_VM_PTY_OPEN_TIMEOUT,
+            vm_pty_open_blocking: false,
             active_profile: Some("gpt5".to_string()),
+            windows_wsl_setup_acknowledged: false,
             disable_paste_burst: false,
             tui_notifications: Default::default(),
+            summaries: SummariesSettings::default(),
+            wait: WaitPolicySettings::default(),
             otel: OtelConfig::default(),
         };
 
@@ -2194,6 +3631,7 @@ trust_level = "trusted"
 #[cfg(test)]
 mod notifications_tests {
     use crate::config_types::Notifications;
+    use assert_matches::assert_matches;
     use serde::Deserialize;
 
     #[derive(Deserialize, Debug, PartialEq)]
@@ -2213,10 +3651,7 @@ mod notifications_tests {
             notifications = true
         "#;
         let parsed: RootTomlTest = toml::from_str(toml).expect("deserialize notifications=true");
-        assert!(matches!(
-            parsed.tui.notifications,
-            Notifications::Enabled(true)
-        ));
+        assert_matches!(parsed.tui.notifications, Notifications::Enabled(true));
     }
 
     #[test]
@@ -2227,9 +3662,195 @@ mod notifications_tests {
         "#;
         let parsed: RootTomlTest =
             toml::from_str(toml).expect("deserialize notifications=[\"foo\"]");
-        assert!(matches!(
+        assert_matches!(
             parsed.tui.notifications,
             Notifications::Custom(ref v) if v == &vec!["foo".to_string()]
-        ));
+        );
+    }
+}
+
+#[cfg(test)]
+mod vm_pty_precedence_tests {
+    use super::*;
+    use serial_test::serial;
+
+    struct LocalEnvGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl LocalEnvGuard {
+        fn set_os(key: &'static str, value: &std::ffi::OsStr) -> Self {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for LocalEnvGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(val) => unsafe { std::env::set_var(self.key, val) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn vm_pty_socket_env_fallback_when_unset_in_config() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let socket_dir = tempfile::tempdir().expect("socket_dir");
+        let socket_path = socket_dir.path().join("env.sock");
+        let _guard = LocalEnvGuard::set_os("CODEX_VM_PTY_SOCKET", socket_path.as_os_str());
+
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.profiles
+            .insert("management".to_string(), ConfigProfile::default());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("management".to_string());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert!(config.include_vm_pty_tool);
+        assert_eq!(config.vm_pty_socket.as_deref(), Some(socket_path.as_path()));
+    }
+
+    #[test]
+    fn vm_pty_socket_profile_beats_project() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let base_socket_dir = tempfile::tempdir().expect("base_socket_dir");
+        let base_socket = base_socket_dir.path().join("base.sock");
+        let profile_socket_dir = tempfile::tempdir().expect("profile_socket_dir");
+        let profile_socket = profile_socket_dir.path().join("profile.sock");
+
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(base_socket.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        let mut profile = ConfigProfile::default();
+        profile.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(profile_socket.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        cfg.profiles.insert("management".to_string(), profile);
+        cfg.profile = Some("management".to_string());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("management".to_string());
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert_eq!(config.vm_pty_socket.as_deref(), Some(profile_socket.as_path()));
+    }
+
+    #[test]
+    fn vm_pty_socket_cli_beats_profile_and_env() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let cwd = tempfile::tempdir().expect("cwd");
+        let base_socket_dir = tempfile::tempdir().expect("base_socket_dir");
+        let base_socket = base_socket_dir.path().join("base.sock");
+        let profile_socket_dir = tempfile::tempdir().expect("profile_socket_dir");
+        let profile_socket = profile_socket_dir.path().join("profile.sock");
+        let cli_socket_dir = tempfile::tempdir().expect("cli_socket_dir");
+        let cli_socket = cli_socket_dir.path().join("cli.sock");
+
+        let mut cfg = ConfigToml::default();
+        cfg.vm_pty.enabled = Some(true);
+        cfg.vm_pty.allow_profiles = vec!["management".to_string()];
+        cfg.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(base_socket.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        let mut profile = ConfigProfile::default();
+        profile.tools = Some(ToolsToml {
+            vm_pty: VmPtyToml { socket: Some(profile_socket.clone()), ..Default::default() },
+            ..Default::default()
+        });
+        cfg.profiles.insert("management".to_string(), profile);
+        cfg.profile = Some("management".to_string());
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cwd = Some(cwd.path().to_path_buf());
+        overrides.config_profile = Some("management".to_string());
+        overrides.cli_resolved_overrides = Some(CliResolvedOverrides {
+            vm_pty_socket: Some(cli_socket.clone()),
+            vm_pty_default_vm_id: None,
+            vm_pty_timeouts: CliVmPtyTimeouts::default(),
+            vm_pty_open_blocking: None,
+            debug_tools: None,
+        });
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+
+        assert_eq!(config.vm_pty_socket.as_deref(), Some(cli_socket.as_path()));
+    }
+
+    #[test]
+    #[serial]
+    fn debug_tools_env_vs_config_precedence() {
+        let _guard = LocalEnvGuard::set_os("CODEX_DEBUG_TOOLS", std::ffi::OsStr::new("1"));
+        let codex_home = tempfile::tempdir().expect("codex_home");
+
+        // Config disables debug.tools; env is set to 1, but project config should win.
+        let mut cfg = ConfigToml::default();
+        cfg.debug = Some(DebugToml { tools: Some(false) });
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            ConfigOverrides::default(),
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+        assert_eq!(config.debug_tools, false);
+    }
+
+    #[test]
+    fn debug_tools_cli_beats_project() {
+        let codex_home = tempfile::tempdir().expect("codex_home");
+        let mut cfg = ConfigToml::default();
+        cfg.debug = Some(DebugToml { tools: Some(false) });
+
+        let mut overrides = ConfigOverrides::default();
+        overrides.cli_resolved_overrides = Some(CliResolvedOverrides {
+            vm_pty_socket: None,
+            vm_pty_default_vm_id: None,
+            vm_pty_timeouts: CliVmPtyTimeouts::default(),
+            vm_pty_open_blocking: None,
+            debug_tools: Some(true),
+        });
+
+        let config = Config::load_from_base_config_with_overrides(
+            cfg,
+            overrides,
+            codex_home.path().to_path_buf(),
+        )
+        .expect("config");
+        assert_eq!(config.debug_tools, true);
     }
 }

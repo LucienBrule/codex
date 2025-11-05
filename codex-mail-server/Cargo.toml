@@ -1,0 +1,36 @@
+[package]
+name = "codex-mail-server"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+async-nats = "0.44.2"
+async-trait = "0.1"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "signal", "sync", "time", "fs", "process"] }
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uuid = { version = "1", features = ["serde", "v7"] }
+thiserror = "2"
+parking_lot = "0.12"
+notify = { version = "7", optional = true }
+fs2 = "0.4"
+codex-otel = { path = "../codex-rs/otel", optional = true }
+# Reuse protocol types for mailbox messages
+codex-protocol = { path = "../codex-rs/protocol" }
+dirs = "6"
+
+[features]
+default = ["otel"]
+otel = ["codex-otel"]
+
+[dev-dependencies]
+tempfile = "3"
+insta = { version = "1.43.2", features = ["yaml"] }
+serde_json = "1"

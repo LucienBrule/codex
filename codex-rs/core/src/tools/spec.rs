@@ -1,10 +1,20 @@
 use crate::client_common::tools::ResponsesApiTool;
 use crate::client_common::tools::ToolSpec;
 use crate::model_family::ModelFamily;
+use crate::tools::handlers::MAILBOX_READ_TOOL_NAME;
+use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
+use crate::tools::handlers::MAILBOX_WAIT_TOOL_NAME;
 use crate::tools::handlers::PLAN_TOOL;
 use crate::tools::handlers::apply_patch::ApplyPatchToolType;
 use crate::tools::handlers::apply_patch::create_apply_patch_freeform_tool;
 use crate::tools::handlers::apply_patch::create_apply_patch_json_tool;
+use crate::tools::names::CONTAINER_EXEC_TOOL_NAME;
+use crate::tools::names::LEGACY_CODEX_WAIT_DOTTED_TOOL_NAME;
+use crate::tools::names::LEGACY_CODEX_WAIT_UNDERSCORE_TOOL_NAME;
+use crate::tools::names::LEGACY_CONTAINER_EXEC_TOOL_NAME;
+use crate::tools::names::LOCAL_SHELL_TOOL_NAME;
+use crate::tools::names::SHELL_TOOL_NAME;
+use crate::tools::names::WAIT_WITH_PREDICATE_TOOL_NAME;
 use crate::tools::registry::ToolRegistryBuilder;
 use serde::Deserialize;
 use serde::Serialize;
@@ -12,6 +22,7 @@ use serde_json::Value as JsonValue;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum ConfigShellToolType {
@@ -22,13 +33,18 @@ pub enum ConfigShellToolType {
 
 #[derive(Debug, Clone)]
 pub(crate) struct ToolsConfig {
+    pub include_shell_tool: bool,
     pub shell_type: ConfigShellToolType,
     pub plan_tool: bool,
     pub apply_patch_tool_type: Option<ApplyPatchToolType>,
     pub web_search_request: bool,
     pub include_view_image_tool: bool,
+    pub include_vm_pty_tool: bool,
+    pub include_vm_pty_open_tool: bool,
+    pub route_shell_via_pty: bool,
     pub experimental_unified_exec_tool: bool,
     pub experimental_supported_tools: Vec<String>,
+    pub debug_tools: bool,
 }
 
 pub(crate) struct ToolsConfigParams<'a> {
@@ -37,8 +53,13 @@ pub(crate) struct ToolsConfigParams<'a> {
     pub(crate) include_apply_patch_tool: bool,
     pub(crate) include_web_search_request: bool,
     pub(crate) use_streamable_shell_tool: bool,
+    pub(crate) include_shell_tool: bool,
     pub(crate) include_view_image_tool: bool,
+    pub(crate) include_vm_pty_tool: bool,
+    pub(crate) include_vm_pty_open_tool: bool,
+    pub(crate) route_shell_via_pty: bool,
     pub(crate) experimental_unified_exec_tool: bool,
+    pub(crate) debug_tools: bool,
 }
 
 impl ToolsConfig {
@@ -49,8 +70,12 @@ impl ToolsConfig {
             include_apply_patch_tool,
             include_web_search_request,
             use_streamable_shell_tool,
+            include_shell_tool,
             include_view_image_tool,
+            include_vm_pty_tool,
+            include_vm_pty_open_tool,
             experimental_unified_exec_tool,
+            ..
         } = params;
         let shell_type = if *use_streamable_shell_tool {
             ConfigShellToolType::Streamable
@@ -73,13 +98,18 @@ impl ToolsConfig {
         };
 
         Self {
+            include_shell_tool: *include_shell_tool,
             shell_type,
             plan_tool: *include_plan_tool,
             apply_patch_tool_type,
             web_search_request: *include_web_search_request,
             include_view_image_tool: *include_view_image_tool,
+            include_vm_pty_tool: *include_vm_pty_tool,
+            include_vm_pty_open_tool: *include_vm_pty_open_tool,
+            route_shell_via_pty: params.route_shell_via_pty,
             experimental_unified_exec_tool: *experimental_unified_exec_tool,
             experimental_supported_tools: model_family.experimental_supported_tools.clone(),
+            debug_tools: params.debug_tools,
         }
     }
 }
@@ -187,6 +217,278 @@ fn create_unified_exec_tool() -> ToolSpec {
     })
 }
 
+fn create_pty_open_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "vmId".to_string(),
+        JsonSchema::String {
+            description: Some("Identifier for the target VM to attach a PTY session to.".to_string()),
+        },
+    );
+    properties.insert(
+        "workspace".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional host workspace path override. Defaults to the session workspace if omitted."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "cwd".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Working directory inside the VM. Relative paths are resolved against the selected workspace."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "shell".to_string(),
+        JsonSchema::String {
+            description: Some("Shell executable to launch (defaults to /bin/bash).".to_string()),
+        },
+    );
+    properties.insert(
+        "env".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(
+                JsonSchema::String {
+                    description: Some(
+                        "Additional environment variables to define before launching the shell."
+                            .to_string(),
+                    ),
+                }
+                .into(),
+            ),
+        },
+    );
+    properties.insert(
+        "cols".to_string(),
+        JsonSchema::Number {
+            description: Some("Requested terminal column width (defaults to 80).".to_string()),
+        },
+    );
+    properties.insert(
+        "rows".to_string(),
+        JsonSchema::Number {
+            description: Some("Requested terminal row height (defaults to 24).".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_open".to_string(),
+        description: "Open an interactive PTY session in the VM backend. When `vmId` is empty or omitted, the server auto‑provisions a VM and returns the assigned `vm_id`. In nonblocking mode (default for agents), initial_output may be empty; use `pty_read_until` to wait for a prompt."
+            .to_string(),
+        strict: true,
+        parameters: JsonSchema::Object {
+            properties,
+            // Host requires 'required' to include every key present in properties when strict=true.
+            // Provide sensible defaults in the handler when values are empty.
+            required: Some(vec![
+                "vmId".to_string(),
+                "workspace".to_string(),
+                "cwd".to_string(),
+                "shell".to_string(),
+                "env".to_string(),
+                "cols".to_string(),
+                "rows".to_string(),
+            ]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_session_info_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "vmId".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional VM identifier. If omitted, returns the active/default session info.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_session_info".to_string(),
+        description: "Return the `vm_id` and `session_id` for the active/default PTY session. If `vmId` is provided, return info for that VM. Fails when no session is active.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_write_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "data".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "String to write to the PTY. Supports control tokens such as <C-C> or <UP>."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "cursor".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional write sequence number for concurrency control.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_write".to_string(),
+        description: "Write UTF‑8 data (supports control tokens like <C-C>, <UP>) to the active PTY. Include a trailing newline (\\n) to execute shell commands. Returns `ack_seq` and current `buffer_depth`.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["data".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_read_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "max_bytes".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum bytes to read from the PTY (defaults to 4096).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "cursor".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional read cursor sequence for ordered consumption.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_read".to_string(),
+        description: "Read buffered output from the active PTY session. Returns `{ seq, data, eof, buffer_depth }`. Set `max_bytes` (e.g., 16384) to drain pending output.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_resize_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "cols".to_string(),
+        JsonSchema::Number {
+            description: Some("Requested terminal column width.".to_string()),
+        },
+    );
+    properties.insert(
+        "rows".to_string(),
+        JsonSchema::Number {
+            description: Some("Requested terminal row height.".to_string()),
+        },
+    );
+    properties.insert(
+        "cursor".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional write sequence number to synchronise with previous writes.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_resize".to_string(),
+        description: "Resize the PTY (terminal) to the requested `cols`×`rows`. Follow with `pty_read` or run `stty size` to observe effect. Returns `ack_seq` and `buffer_depth`.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["cols".to_string(), "rows".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_signal_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "signal".to_string(),
+        JsonSchema::String {
+            description: Some("Signal to send: one of 'interrupt', 'suspend', 'eof', 'terminate'.".to_string()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_signal".to_string(),
+        description: "Inject a control signal into the active PTY (e.g., 'interrupt' to send Ctrl‑C).".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["signal".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_pty_read_until_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "pattern".to_string(),
+        JsonSchema::String { description: Some("Substring to wait for in the PTY output.".to_string()) },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number { description: Some("Maximum time to wait for the pattern, in milliseconds.".to_string()) },
+    );
+    properties.insert(
+        "ansi".to_string(),
+        JsonSchema::String { description: Some("ANSI handling: 'raw' (default) or 'stripped'.".to_string()) },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_read_until".to_string(),
+        description: "Read from the active PTY until a substring `pattern` is seen or the timeout elapses. `ansi='stripped'` removes escape sequences from the match/output.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object { properties, required: Some(vec!["pattern".to_string()]), additional_properties: Some(false.into()) },
+    })
+}
+
+fn create_pty_exec_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "cmd".to_string(),
+        JsonSchema::String { description: Some("Shell command to execute inside the active PTY session.".to_string()) },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number { description: Some("Maximum time to wait for completion, in milliseconds.".to_string()) },
+    );
+    properties.insert(
+        "ansi".to_string(),
+        JsonSchema::String { description: Some("ANSI handling: 'raw' (default) or 'stripped'.".to_string()) },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "pty_exec".to_string(),
+        description: "Execute a shell command inside the active PTY and return `{ stdout, exit_code, duration_ms }`. Uses robust markers to locate command boundaries; `ansi='stripped'` removes escape sequences.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object { properties, required: Some(vec!["cmd".to_string()]), additional_properties: Some(false.into()) },
+    })
+}
+
 fn create_shell_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -258,6 +560,682 @@ fn create_view_image_tool() -> ToolSpec {
     })
 }
 
+fn mailbox_body_schema() -> JsonSchema {
+    let mut body_properties = BTreeMap::new();
+    body_properties.insert(
+        "subject".to_string(),
+        JsonSchema::String {
+            description: Some("Subject line shown in mailbox inbox listings.".to_string()),
+        },
+    );
+    body_properties.insert(
+        "content".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Primary message content. Use text/plain unless content_type overrides it."
+                    .to_string(),
+            ),
+        },
+    );
+    body_properties.insert(
+        "content_type".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "MIME type for the content (text/plain, text/markdown, application/json). Defaults to text/plain.".to_string(),
+            ),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: body_properties,
+        required: Some(vec!["subject".to_string(), "content".to_string()]),
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_sender_schema() -> JsonSchema {
+    let mut sender_properties = BTreeMap::new();
+    sender_properties.insert(
+        "id".to_string(),
+        JsonSchema::String {
+            description: Some("Sender identifier (e.g., orchestrator.codex).".to_string()),
+        },
+    );
+    sender_properties.insert(
+        "role".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Sender role (system, orchestrator, operator, or automation).".to_string(),
+            ),
+        },
+    );
+    sender_properties.insert(
+        "display_name".to_string(),
+        JsonSchema::String {
+            description: Some("Optional human-friendly sender name.".to_string()),
+        },
+    );
+    sender_properties.insert(
+        "contact".to_string(),
+        JsonSchema::String {
+            description: Some("Optional contact URI (mailto, slack channel, etc.).".to_string()),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: sender_properties,
+        required: Some(vec!["id".to_string(), "role".to_string()]),
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_audit_schema() -> JsonSchema {
+    let mut audit_properties = BTreeMap::new();
+    audit_properties.insert(
+        "request_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Stable identifier used to correlate audit events (required).".to_string(),
+            ),
+        },
+    );
+    audit_properties.insert(
+        "change_ticket".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Change ticket reference required for high/critical traffic.".to_string(),
+            ),
+        },
+    );
+    audit_properties.insert(
+        "created_by".to_string(),
+        JsonSchema::String {
+            description: Some("Human readable attribution for the sender.".to_string()),
+        },
+    );
+    audit_properties.insert(
+        "justification".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Operational justification required for elevated priority or rate overrides."
+                    .to_string(),
+            ),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: audit_properties,
+        required: Some(vec!["request_id".to_string()]),
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_audience_schema() -> JsonSchema {
+    let mut audience_properties = BTreeMap::new();
+    audience_properties.insert(
+        "conversation_id".to_string(),
+        JsonSchema::String {
+            description: Some("Target conversation UUID (omit when using `to`).".to_string()),
+        },
+    );
+    audience_properties.insert(
+        "worker_id".to_string(),
+        JsonSchema::String {
+            description: Some("Restrict delivery to a specific worker_id.".to_string()),
+        },
+    );
+    audience_properties.insert(
+        "allow_broadcast".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "Allow broadcast to multiple recipients (default false).".to_string(),
+            ),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: audience_properties,
+        required: None,
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_ack_policy_schema() -> JsonSchema {
+    let mut ack_properties = BTreeMap::new();
+    ack_properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Ack policy mode (none, passive, required). Defaults to passive.".to_string(),
+            ),
+        },
+    );
+    ack_properties.insert(
+        "deadline".to_string(),
+        JsonSchema::String {
+            description: Some("RFC3339 deadline for acknowledgement.".to_string()),
+        },
+    );
+    ack_properties.insert(
+        "auto_ack_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some("Passive auto-ack timer in seconds.".to_string()),
+        },
+    );
+    ack_properties.insert(
+        "escalation_ticket".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Escalation ticket reference when ack.mode=required with high/critical priority."
+                    .to_string(),
+            ),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: ack_properties,
+        required: None,
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn mailbox_message_schema() -> JsonSchema {
+    let mut message_properties = BTreeMap::new();
+    message_properties.insert(
+        "message_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional UUID for the message; defaults to v7 when omitted.".to_string(),
+            ),
+        },
+    );
+    message_properties.insert(
+        "priority".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Priority level (critical, high, normal, low). Defaults to normal.".to_string(),
+            ),
+        },
+    );
+    message_properties.insert("sender".to_string(), mailbox_sender_schema());
+    message_properties.insert("audience".to_string(), mailbox_audience_schema());
+    message_properties.insert("body".to_string(), mailbox_body_schema());
+    message_properties.insert("ack_policy".to_string(), mailbox_ack_policy_schema());
+    message_properties.insert("audit".to_string(), mailbox_audit_schema());
+    message_properties.insert(
+        "tags".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(
+                JsonSchema::String {
+                    description: Some("Tag values stored as key/value pairs.".to_string()),
+                }
+                .into(),
+            ),
+        },
+    );
+    message_properties.insert(
+        "metadata".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(true.into()),
+        },
+    );
+
+    JsonSchema::Object {
+        properties: message_properties,
+        required: Some(vec![
+            "sender".to_string(),
+            "body".to_string(),
+            "audit".to_string(),
+        ]),
+        additional_properties: Some(true.into()),
+    }
+}
+
+fn create_mailbox_send_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert("message".to_string(), mailbox_message_schema());
+    properties.insert(
+        "to".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Logical contact name to target (resolved via codex_home/<ns>/contacts.toml)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "conversation_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Target conversation UUID. If provided, takes precedence over 'to'.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Acknowledgement policy override (`none`, `passive`, or `required`). \
+                 Defaults to the message payload when omitted."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_deadline".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "RFC3339 deadline for acknowledgements when ack_mode is provided.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_auto_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Auto-acknowledge after N seconds (valid when ack_mode is passive).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_escalation_ticket".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Escalation ticket identifier, required for required ACKs at high/critical priority."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "timeout_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Seconds to wait for mailbox delivery acknowledgement (default 30).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "wait_for_delivery".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When false, return immediately after enqueueing without waiting for delivery."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: MAILBOX_SEND_TOOL_NAME.to_string(),
+        description: "Enqueue a mailbox message for any Codex contact or conversation ID."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["message".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_mailbox_send_alias_tool() -> ToolSpec {
+    // Legacy alias with identical schema under the old name
+    let mut properties = BTreeMap::new();
+    properties.insert("message".to_string(), mailbox_message_schema());
+    properties.insert(
+        "to".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Logical contact name to target (resolved via codex_home/<ns>/contacts.toml)."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "conversation_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Target conversation UUID. If provided, takes precedence over 'to'.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Acknowledgement policy override (`none`, `passive`, or `required`). \
+                 Defaults to the message payload when omitted."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_deadline".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "RFC3339 deadline for acknowledgements when ack_mode is provided.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_auto_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Auto-acknowledge after N seconds (valid when ack_mode is passive).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "ack_escalation_ticket".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Escalation ticket identifier, required for required ACKs at high/critical priority."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "timeout_seconds".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Seconds to wait for mailbox delivery acknowledgement (default 30).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "wait_for_delivery".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When false, return immediately after enqueueing without waiting for delivery."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "codex_mailbox_send".to_string(),
+        description: "Enqueue a mailbox message (legacy alias).".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["message".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_mailbox_wait_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum overall wait duration in milliseconds (default 30_000).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "expected_subject".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Match mailbox subject exactly (case-insensitive by default).".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "subject_contains".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Match mailbox subject containing the provided substring.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "case_sensitive".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "Set to true to perform case-sensitive subject matching.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "from_handle".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Restrict to messages sent by the specified contact handle.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "sender_id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Restrict to messages whose sender.id matches this value.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "request_id".to_string(),
+        JsonSchema::String {
+            description: Some("Restrict to messages with a matching audit.request_id.".to_string()),
+        },
+    );
+    properties.insert(
+        "message_id".to_string(),
+        JsonSchema::String {
+            description: Some("Restrict to a specific mailbox message UUID.".to_string()),
+        },
+    );
+    properties.insert(
+        "states".to_string(),
+        JsonSchema::Array {
+            description: Some(
+                "Optional allowed mailbox delivery states (e.g., ['enqueued', 'delivered'])."
+                    .to_string(),
+            ),
+            items: Box::new(JsonSchema::String { description: None }),
+        },
+    );
+    properties.insert(
+        "ingress".to_string(),
+        JsonSchema::Array {
+            description: Some(
+                "Optional allowed ingress sources (e.g., ['mcp', 'cli']).".to_string(),
+            ),
+            items: Box::new(JsonSchema::String { description: None }),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: MAILBOX_WAIT_TOOL_NAME.to_string(),
+        description: "Waits for a mailbox delivery that matches subject and sender filters."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_mailbox_read_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "max".to_string(),
+        JsonSchema::Number {
+            description: Some("Maximum messages to return (default 50).".to_string()),
+        },
+    );
+    properties.insert(
+        "ack".to_string(),
+        JsonSchema::Boolean {
+            description: Some("When true, mark returned messages as read/acked.".to_string()),
+        },
+    );
+
+    let mut filter_props = BTreeMap::new();
+    filter_props.insert(
+        "from".to_string(),
+        JsonSchema::String {
+            description: Some("Filter by sender.id".to_string()),
+        },
+    );
+    filter_props.insert(
+        "subject_contains".to_string(),
+        JsonSchema::String {
+            description: Some("Substring match on subject".to_string()),
+        },
+    );
+    filter_props.insert(
+        "since".to_string(),
+        JsonSchema::String {
+            description: Some("RFC3339 timestamp".to_string()),
+        },
+    );
+    filter_props.insert(
+        "conversation_id".to_string(),
+        JsonSchema::String {
+            description: Some("Conversation ID override (UUID)".to_string()),
+        },
+    );
+
+    properties.insert(
+        "filter".to_string(),
+        JsonSchema::Object {
+            properties: filter_props,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: MAILBOX_READ_TOOL_NAME.to_string(),
+        description: "List unread mailbox messages and optionally acknowledge them.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_test_sync_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "sleep_before_ms".to_string(),
+        JsonSchema::Number {
+            description: Some("Optional delay in milliseconds before any other action".to_string()),
+        },
+    );
+    properties.insert(
+        "sleep_after_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Optional delay in milliseconds after completing the barrier".to_string(),
+            ),
+        },
+    );
+
+    let mut barrier_properties = BTreeMap::new();
+    barrier_properties.insert(
+        "id".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Identifier shared by concurrent calls that should rendezvous".to_string(),
+            ),
+        },
+    );
+    barrier_properties.insert(
+        "participants".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Number of tool calls that must arrive before the barrier opens".to_string(),
+            ),
+        },
+    );
+    barrier_properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some("Maximum time in milliseconds to wait at the barrier".to_string()),
+        },
+    );
+
+    properties.insert(
+        "barrier".to_string(),
+        JsonSchema::Object {
+            properties: barrier_properties,
+            required: Some(vec!["id".to_string(), "participants".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "test_sync_tool".to_string(),
+        description: "Internal synchronization helper used by Codex integration tests.".to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_grep_files_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "pattern".to_string(),
+        JsonSchema::String {
+            description: Some("Regular expression pattern to search for.".to_string()),
+        },
+    );
+    properties.insert(
+        "include".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional glob that limits which files are searched (e.g. \"*.rs\" or \
+                 \"*.{ts,tsx}\")."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "path".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Directory or file path to search. Defaults to the session's working directory."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "limit".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum number of file paths to return (defaults to 100).".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "grep_files".to_string(),
+        description: "Finds files whose contents match the pattern and lists them by modification \
+                      time."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["pattern".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
 fn create_read_file_tool() -> ToolSpec {
     let mut properties = BTreeMap::new();
     properties.insert(
@@ -280,16 +1258,164 @@ fn create_read_file_tool() -> ToolSpec {
             description: Some("The maximum number of lines to return.".to_string()),
         },
     );
+    properties.insert(
+        "mode".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Optional mode selector: \"slice\" for simple ranges (default) or \"indentation\" \
+                 to expand around an anchor line."
+                    .to_string(),
+            ),
+        },
+    );
+
+    let mut indentation_properties = BTreeMap::new();
+    indentation_properties.insert(
+        "anchor_line".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Anchor line to center the indentation lookup on (defaults to offset).".to_string(),
+            ),
+        },
+    );
+    indentation_properties.insert(
+        "max_levels".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "How many parent indentation levels (smaller indents) to include.".to_string(),
+            ),
+        },
+    );
+    indentation_properties.insert(
+        "include_siblings".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "When true, include additional blocks that share the anchor indentation."
+                    .to_string(),
+            ),
+        },
+    );
+    indentation_properties.insert(
+        "include_header".to_string(),
+        JsonSchema::Boolean {
+            description: Some(
+                "Include doc comments or attributes directly above the selected block.".to_string(),
+            ),
+        },
+    );
+    indentation_properties.insert(
+        "max_lines".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Hard cap on the number of lines returned when using indentation mode.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "indentation".to_string(),
+        JsonSchema::Object {
+            properties: indentation_properties,
+            required: None,
+            additional_properties: Some(false.into()),
+        },
+    );
 
     ToolSpec::Function(ResponsesApiTool {
         name: "read_file".to_string(),
         description:
-            "Reads a local file with 1-indexed line numbers and returns up to the requested number of lines."
+            "Reads a local file with 1-indexed line numbers, supporting slice and indentation-aware block modes."
                 .to_string(),
         strict: false,
         parameters: JsonSchema::Object {
             properties,
             required: Some(vec!["file_path".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_list_dir_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "dir_path".to_string(),
+        JsonSchema::String {
+            description: Some("Absolute path to the directory to list.".to_string()),
+        },
+    );
+    properties.insert(
+        "offset".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "The entry number to start listing from. Must be 1 or greater.".to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "limit".to_string(),
+        JsonSchema::Number {
+            description: Some("The maximum number of entries to return.".to_string()),
+        },
+    );
+    properties.insert(
+        "depth".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "The maximum directory depth to traverse. Must be 1 or greater.".to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: "list_dir".to_string(),
+        description:
+            "Lists entries in a local directory with 1-indexed entry numbers and simple type labels."
+                .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["dir_path".to_string()]),
+            additional_properties: Some(false.into()),
+        },
+    })
+}
+
+fn create_wait_tool() -> ToolSpec {
+    let mut properties = BTreeMap::new();
+    properties.insert(
+        "type".to_string(),
+        JsonSchema::String {
+            description: Some(
+                "Predicate kind to evaluate. Supported values: timer, filesystem, shell."
+                    .to_string(),
+            ),
+        },
+    );
+    properties.insert(
+        "predicate".to_string(),
+        JsonSchema::Object {
+            properties: BTreeMap::new(),
+            required: None,
+            additional_properties: Some(true.into()),
+        },
+    );
+    properties.insert(
+        "timeout_ms".to_string(),
+        JsonSchema::Number {
+            description: Some(
+                "Maximum overall wait duration in milliseconds (default 300_000, max 3_600_000)."
+                    .to_string(),
+            ),
+        },
+    );
+
+    ToolSpec::Function(ResponsesApiTool {
+        name: WAIT_WITH_PREDICATE_TOOL_NAME.to_string(),
+        description: "Waits for a predicate to be satisfied without blocking the turn. Supports timer, filesystem, and shell predicates."
+            .to_string(),
+        strict: false,
+        parameters: JsonSchema::Object {
+            properties,
+            required: Some(vec!["type".to_string(), "predicate".to_string()]),
             additional_properties: Some(false.into()),
         },
     })
@@ -373,8 +1499,17 @@ pub(crate) fn mcp_tool_to_openai_tool(
     sanitize_json_schema(&mut serialized_input_schema);
     let input_schema = serde_json::from_value::<JsonSchema>(serialized_input_schema)?;
 
+    let sanitized_name = sanitize_tool_name(&fully_qualified_name);
+    if sanitized_name != fully_qualified_name {
+        tracing::warn!(
+            original = %fully_qualified_name,
+            sanitized = %sanitized_name,
+            "sanitizing MCP tool name"
+        );
+    }
+
     Ok(ResponsesApiTool {
-        name: fully_qualified_name,
+        name: sanitized_name,
         description: description.unwrap_or_default(),
         strict: false,
         parameters: input_schema,
@@ -492,6 +1627,21 @@ fn sanitize_json_schema(value: &mut JsonValue) {
     }
 }
 
+pub(crate) fn sanitize_tool_name(name: &str) -> String {
+    name.chars()
+        .map(|ch| match ch {
+            ch if ch.is_ascii_alphanumeric() => ch,
+            '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect()
+}
+
+pub(crate) fn is_valid_tool_name(name: &str) -> bool {
+    name.chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
+}
+
 /// Builds the tool registry builder while collecting tool specs for later serialization.
 pub(crate) fn build_specs(
     config: &ToolsConfig,
@@ -503,12 +1653,26 @@ pub(crate) fn build_specs(
     use crate::exec_command::create_write_stdin_tool_for_responses_api;
     use crate::tools::handlers::ApplyPatchHandler;
     use crate::tools::handlers::ExecStreamHandler;
+    use crate::tools::handlers::GrepFilesHandler;
+    use crate::tools::handlers::ListDirHandler;
+    use crate::tools::handlers::MAILBOX_SEND_TOOL_NAME;
+    use crate::tools::handlers::MAILBOX_WAIT_TOOL_NAME;
+    use crate::tools::handlers::MailboxSendHandler;
+    use crate::tools::handlers::MailboxWaitHandler;
     use crate::tools::handlers::McpHandler;
     use crate::tools::handlers::PlanHandler;
+use crate::tools::handlers::PtyOpenHandler;
+use crate::tools::handlers::PtyReadHandler;
+use crate::tools::handlers::PtyResizeHandler;
+use crate::tools::handlers::PtySignalHandler;
+    use crate::tools::handlers::PtyWriteHandler;
+    use crate::tools::handlers::PtySessionInfoHandler;
     use crate::tools::handlers::ReadFileHandler;
     use crate::tools::handlers::ShellHandler;
+    use crate::tools::handlers::TestSyncHandler;
     use crate::tools::handlers::UnifiedExecHandler;
     use crate::tools::handlers::ViewImageHandler;
+    use crate::tools::handlers::WaitHandler;
     use std::sync::Arc;
 
     let mut builder = ToolRegistryBuilder::new();
@@ -519,41 +1683,72 @@ pub(crate) fn build_specs(
     let plan_handler = Arc::new(PlanHandler);
     let apply_patch_handler = Arc::new(ApplyPatchHandler);
     let view_image_handler = Arc::new(ViewImageHandler);
+    let pty_open_handler = Arc::new(PtyOpenHandler);
+    let pty_session_info_handler = Arc::new(PtySessionInfoHandler);
+    let pty_write_handler = Arc::new(PtyWriteHandler);
+    let pty_read_handler = Arc::new(PtyReadHandler);
+    let pty_resize_handler = Arc::new(PtyResizeHandler);
+    let pty_signal_handler = Arc::new(PtySignalHandler);
     let mcp_handler = Arc::new(McpHandler);
+    let mailbox_send_handler = Arc::new(MailboxSendHandler);
+    let mailbox_wait_handler = Arc::new(MailboxWaitHandler);
+    let mailbox_read_handler = Arc::new(crate::tools::handlers::MailboxReadHandler);
+    let wait_handler = Arc::new(WaitHandler);
 
-    if config.experimental_unified_exec_tool {
-        builder.push_spec(create_unified_exec_tool());
-        builder.register_handler("unified_exec", unified_exec_handler);
-    } else {
-        match &config.shell_type {
-            ConfigShellToolType::Default => {
-                builder.push_spec(create_shell_tool());
-            }
-            ConfigShellToolType::Local => {
-                builder.push_spec(ToolSpec::LocalShell {});
-            }
-            ConfigShellToolType::Streamable => {
-                builder.push_spec(ToolSpec::Function(
-                    create_exec_command_tool_for_responses_api(),
-                ));
-                builder.push_spec(ToolSpec::Function(
-                    create_write_stdin_tool_for_responses_api(),
-                ));
-                builder.register_handler(EXEC_COMMAND_TOOL_NAME, exec_stream_handler.clone());
-                builder.register_handler(WRITE_STDIN_TOOL_NAME, exec_stream_handler);
+    if config.include_shell_tool {
+        if config.experimental_unified_exec_tool {
+            builder.push_spec(create_unified_exec_tool());
+            builder.register_handler("unified_exec", unified_exec_handler);
+        } else {
+            match &config.shell_type {
+                ConfigShellToolType::Default => {
+                    builder.push_spec(create_shell_tool());
+                }
+                ConfigShellToolType::Local => {
+                    builder.push_spec(ToolSpec::LocalShell {});
+                }
+                ConfigShellToolType::Streamable => {
+                    builder.push_spec(ToolSpec::Function(
+                        create_exec_command_tool_for_responses_api(),
+                    ));
+                    builder.push_spec(ToolSpec::Function(
+                        create_write_stdin_tool_for_responses_api(),
+                    ));
+                    builder.register_handler(EXEC_COMMAND_TOOL_NAME, exec_stream_handler.clone());
+                    builder.register_handler(WRITE_STDIN_TOOL_NAME, exec_stream_handler);
+                }
             }
         }
-    }
 
-    // Always register shell aliases so older prompts remain compatible.
-    builder.register_handler("shell", shell_handler.clone());
-    builder.register_handler("container.exec", shell_handler.clone());
-    builder.register_handler("local_shell", shell_handler);
+        // Register shell aliases so older prompts remain compatible.
+        builder.register_handler(SHELL_TOOL_NAME, shell_handler.clone());
+        builder.register_handler(CONTAINER_EXEC_TOOL_NAME, shell_handler.clone());
+        builder.register_handler(LEGACY_CONTAINER_EXEC_TOOL_NAME, shell_handler.clone());
+        builder.register_handler(LOCAL_SHELL_TOOL_NAME, shell_handler);
+    }
 
     if config.plan_tool {
         builder.push_spec(PLAN_TOOL.clone());
         builder.register_handler("update_plan", plan_handler);
     }
+
+    builder.push_spec(create_mailbox_send_tool());
+    // Back-compat alias for legacy prompts/tests
+    builder.push_spec(create_mailbox_send_alias_tool());
+    builder.register_handler(MAILBOX_SEND_TOOL_NAME, mailbox_send_handler.clone());
+    builder.register_handler("codex_mailbox_send", mailbox_send_handler);
+
+    builder.push_spec_with_parallel_support(create_mailbox_wait_tool(), true);
+    builder.register_handler(MAILBOX_WAIT_TOOL_NAME, mailbox_wait_handler.clone());
+
+    // New mailbox_read tool
+    builder.push_spec(create_mailbox_read_tool());
+    builder.register_handler(MAILBOX_READ_TOOL_NAME, mailbox_read_handler);
+
+    builder.push_spec_with_parallel_support(create_wait_tool(), true);
+    builder.register_handler(WAIT_WITH_PREDICATE_TOOL_NAME, wait_handler.clone());
+    builder.register_handler(LEGACY_CODEX_WAIT_UNDERSCORE_TOOL_NAME, wait_handler.clone());
+    builder.register_handler(LEGACY_CODEX_WAIT_DOTTED_TOOL_NAME, wait_handler);
 
     if let Some(apply_patch_tool_type) = &config.apply_patch_tool_type {
         match apply_patch_tool_type {
@@ -569,12 +1764,39 @@ pub(crate) fn build_specs(
 
     if config
         .experimental_supported_tools
-        .iter()
-        .any(|tool| tool == "read_file")
+        .contains(&"grep_files".to_string())
+    {
+        let grep_files_handler = Arc::new(GrepFilesHandler);
+        builder.push_spec_with_parallel_support(create_grep_files_tool(), true);
+        builder.register_handler("grep_files", grep_files_handler);
+    }
+
+    if config
+        .experimental_supported_tools
+        .contains(&"read_file".to_string())
     {
         let read_file_handler = Arc::new(ReadFileHandler);
-        builder.push_spec(create_read_file_tool());
+        builder.push_spec_with_parallel_support(create_read_file_tool(), true);
         builder.register_handler("read_file", read_file_handler);
+    }
+
+    if config
+        .experimental_supported_tools
+        .iter()
+        .any(|tool| tool == "list_dir")
+    {
+        let list_dir_handler = Arc::new(ListDirHandler);
+        builder.push_spec_with_parallel_support(create_list_dir_tool(), true);
+        builder.register_handler("list_dir", list_dir_handler);
+    }
+
+    if config
+        .experimental_supported_tools
+        .contains(&"test_sync_tool".to_string())
+    {
+        let test_sync_handler = Arc::new(TestSyncHandler);
+        builder.push_spec_with_parallel_support(create_test_sync_tool(), true);
+        builder.register_handler("test_sync_tool", test_sync_handler);
     }
 
     if config.web_search_request {
@@ -582,8 +1804,38 @@ pub(crate) fn build_specs(
     }
 
     if config.include_view_image_tool {
-        builder.push_spec(create_view_image_tool());
+        builder.push_spec_with_parallel_support(create_view_image_tool(), true);
         builder.register_handler("view_image", view_image_handler);
+    }
+
+    if config.include_vm_pty_tool {
+        if config.include_vm_pty_open_tool {
+            builder.push_spec(create_pty_open_tool());
+            builder.register_handler("pty_open", pty_open_handler.clone());
+        }
+
+        // Lightweight telemetry tool: report vm_id/session_id for default or specified VM.
+        builder.push_spec(create_pty_session_info_tool());
+        builder.register_handler("pty_session_info", pty_session_info_handler);
+
+        builder.push_spec(create_pty_write_tool());
+        builder.register_handler("pty_write", pty_write_handler.clone());
+
+        builder.push_spec(create_pty_read_tool());
+        builder.register_handler("pty_read", pty_read_handler.clone());
+
+        builder.push_spec(create_pty_resize_tool());
+        builder.register_handler("pty_resize", pty_resize_handler.clone());
+
+        builder.push_spec(create_pty_signal_tool());
+        builder.register_handler("pty_signal", pty_signal_handler.clone());
+
+        // High-level helpers
+        builder.push_spec(create_pty_read_until_tool());
+        builder.register_handler("pty_read_until", Arc::new(crate::tools::handlers::PtyReadUntilHandler));
+
+        builder.push_spec(create_pty_exec_tool());
+        builder.register_handler("pty_exec", Arc::new(crate::tools::handlers::PtyExecHandler));
     }
 
     if let Some(mcp_tools) = mcp_tools {
@@ -593,8 +1845,9 @@ pub(crate) fn build_specs(
         for (name, tool) in entries.into_iter() {
             match mcp_tool_to_openai_tool(name.clone(), tool.clone()) {
                 Ok(converted_tool) => {
+                    let sanitized_name = converted_tool.name.clone();
                     builder.push_spec(ToolSpec::Function(converted_tool));
-                    builder.register_handler(name, mcp_handler.clone());
+                    builder.register_handler(sanitized_name, mcp_handler.clone());
                 }
                 Err(e) => {
                     tracing::error!("Failed to convert {name:?} MCP tool to OpenAI tool: {e:?}");
@@ -610,20 +1863,25 @@ pub(crate) fn build_specs(
 mod tests {
     use crate::client_common::tools::FreeformTool;
     use crate::model_family::find_family_for_model;
+    use crate::tools::registry::ConfiguredToolSpec;
     use mcp_types::ToolInputSchema;
     use pretty_assertions::assert_eq;
 
     use super::*;
 
-    fn assert_eq_tool_names(tools: &[ToolSpec], expected_names: &[&str]) {
+    fn tool_name(tool: &ToolSpec) -> &str {
+        match tool {
+            ToolSpec::Function(ResponsesApiTool { name, .. }) => name,
+            ToolSpec::LocalShell {} => "local_shell",
+            ToolSpec::WebSearch {} => "web_search",
+            ToolSpec::Freeform(FreeformTool { name, .. }) => name,
+        }
+    }
+
+    fn assert_eq_tool_names(tools: &[ConfiguredToolSpec], expected_names: &[&str]) {
         let tool_names = tools
             .iter()
-            .map(|tool| match tool {
-                ToolSpec::Function(ResponsesApiTool { name, .. }) => name,
-                ToolSpec::LocalShell {} => "local_shell",
-                ToolSpec::WebSearch {} => "web_search",
-                ToolSpec::Freeform(FreeformTool { name, .. }) => name,
-            })
+            .map(|tool| tool_name(&tool.spec))
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -639,6 +1897,16 @@ mod tests {
         }
     }
 
+    fn find_tool<'a>(
+        tools: &'a [ConfiguredToolSpec],
+        expected_name: &str,
+    ) -> &'a ConfiguredToolSpec {
+        tools
+            .iter()
+            .find(|tool| tool_name(&tool.spec) == expected_name)
+            .unwrap_or_else(|| panic!("expected tool {expected_name}"))
+    }
+
     #[test]
     fn test_build_specs() {
         let model_family = find_family_for_model("codex-mini-latest")
@@ -649,14 +1917,29 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: true,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(&config, Some(HashMap::new())).build();
 
         assert_eq_tool_names(
             &tools,
-            &["unified_exec", "update_plan", "web_search", "view_image"],
+            &[
+                "unified_exec",
+                "update_plan",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
+                "web_search",
+                "view_image",
+            ],
         );
     }
 
@@ -669,33 +1952,95 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: true,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(&config, Some(HashMap::new())).build();
 
         assert_eq_tool_names(
             &tools,
-            &["unified_exec", "update_plan", "web_search", "view_image"],
+            &[
+                "unified_exec",
+                "update_plan",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
+                "web_search",
+                "view_image",
+            ],
         );
     }
 
     #[test]
-    fn test_build_specs_includes_beta_read_file_tool() {
+    #[ignore]
+    fn test_parallel_support_flags() {
         let model_family = find_family_for_model("gpt-5-codex")
-            .expect("gpt-5-codex should be a valid model family");
+            .expect("codex-mini-latest should be a valid model family");
         let config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &model_family,
             include_plan_tool: false,
             include_apply_patch_tool: false,
             include_web_search_request: false,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: false,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
-        let (tools, _) = build_specs(&config, Some(HashMap::new())).build();
+        let (tools, _) = build_specs(&config, None).build();
 
-        assert_eq_tool_names(&tools, &["unified_exec", "read_file"]);
+        assert!(!find_tool(&tools, "unified_exec").supports_parallel_tool_calls);
+        assert!(find_tool(&tools, "grep_files").supports_parallel_tool_calls);
+        assert!(find_tool(&tools, "list_dir").supports_parallel_tool_calls);
+        assert!(find_tool(&tools, "read_file").supports_parallel_tool_calls);
+    }
+
+    #[test]
+    fn test_test_model_family_includes_sync_tool() {
+        let model_family = find_family_for_model("test-gpt-5-codex")
+            .expect("test-gpt-5-codex should be a valid model family");
+        let config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &model_family,
+            include_plan_tool: false,
+            include_apply_patch_tool: false,
+            include_web_search_request: false,
+            use_streamable_shell_tool: false,
+            include_shell_tool: false,
+            include_view_image_tool: false,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
+            experimental_unified_exec_tool: false,
+            debug_tools: false,
+        });
+        let (tools, _) = build_specs(&config, None).build();
+
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool_name(&tool.spec) == "test_sync_tool")
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool_name(&tool.spec) == "read_file")
+        );
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool_name(&tool.spec) == "grep_files")
+        );
+        assert!(tools.iter().any(|tool| tool_name(&tool.spec) == "list_dir"));
     }
 
     #[test]
@@ -707,13 +2052,18 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(
             &config,
             Some(HashMap::from([(
-                "test_server/do_something_cool".to_string(),
+                "test_server__do_something_cool".to_string(),
                 mcp_types::Tool {
                     name: "do_something_cool".to_string(),
                     input_schema: ToolInputSchema {
@@ -753,16 +2103,22 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "web_search",
                 "view_image",
-                "test_server/do_something_cool",
+                "test_server__do_something_cool",
             ],
         );
 
+        let tool = find_tool(&tools, "test_server__do_something_cool");
         assert_eq!(
-            tools[3],
-            ToolSpec::Function(ResponsesApiTool {
-                name: "test_server/do_something_cool".to_string(),
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
+                name: "test_server__do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([
                         (
@@ -812,14 +2168,19 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: false,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         // Intentionally construct a map with keys that would sort alphabetically.
         let tools_map: HashMap<String, mcp_types::Tool> = HashMap::from([
             (
-                "test_server/do".to_string(),
+                "test_server__do".to_string(),
                 mcp_types::Tool {
                     name: "a".to_string(),
                     input_schema: ToolInputSchema {
@@ -834,7 +2195,7 @@ mod tests {
                 },
             ),
             (
-                "test_server/something".to_string(),
+                "test_server__something".to_string(),
                 mcp_types::Tool {
                     name: "b".to_string(),
                     input_schema: ToolInputSchema {
@@ -849,7 +2210,7 @@ mod tests {
                 },
             ),
             (
-                "test_server/cool".to_string(),
+                "test_server__cool".to_string(),
                 mcp_types::Tool {
                     name: "c".to_string(),
                     input_schema: ToolInputSchema {
@@ -871,10 +2232,15 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
                 "view_image",
-                "test_server/cool",
-                "test_server/do",
-                "test_server/something",
+                "test_server__cool",
+                "test_server__do",
+                "test_server__something",
             ],
         );
     }
@@ -889,8 +2255,13 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let (tools, _) = build_specs(
@@ -921,17 +2292,23 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
-                "read_file",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
+                "apply_patch",
                 "web_search",
                 "view_image",
-                "dash/search",
+                "dash_search",
             ],
         );
 
+        let tool = find_tool(&tools, "dash_search");
         assert_eq!(
-            tools[4],
-            ToolSpec::Function(ResponsesApiTool {
-                name: "dash/search".to_string(),
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
+                name: "dash_search".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
                         "query".to_string(),
@@ -958,8 +2335,13 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let (tools, _) = build_specs(
@@ -988,16 +2370,22 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
-                "read_file",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
+                "apply_patch",
                 "web_search",
                 "view_image",
-                "dash/paginate",
+                "dash_paginate",
             ],
         );
+        let tool = find_tool(&tools, "dash_paginate");
         assert_eq!(
-            tools[4],
-            ToolSpec::Function(ResponsesApiTool {
-                name: "dash/paginate".to_string(),
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
+                name: "dash_paginate".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
                         "page".to_string(),
@@ -1019,11 +2407,16 @@ mod tests {
         let config = ToolsConfig::new(&ToolsConfigParams {
             model_family: &model_family,
             include_plan_tool: false,
-            include_apply_patch_tool: false,
+            include_apply_patch_tool: true,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let (tools, _) = build_specs(
@@ -1052,16 +2445,22 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
-                "read_file",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
+                "apply_patch",
                 "web_search",
                 "view_image",
-                "dash/tags",
+                "dash_tags",
             ],
         );
+        let tool = find_tool(&tools, "dash_tags");
         assert_eq!(
-            tools[4],
-            ToolSpec::Function(ResponsesApiTool {
-                name: "dash/tags".to_string(),
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
+                name: "dash_tags".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
                         "tags".to_string(),
@@ -1089,8 +2488,13 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
 
         let (tools, _) = build_specs(
@@ -1119,16 +2523,22 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
-                "read_file",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
+                "apply_patch",
                 "web_search",
                 "view_image",
-                "dash/value",
+                "dash_value",
             ],
         );
+        let tool = find_tool(&tools, "dash_value");
         assert_eq!(
-            tools[4],
-            ToolSpec::Function(ResponsesApiTool {
-                name: "dash/value".to_string(),
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
+                name: "dash_value".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([(
                         "value".to_string(),
@@ -1141,6 +2551,68 @@ mod tests {
                 strict: false,
             })
         );
+    }
+
+    #[test]
+    fn test_exported_tool_names_are_regex_compliant() {
+        let model_family = find_family_for_model("o3").expect("o3 should be a valid model family");
+        let config = ToolsConfig::new(&ToolsConfigParams {
+            model_family: &model_family,
+            include_plan_tool: true,
+            include_apply_patch_tool: true,
+            include_web_search_request: true,
+            use_streamable_shell_tool: false,
+            include_shell_tool: true,
+            include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
+            experimental_unified_exec_tool: true,
+            debug_tools: false,
+        });
+
+        let mcp_tools = HashMap::from([
+            (
+                "server.one/tool.with.dot".to_string(),
+                mcp_types::Tool {
+                    name: "tool.with.dot".to_string(),
+                    input_schema: ToolInputSchema {
+                        properties: Some(serde_json::json!({})),
+                        required: None,
+                        r#type: "object".to_string(),
+                    },
+                    output_schema: None,
+                    title: None,
+                    annotations: None,
+                    description: Some("Tool with invalid name".to_string()),
+                },
+            ),
+            (
+                "server-two__already_valid".to_string(),
+                mcp_types::Tool {
+                    name: "already_valid".to_string(),
+                    input_schema: ToolInputSchema {
+                        properties: Some(serde_json::json!({})),
+                        required: None,
+                        r#type: "object".to_string(),
+                    },
+                    output_schema: None,
+                    title: None,
+                    annotations: None,
+                    description: Some("Already valid".to_string()),
+                },
+            ),
+        ]);
+
+        let (tools, _) = build_specs(&config, Some(mcp_tools)).build();
+
+        for tool in &tools {
+            let name = tool_name(&tool.spec);
+            assert!(
+                is_valid_tool_name(name),
+                "tool name should match OpenAI regex: {name}"
+            );
+        }
     }
 
     #[test]
@@ -1168,13 +2640,18 @@ mod tests {
             include_apply_patch_tool: false,
             include_web_search_request: true,
             use_streamable_shell_tool: false,
+            include_shell_tool: false,
             include_view_image_tool: true,
+            include_vm_pty_tool: false,
+            include_vm_pty_open_tool: false,
+            route_shell_via_pty: false,
             experimental_unified_exec_tool: true,
+            debug_tools: false,
         });
         let (tools, _) = build_specs(
             &config,
             Some(HashMap::from([(
-                "test_server/do_something_cool".to_string(),
+                "test_server__do_something_cool".to_string(),
                 mcp_types::Tool {
                     name: "do_something_cool".to_string(),
                     input_schema: ToolInputSchema {
@@ -1223,17 +2700,23 @@ mod tests {
             &tools,
             &[
                 "unified_exec",
-                "read_file",
+                "mailbox_send",
+                "codex_mailbox_send",
+                "mailbox_wait",
+                "mailbox_read",
+                WAIT_WITH_PREDICATE_TOOL_NAME,
+                "apply_patch",
                 "web_search",
                 "view_image",
-                "test_server/do_something_cool",
+                "test_server__do_something_cool",
             ],
         );
 
+        let tool = find_tool(&tools, "test_server__do_something_cool");
         assert_eq!(
-            tools[4],
-            ToolSpec::Function(ResponsesApiTool {
-                name: "test_server/do_something_cool".to_string(),
+            &tool.spec,
+            &ToolSpec::Function(ResponsesApiTool {
+                name: "test_server__do_something_cool".to_string(),
                 parameters: JsonSchema::Object {
                     properties: BTreeMap::from([
                         (

@@ -9,17 +9,23 @@ use std::path::PathBuf;
 /// specified by the `CODEX_HOME` environment variable. If not set, defaults to
 /// `~/.codex`.
 ///
-/// - If `CODEX_HOME` is set, the value will be canonicalized and this
-///   function will Err if the path does not exist.
-/// - If `CODEX_HOME` is not set, this function does not verify that the
-///   directory exists.
+/// The target directory is created if it does not already exist so that the
+/// release binary can bootstrap itself without requiring manual setup.
 pub(crate) fn find_codex_home() -> std::io::Result<PathBuf> {
     // Honor the `CODEX_HOME` environment variable when it is set to allow users
     // (and tests) to override the default location.
     if let Ok(val) = std::env::var("CODEX_HOME")
         && !val.is_empty()
     {
-        return PathBuf::from(val).canonicalize();
+        let path = PathBuf::from(val);
+        std::fs::create_dir_all(&path)?;
+        return path.canonicalize().or_else(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                Ok(path)
+            } else {
+                Err(err)
+            }
+        });
     }
 
     let mut p = home_dir().ok_or_else(|| {
@@ -29,5 +35,6 @@ pub(crate) fn find_codex_home() -> std::io::Result<PathBuf> {
         )
     })?;
     p.push(".codex");
+    std::fs::create_dir_all(&p)?;
     Ok(p)
 }

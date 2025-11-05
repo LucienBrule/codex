@@ -240,6 +240,9 @@ impl RolloutRecorder {
                     RolloutItem::EventMsg(_ev) => {
                         items.push(RolloutItem::EventMsg(_ev));
                     }
+                    RolloutItem::SummarySnapshot(item) => {
+                        items.push(RolloutItem::SummarySnapshot(item));
+                    }
                 },
                 Err(e) => {
                     warn!("failed to parse rollout line: {v:?}, error: {e}");

@@ -9,6 +9,7 @@ mod event_processor;
 mod event_processor_with_human_output;
 pub mod event_processor_with_jsonl_output;
 pub mod exec_events;
+mod mailbox;
 
 pub use cli::Cli;
 use codex_core::AuthManager;
@@ -29,6 +30,8 @@ use codex_ollama::DEFAULT_OSS_MODEL;
 use codex_protocol::config_types::SandboxMode;
 use event_processor_with_human_output::EventProcessorWithHumanOutput;
 use event_processor_with_jsonl_output::EventProcessorWithJsonOutput;
+pub use mailbox::MailboxServer;
+use toml::Value as TomlValue;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use serde_json::Value;
 use std::io::IsTerminal;
@@ -48,7 +51,7 @@ use codex_core::default_client::set_default_originator;
 use codex_core::find_conversation_path_by_id_str;
 
 pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> anyhow::Result<()> {
-    if let Err(err) = set_default_originator("codex_exec") {
+    if let Err(err) = set_default_originator("codex_exec".to_string()) {
         tracing::warn!(?err, "Failed to set codex exec originator override {err:?}");
     }
 
@@ -70,6 +73,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         output_schema: output_schema_path,
         include_plan_tool,
         config_overrides,
+        vm_pty_socket,
+        vm_pty_vm_id,
+        vm_pty_auto,
     } = cli;
 
     // Determine the prompt source (parent or subcommand) and read from stdin if needed.
@@ -163,6 +169,44 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         None // No specific model provider override.
     };
 
+    // Parse `-c` overrides.
+    let mut cli_kv_overrides = match config_overrides.parse_overrides() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error parsing -c overrides: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Inject vm-pty CLI flags as high-precedence overrides so they are applied after profile selection.
+    if let Some(socket) = vm_pty_socket.as_ref() {
+        cli_kv_overrides.push((
+            "tools.vm_pty.socket".to_string(),
+            TomlValue::String(socket.display().to_string()),
+        ));
+    }
+    if let Some(vm_id) = vm_pty_vm_id.as_ref() {
+        cli_kv_overrides.push((
+            "vm_pty.default_vm_id".to_string(),
+            TomlValue::String(vm_id.clone()),
+        ));
+    }
+    if vm_pty_auto {
+        cli_kv_overrides.push((
+            "tools.vm_pty.enabled".to_string(),
+            TomlValue::Boolean(true),
+        ));
+        // If a profile was explicitly provided, allow that; otherwise allow all ("*").
+        let allow_profiles: Vec<TomlValue> = match config_profile.as_ref() {
+            Some(p) => vec![TomlValue::String(p.clone())],
+            None => vec![TomlValue::String("*".to_string())],
+        };
+        cli_kv_overrides.push((
+            "tools.vm_pty.allow_profiles".to_string(),
+            TomlValue::Array(allow_profiles),
+        ));
+    }
+
     // Load configuration and determine approval policy
     let overrides = ConfigOverrides {
         model,
@@ -177,18 +221,12 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         codex_linux_sandbox_exe,
         base_instructions: None,
         include_plan_tool: Some(include_plan_tool),
-        include_apply_patch_tool: Some(true),
+        include_apply_patch_tool: None,
         include_view_image_tool: None,
         show_raw_agent_reasoning: oss.then_some(true),
         tools_web_search_request: None,
-    };
-    // Parse `-c` overrides.
-    let cli_kv_overrides = match config_overrides.parse_overrides() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("Error parsing -c overrides: {e}");
-            std::process::exit(1);
-        }
+        wait_policy: None,
+        cli_resolved_overrides: None,
     };
 
     let config = Config::load_with_cli_overrides(cli_kv_overrides, overrides).await?;
@@ -249,7 +287,7 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
 
     // Handle resume subcommand by resolving a rollout path and using explicit resume API.
     let NewConversation {
-        conversation_id: _,
+        conversation_id,
         conversation,
         session_configured,
     } = if let Some(ExecCommand::Resume(args)) = command {
@@ -269,6 +307,9 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
             .new_conversation(config.clone())
             .await?
     };
+    let mut mailbox_server =
+        MailboxServer::start_if_enabled(&config, conversation.clone(), conversation_id).await?;
+
     // Print the effective configuration and prompt so users can see what Codex
     // is using.
     event_processor.print_config_summary(&config, &prompt, &session_configured);
@@ -357,7 +398,10 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
     // exit with a non-zero status for automation-friendly signaling.
     let mut error_seen = false;
     while let Some(event) = rx.recv().await {
-        if matches!(event.msg, EventMsg::Error(_)) {
+        if let Some(server) = mailbox_server.as_ref() {
+            server.handle_event(&event).await;
+        }
+        if matches!(&event.msg, EventMsg::Error(_)) {
             error_seen = true;
         }
         let shutdown: CodexStatus = event_processor.process_event(event);
@@ -372,6 +416,11 @@ pub async fn run_main(cli: Cli, codex_linux_sandbox_exe: Option<PathBuf>) -> any
         }
     }
     event_processor.print_final_output();
+
+    if let Some(server) = mailbox_server.take() {
+        server.shutdown().await?;
+    }
+
     if error_seen {
         std::process::exit(1);
     }

@@ -1,0 +1,33 @@
+# This configuration file helps optimize Rust release builds.
+# Place this file in `.cargo/config.toml` at the root of your project.
+
+[target.x86_64-unknown-linux-gnu]
+# Use a faster, multi-threaded linker. We're specifying `mold` here,
+# which is currently the fastest option available. You'll need to install it
+# on your system first (e.g., `sudo apt install mold`).
+# We use `clang` as the driver to tell it to use `mold` for linking.
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# --- Build Profile Settings ---
+# These settings apply when you run `cargo build --release`.
+
+[profile.release]
+# Link-Time Optimization (LTO) allows the compiler to optimize across
+# multiple crates. "thin" is a great default, offering most of the
+# performance of "fat" LTO with much faster build times.
+lto = "thin"
+
+# This splits your crate into multiple "codegen units," allowing Rust
+# to compile them in parallel. You were already using 16, which is a
+# good number for a machine with many cores.
+codegen-units = 16
+
+# As requested, this ensures debug information is included in the release
+# build, which is useful for profiling and debugging performance issues.
+# It does not significantly impact runtime performance.
+debug = true
+
+# `strip = "symbols"` would remove symbols, but we are leaving this commented
+# out (or you can set it to `false`) to ensure symbols are kept.
+# strip = false

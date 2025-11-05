@@ -10,6 +10,9 @@ use codex_core::protocol::EventMsg;
 use codex_core::protocol::ExecCommandBeginEvent;
 use codex_core::protocol::ExecCommandEndEvent;
 use codex_core::protocol::FileChange;
+use codex_core::protocol::MailboxDeliveryEvent;
+use codex_core::protocol::MailboxDeliveryIngress;
+use codex_core::protocol::MailboxDeliveryState;
 use codex_core::protocol::McpInvocation;
 use codex_core::protocol::McpToolCallBeginEvent;
 use codex_core::protocol::McpToolCallEndEvent;
@@ -17,6 +20,7 @@ use codex_core::protocol::PatchApplyBeginEvent;
 use codex_core::protocol::PatchApplyEndEvent;
 use codex_core::protocol::SessionConfiguredEvent;
 use codex_core::protocol::StreamErrorEvent;
+use codex_core::protocol::SummaryUpdatedEvent;
 use codex_core::protocol::TaskCompleteEvent;
 use codex_core::protocol::TurnAbortReason;
 use codex_core::protocol::TurnDiffEvent;
@@ -34,8 +38,16 @@ use crate::event_processor::CodexStatus;
 use crate::event_processor::EventProcessor;
 use crate::event_processor::handle_last_message;
 use codex_common::create_config_summary_entries;
+use codex_protocol::mailbox::MailboxAckMode;
 use codex_protocol::plan_tool::StepStatus;
 use codex_protocol::plan_tool::UpdatePlanArgs;
+
+/// Timestamped helper. The timestamp is styled with self.dimmed.
+macro_rules! ts_msg {
+    ($self:ident, $($arg:tt)*) => {{
+        eprintln!($($arg)*);
+    }};
+}
 
 /// This should be configurable. When used in CI, users may not want to impose
 /// a limit so they can see the full transcript.
@@ -58,9 +70,14 @@ pub(crate) struct EventProcessorWithHumanOutput {
     /// Whether to include `AgentReasoning` events in the output.
     show_agent_reasoning: bool,
     show_raw_agent_reasoning: bool,
+    show_diff_logs: bool,
+    diff_logging_notice_emitted: bool,
     last_message_path: Option<PathBuf>,
     last_total_token_usage: Option<codex_core::protocol::TokenUsageInfo>,
     final_message: Option<String>,
+
+    // Optional: show concise notices for background summary updates.
+    show_summary_update_notice: bool,
 }
 
 impl EventProcessorWithHumanOutput {
@@ -70,6 +87,7 @@ impl EventProcessorWithHumanOutput {
         last_message_path: Option<PathBuf>,
     ) -> Self {
         let call_id_to_patch = HashMap::new();
+        let show_diff_logs = Self::resolve_diff_logging_preference(config);
 
         if with_ansi {
             Self {
@@ -83,9 +101,12 @@ impl EventProcessorWithHumanOutput {
                 cyan: Style::new().cyan(),
                 show_agent_reasoning: !config.hide_agent_reasoning,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+                show_diff_logs,
+                diff_logging_notice_emitted: false,
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
+                show_summary_update_notice: config.summaries.enabled,
             }
         } else {
             Self {
@@ -99,24 +120,46 @@ impl EventProcessorWithHumanOutput {
                 cyan: Style::new(),
                 show_agent_reasoning: !config.hide_agent_reasoning,
                 show_raw_agent_reasoning: config.show_raw_agent_reasoning,
+                show_diff_logs,
+                diff_logging_notice_emitted: false,
                 last_message_path,
                 last_total_token_usage: None,
                 final_message: None,
+                show_summary_update_notice: config.summaries.enabled,
             }
         }
+    }
+
+    fn resolve_diff_logging_preference(_config: &Config) -> bool {
+        match std::env::var("CODEX_DIFF_LOG") {
+            Ok(value) => {
+                let normalized = value.trim().to_ascii_lowercase();
+                !matches!(
+                    normalized.as_str(),
+                    "" | "0" | "false" | "off" | "no" | "disable" | "disabled"
+                )
+            }
+            Err(_) => true,
+        }
+    }
+
+    fn emit_diff_logging_notice_if_needed(&mut self) {
+        if self.show_diff_logs || self.diff_logging_notice_emitted {
+            return;
+        }
+
+        ts_msg!(
+            self,
+            "{}",
+            "diff logging muted via CODEX_DIFF_LOG; snippets suppressed.".style(self.dimmed)
+        );
+        self.diff_logging_notice_emitted = true;
     }
 }
 
 struct PatchApplyBegin {
     start_time: Instant,
     auto_approved: bool,
-}
-
-/// Timestamped helper. The timestamp is styled with self.dimmed.
-macro_rules! ts_msg {
-    ($self:ident, $($arg:tt)*) => {{
-        eprintln!($($arg)*);
-    }};
 }
 
 impl EventProcessor for EventProcessorWithHumanOutput {
@@ -166,6 +209,11 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             }
             EventMsg::StreamError(StreamErrorEvent { message }) => {
                 ts_msg!(self, "{}", message.style(self.dimmed));
+            }
+            EventMsg::SummaryUpdated(_) => {
+                if self.show_summary_update_notice {
+                    ts_msg!(self, "summary updated");
+                }
             }
             EventMsg::TaskStarted(_) => {
                 // Ignore.
@@ -302,11 +350,20 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                     },
                 );
 
+                let file_update_banner = if self.show_diff_logs {
+                    "file update"
+                } else {
+                    "file update (diff logging muted)"
+                };
                 ts_msg!(
                     self,
                     "{}",
-                    "file update".style(self.magenta).style(self.italic),
+                    file_update_banner.style(self.magenta).style(self.italic),
                 );
+
+                if !self.show_diff_logs {
+                    self.emit_diff_logging_notice_if_needed();
+                }
 
                 // Pretty-print the patch summary with colored diff markers so
                 // it's easy to scan in the terminal output.
@@ -319,8 +376,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                                 path.to_string_lossy()
                             );
                             eprintln!("{}", header.style(self.magenta));
-                            for line in content.lines() {
-                                eprintln!("{}", line.style(self.green));
+                            if self.show_diff_logs {
+                                for line in content.lines() {
+                                    eprintln!("{}", line.style(self.green));
+                                }
                             }
                         }
                         FileChange::Delete { content } => {
@@ -330,8 +389,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                                 path.to_string_lossy()
                             );
                             eprintln!("{}", header.style(self.magenta));
-                            for line in content.lines() {
-                                eprintln!("{}", line.style(self.red));
+                            if self.show_diff_logs {
+                                for line in content.lines() {
+                                    eprintln!("{}", line.style(self.red));
+                                }
                             }
                         }
                         FileChange::Update {
@@ -350,18 +411,20 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                             };
                             eprintln!("{}", header.style(self.magenta));
 
-                            // Colorize diff lines. We keep file header lines
-                            // (--- / +++) without extra coloring so they are
-                            // still readable.
-                            for diff_line in unified_diff.lines() {
-                                if diff_line.starts_with('+') && !diff_line.starts_with("+++") {
-                                    eprintln!("{}", diff_line.style(self.green));
-                                } else if diff_line.starts_with('-')
-                                    && !diff_line.starts_with("---")
-                                {
-                                    eprintln!("{}", diff_line.style(self.red));
-                                } else {
-                                    eprintln!("{diff_line}");
+                            if self.show_diff_logs {
+                                // Colorize diff lines. We keep file header lines
+                                // (--- / +++) without extra coloring so they are
+                                // still readable.
+                                for diff_line in unified_diff.lines() {
+                                    if diff_line.starts_with('+') && !diff_line.starts_with("+++") {
+                                        eprintln!("{}", diff_line.style(self.green));
+                                    } else if diff_line.starts_with('-')
+                                        && !diff_line.starts_with("---")
+                                    {
+                                        eprintln!("{}", diff_line.style(self.red));
+                                    } else {
+                                        eprintln!("{diff_line}");
+                                    }
                                 }
                             }
                         }
@@ -404,12 +467,23 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 }
             }
             EventMsg::TurnDiff(TurnDiffEvent { unified_diff }) => {
-                ts_msg!(
-                    self,
-                    "{}",
-                    "file update:".style(self.magenta).style(self.italic)
-                );
-                eprintln!("{unified_diff}");
+                if self.show_diff_logs {
+                    ts_msg!(
+                        self,
+                        "{}",
+                        "file update:".style(self.magenta).style(self.italic)
+                    );
+                    eprintln!("{unified_diff}");
+                } else {
+                    self.emit_diff_logging_notice_if_needed();
+                    ts_msg!(
+                        self,
+                        "{}",
+                        "file update (diff logging muted)"
+                            .style(self.magenta)
+                            .style(self.italic)
+                    );
+                }
             }
             EventMsg::ExecApprovalRequest(_) => {
                 // Should we exit?
@@ -517,6 +591,10 @@ impl EventProcessor for EventProcessorWithHumanOutput {
             EventMsg::AgentMessageDelta(_) => {}
             EventMsg::AgentReasoningDelta(_) => {}
             EventMsg::AgentReasoningRawContentDelta(_) => {}
+            EventMsg::MailboxDelivery(delivery) => {
+                self.print_mailbox_delivery(delivery);
+            }
+            EventMsg::Heartbeat(_) => {}
         }
         CodexStatus::Running
     }
@@ -540,6 +618,126 @@ impl EventProcessor for EventProcessorWithHumanOutput {
                 print!("{message}");
             } else {
                 println!("{message}");
+            }
+        }
+    }
+}
+
+impl EventProcessorWithHumanOutput {
+    fn print_mailbox_delivery(&mut self, delivery: MailboxDeliveryEvent) {
+        let sender = delivery
+            .message
+            .sender
+            .display_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| delivery.message.sender.id.clone());
+        let subject = delivery
+            .message
+            .body
+            .subject
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("(no subject)");
+        let priority = format!("{:?}", delivery.message.priority).to_lowercase();
+        let ack_mode = format!("{:?}", delivery.message.ack_policy.mode).to_lowercase();
+        let ack_required = matches!(delivery.message.ack_policy.mode, MailboxAckMode::Required);
+
+        let state_label = match delivery.state {
+            MailboxDeliveryState::Enqueued => "enqueued",
+            MailboxDeliveryState::Delivered => "delivered",
+        };
+
+        let ingress = delivery
+            .ingress
+            .map(format_mailbox_ingress)
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let queue_depth = delivery
+            .queue_depth
+            .map(|depth| depth.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let latency = delivery
+            .delivery_latency_ms
+            .map(|ms| format!("{ms}ms"))
+            .unwrap_or_else(|| "-".to_string());
+
+        ts_msg!(
+            self,
+            "{} {}",
+            "mailbox".style(self.magenta).style(self.italic),
+            format!("{state_label} from {sender}").style(self.bold)
+        );
+
+        let priority_text = format!("priority={priority}");
+        let ingress_text = format!("ingress={ingress}");
+        let queue_text = format!("queue_depth={queue_depth}");
+        let latency_text = format!("latency={latency}");
+        let ack_text = format!("ack={ack_mode}");
+
+        let priority_fragment = priority_text.style(self.dimmed);
+        let ingress_fragment = ingress_text.style(self.dimmed);
+        let queue_fragment = queue_text.style(self.dimmed);
+        let latency_fragment = latency_text.style(self.dimmed);
+        let ack_fragment = if ack_required {
+            ack_text.style(self.red)
+        } else {
+            ack_text.style(self.dimmed)
+        };
+
+        ts_msg!(
+            self,
+            "  {} {} {} {} {}",
+            priority_fragment,
+            ack_fragment,
+            ingress_fragment,
+            queue_fragment,
+            latency_fragment,
+        );
+
+        let message_id_text = format!("message_id={}", delivery.message.message_id);
+        let message_id = message_id_text.style(self.dimmed);
+        if let Some(request_id) = delivery
+            .message
+            .audit
+            .request_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+        {
+            let request_text = format!("request_id={request_id}");
+            let request_fragment = request_text.style(self.dimmed);
+            ts_msg!(self, "  {} {}", message_id, request_fragment);
+        } else {
+            ts_msg!(self, "  {}", message_id);
+        }
+
+        ts_msg!(self, "  subject: {}", subject.style(self.bold));
+
+        for line in delivery.message.body.content.lines() {
+            if line.trim().is_empty() {
+                ts_msg!(self, "");
+            } else {
+                ts_msg!(self, "    {}", line);
+            }
+        }
+
+        if ack_required {
+            if let Some(deadline) = delivery.message.ack_policy.deadline {
+                let formatted_deadline = deadline.to_string();
+                ts_msg!(
+                    self,
+                    "  ack deadline: {}",
+                    formatted_deadline.style(self.red)
+                );
+            }
+            if let Some(ticket) = delivery
+                .message
+                .ack_policy
+                .escalation_ticket
+                .as_deref()
+                .filter(|s| !s.is_empty())
+            {
+                ts_msg!(self, "  escalation: {}", ticket.style(self.red));
             }
         }
     }
@@ -578,4 +776,8 @@ fn format_mcp_invocation(invocation: &McpInvocation) -> String {
     } else {
         format!("{fq_tool_name}({args_str})")
     }
+}
+
+fn format_mailbox_ingress(ingress: MailboxDeliveryIngress) -> String {
+    format!("{ingress:?}").to_lowercase()
 }

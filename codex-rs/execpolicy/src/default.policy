@@ -116,13 +116,21 @@ define_program(
         opt("--glob", ARG_OPAQUE_VALUE),
         opt("-m", ARG_POS_INT),
         opt("--max-count", ARG_POS_INT),
+        opt("--color", "never"),
 
         flag("-n"),
         flag("-i"),
+        flag("-S"),
+        flag("-c"),
+        flag("-q"),
         flag("-l"),
+        flag("--count"),
+        flag("--quiet"),
         flag("--files"),
         flag("--files-with-matches"),
         flag("--files-without-match"),
+        flag("--stats"),
+        flag("--color=never"),
     ],
     args=[ARG_OPAQUE_VALUE, ARG_RFILES_OR_CWD],
     should_match=[
@@ -130,14 +138,20 @@ define_program(
         ["-n", "init", "."],
         ["-i", "-n", "init", "src"],
         ["--files", "--max-depth", "2", "."],
+        ["-q", "needle", "README.md"],
+        ["-c", "needle", "README.md"],
+        ["--stats", "-n", "needle", "."],
+        ["--color", "never", "needle", "src"],
+        ["--color=never", "-n", "needle", "."],
     ],
     should_not_match=[
         ["-m", "-n", "init"],
         ["--glob", "src"],
+        ["--color", "always", "needle"],
+        ["-q"],
     ],
-    # TODO(mbolin): Perhaps we need a way to indicate that we expect `rg` to be
-    # bundled with the host environment and we should be using that version.
-    system_path=[],
+    # Prefer the host-provided ripgrep binaries so PATH hijacking is avoided.
+    system_path=["/usr/bin/rg", "/bin/rg", "/opt/homebrew/bin/rg"],
 )
 
 # Unfortunately, `sed` is difficult to secure because GNU sed supports an `e`

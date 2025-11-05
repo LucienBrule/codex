@@ -5,4 +5,4 @@ expression: terminal.backend()
 "                                                            "
 "› /mo                                                       "
 "  /model    choose what model and reasoning effort to use   "
-"  /mention  mention a file                                  "
+"  /mailbox  open the mailbox drawer (Ctrl+M) to view/ack    "

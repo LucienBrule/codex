@@ -1,8 +1,11 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::AuthManager;
 use crate::client_common::REVIEW_PROMPT;
@@ -15,25 +18,37 @@ use async_channel::Receiver;
 use async_channel::Sender;
 use codex_apply_patch::ApplyPatchAction;
 use codex_protocol::ConversationId;
+use codex_protocol::mailbox::MailboxContentType;
+use codex_protocol::mailbox::MailboxMessage;
+use codex_protocol::mailbox::MailboxSenderRole;
 use codex_protocol::protocol::ConversationPathResponseEvent;
 use codex_protocol::protocol::ExitedReviewModeEvent;
+use codex_protocol::protocol::HeartbeatEvent;
+use codex_protocol::protocol::MailboxDeliveryEvent;
+use codex_protocol::protocol::MailboxDeliveryState;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::TaskStartedEvent;
 use codex_protocol::protocol::TurnAbortReason;
 use codex_protocol::protocol::TurnContextItem;
+use futures::future::BoxFuture;
 use futures::prelude::*;
+use futures::stream::FuturesOrdered;
 use mcp_types::CallToolResult;
 use serde_json;
 use serde_json::Value;
+use thiserror::Error;
+use time::format_description::well_known::Rfc3339;
 use tokio::sync::Mutex;
 use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
 use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::ModelProviderInfo;
 use crate::apply_patch::convert_apply_patch_to_protocol;
@@ -55,6 +70,20 @@ use crate::exec_command::WriteStdinParams;
 use crate::executor::Executor;
 use crate::executor::ExecutorConfig;
 use crate::executor::normalize_exec_result;
+use crate::mailbox::MAILBOX_QUEUE_CAPACITY;
+use crate::mailbox::MailboxEnvelope;
+use crate::mailbox::MailboxReceiver;
+use crate::mailbox::MailboxSender;
+use crate::mailbox::MailboxWaitFilter;
+use crate::mailbox::ROUTING_MODE_METADATA_KEY;
+use crate::mailbox::TryEnqueueError;
+use crate::mailbox::apply_mailbox_defaults;
+use crate::mailbox::mailbox_channel;
+use crate::mailbox::mailbox_feature_enabled;
+use crate::mailbox::validate_mailbox_message;
+use crate::mailbox_dispatcher::DispatchStatus;
+use crate::mailbox_dispatcher::MailboxDispatcherClient;
+use crate::mcp::auth::compute_auth_statuses;
 use crate::mcp_connection_manager::McpConnectionManager;
 use crate::model_family::find_family_for_model;
 use crate::openai_model_info::get_model_info;
@@ -96,16 +125,32 @@ use crate::rollout::RolloutRecorderParams;
 use crate::shell;
 use crate::state::ActiveTurn;
 use crate::state::SessionServices;
+use crate::summaries;
+use crate::summaries::SummariesState as SlidingSummariesState;
+use crate::summaries::build_prompt as build_sliding_window_prompt;
 use crate::tasks::CompactTask;
 use crate::tasks::RegularTask;
 use crate::tasks::ReviewTask;
+use crate::telemetry::MailboxDeliveryTelemetry;
+use crate::telemetry::MailboxLivenessSnapshot;
+use crate::telemetry::MailboxLivenessTelemetry;
+use crate::telemetry::MailboxTelemetryLabels;
 use crate::tools::ToolRouter;
+use crate::tools::context::SharedTurnDiffTracker;
+use crate::tools::context::WaitTriggerCancelReason;
+use crate::tools::context::WaitTriggerCompletion;
+use crate::tools::context::WaitTriggerError;
+use crate::tools::context::WaitTriggerHandle;
+use crate::tools::context::WaitTriggerSpec;
 use crate::tools::format_exec_output_str;
+use crate::tools::names::WAIT_WITH_PREDICATE_TOOL_NAME;
+use crate::tools::parallel::ToolCallRuntime;
 use crate::turn_diff_tracker::TurnDiffTracker;
 use crate::unified_exec::UnifiedExecSessionManager;
 use crate::user_instructions::UserInstructions;
 use crate::user_notification::UserNotification;
 use crate::util::backoff;
+use crate::vm_pty::VmPtyClient;
 use codex_otel::otel_event_manager::OtelEventManager;
 use codex_protocol::config_types::ReasoningEffort as ReasoningEffortConfig;
 use codex_protocol::config_types::ReasoningSummary as ReasoningSummaryConfig;
@@ -115,6 +160,8 @@ use codex_protocol::models::FunctionCallOutputPayload;
 use codex_protocol::models::ResponseInputItem;
 use codex_protocol::models::ResponseItem;
 use codex_protocol::protocol::InitialHistory;
+use codex_protocol::protocol::MailboxDeliveryIngress;
+use time::OffsetDateTime;
 
 pub mod compact;
 use self::compact::build_compacted_history;
@@ -138,6 +185,7 @@ pub struct CodexSpawnOk {
 
 pub(crate) const INITIAL_SUBMIT_ID: &str = "";
 pub(crate) const SUBMISSION_CHANNEL_CAPACITY: usize = 64;
+pub(crate) const MAX_WAIT_TRIGGERS_PER_TURN: usize = 16;
 
 impl Codex {
     /// Spawn a new [`Codex`] and initialize the session.
@@ -149,6 +197,7 @@ impl Codex {
     ) -> CodexResult<CodexSpawnOk> {
         let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
         let (tx_event, rx_event) = async_channel::unbounded();
+        let (mailbox_tx, mailbox_rx) = mailbox_channel(MAILBOX_QUEUE_CAPACITY);
 
         let user_instructions = get_user_instructions(&config).await;
 
@@ -168,6 +217,7 @@ impl Codex {
         };
 
         // Generate a unique ID for the lifetime of this Codex session.
+        let session_mailbox_tx = mailbox_tx.clone();
         let (session, turn_context) = Session::new(
             configure_session,
             config.clone(),
@@ -175,6 +225,7 @@ impl Codex {
             tx_event.clone(),
             conversation_history,
             session_source,
+            session_mailbox_tx,
         )
         .await
         .map_err(|e| {
@@ -183,8 +234,18 @@ impl Codex {
         })?;
         let conversation_id = session.conversation_id;
 
+        let dispatcher_client = MailboxDispatcherClient::from_env().map(Arc::new);
+
         // This task will run until Op::Shutdown is received.
-        tokio::spawn(submission_loop(session, turn_context, config, rx_sub));
+        tokio::spawn(submission_loop(
+            session,
+            turn_context,
+            config,
+            rx_sub,
+            mailbox_tx.clone(),
+            mailbox_rx,
+            dispatcher_client,
+        ));
         let codex = Codex {
             next_id: AtomicU64::new(0),
             tx_sub,
@@ -197,12 +258,15 @@ impl Codex {
         })
     }
 
+    pub(crate) fn allocate_submission_id(&self) -> String {
+        self.next_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .to_string()
+    }
+
     /// Submit the `op` wrapped in a `Submission` with a unique ID.
     pub async fn submit(&self, op: Op) -> CodexResult<String> {
-        let id = self
-            .next_id
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .to_string();
+        let id = self.allocate_submission_id();
         let sub = Submission { id: id.clone(), op };
         self.submit_with_id(sub).await?;
         Ok(id)
@@ -240,6 +304,143 @@ pub(crate) struct Session {
     pub(crate) active_turn: Mutex<Option<ActiveTurn>>,
     pub(crate) services: SessionServices,
     next_internal_sub_id: AtomicU64,
+    mailbox_tx: MailboxSender,
+    #[cfg(test)]
+    wait_trigger_mailbox_events: Mutex<Vec<MailboxDeliveryEvent>>,
+    #[cfg(test)]
+    wait_trigger_mailbox_failures: Mutex<Vec<MailboxEnqueueError>>,
+    wait_triggers: Mutex<HashMap<Uuid, WaitTriggerState>>,
+    mailbox_waiters: Mutex<HashMap<Uuid, Vec<oneshot::Sender<MailboxDeliveryEvent>>>>,
+    mailbox_predicate_waiters: Mutex<Vec<MailboxPredicateWaiter>>,
+    session_source: SessionSource,
+    mailbox_metrics: Mutex<MailboxDeliveryTelemetry>,
+    mailbox_liveness: Option<Mutex<MailboxLivenessTelemetry>>,
+}
+
+#[derive(Debug, Error)]
+pub enum MailboxEnqueueError {
+    #[error("mailbox dispatcher disabled (set CODEX_MAILBOX_OOB=1 to enable)")]
+    Disabled,
+    #[error("mailbox queue is full (capacity = {capacity})")]
+    Full { capacity: usize },
+    #[error("mailbox dispatcher unavailable")]
+    Closed,
+}
+
+struct MailboxPredicateWaiter {
+    id: Uuid,
+    filter: MailboxWaitFilter,
+    tx: oneshot::Sender<MailboxDeliveryEvent>,
+}
+
+struct WaitTriggerState {
+    sub_id: String,
+    call_id: String,
+    predicate_id: String,
+    wake_deadline: Option<OffsetDateTime>,
+    request_id: String,
+    created_at: OffsetDateTime,
+    fire_quota: u32,
+    fires: u32,
+    abort_handle: AbortHandle,
+}
+
+impl WaitTriggerState {
+    fn new(
+        sub_id: String,
+        call_id: String,
+        predicate_id: String,
+        wake_deadline: Option<OffsetDateTime>,
+        request_id: String,
+        fire_quota: u32,
+        abort_handle: AbortHandle,
+    ) -> Self {
+        Self {
+            sub_id,
+            call_id,
+            predicate_id,
+            wake_deadline,
+            request_id,
+            created_at: OffsetDateTime::now_utc(),
+            fire_quota: fire_quota.max(1),
+            fires: 0,
+            abort_handle,
+        }
+    }
+
+    fn record_fire(&mut self) {
+        self.fires = self.fires.saturating_add(1);
+    }
+
+    fn completion_summary(&self, completion: &WaitTriggerCompletion) -> String {
+        let mut summary = match &completion.summary {
+            Some(summary) if !summary.is_empty() => format!(
+                "wait predicate `{}` (call {}) completed: {summary}",
+                self.predicate_id, self.call_id
+            ),
+            _ => format!(
+                "wait predicate `{}` (call {}) completed",
+                self.predicate_id, self.call_id
+            ),
+        };
+
+        let elapsed = OffsetDateTime::now_utc() - self.created_at;
+        summary.push_str(&format!(
+            " after {:.1}s (delivery {}/{})",
+            elapsed.as_seconds_f32(),
+            self.fires + 1,
+            self.fire_quota
+        ));
+
+        if let Some(deadline) = self.wake_deadline
+            && let Ok(formatted) = deadline.format(&Rfc3339)
+        {
+            summary.push_str(&format!("; deadline {formatted}"));
+        }
+
+        summary
+    }
+
+    fn cancellation_summary(&self, reason: WaitTriggerCancelReason) -> String {
+        let mut message = match reason {
+            WaitTriggerCancelReason::Explicit => format!(
+                "wait predicate `{}` (call {}) cancelled by tool context",
+                self.predicate_id, self.call_id
+            ),
+            WaitTriggerCancelReason::TurnShutdown => format!(
+                "wait predicate `{}` (call {}) cancelled when turn ended",
+                self.predicate_id, self.call_id
+            ),
+            WaitTriggerCancelReason::Dropped => format!(
+                "wait predicate `{}` (call {}) cancelled because the trigger handle was dropped",
+                self.predicate_id, self.call_id
+            ),
+        };
+
+        if let Some(deadline) = self.wake_deadline
+            && let Ok(formatted) = deadline.format(&Rfc3339)
+        {
+            message.push_str(&format!("; deadline {formatted}"));
+        }
+
+        message.push_str(&format!(
+            " (deliveries so far {}/{})",
+            self.fires, self.fire_quota
+        ));
+
+        message
+    }
+
+    fn default_mailbox_message(&self, summary: &str) -> MailboxMessage {
+        let mut message = MailboxMessage::default();
+        message.sender.id = WAIT_WITH_PREDICATE_TOOL_NAME.to_string();
+        message.sender.role = MailboxSenderRole::Automation;
+        message.body.subject = Some(format!("Wait trigger completed for call {}", self.call_id));
+        message.body.content = summary.to_string();
+        message.body.content_type = MailboxContentType::TextPlain;
+        message.audit.request_id = Some(self.request_id.clone());
+        message
+    }
 }
 
 /// The context needed for a single turn of the conversation.
@@ -256,6 +457,11 @@ pub(crate) struct TurnContext {
     pub(crate) sandbox_policy: SandboxPolicy,
     pub(crate) shell_environment_policy: ShellEnvironmentPolicy,
     pub(crate) tools_config: ToolsConfig,
+    // Resolved vm-pty defaults
+    pub(crate) vm_pty_default_vm_id: Option<String>,
+    pub(crate) vm_pty_open_timeout: std::time::Duration,
+    pub(crate) vm_pty_open_blocking: bool,
+    pub(crate) vm_pty_max_concurrent_per_worker: Option<usize>,
     pub(crate) is_review_mode: bool,
     pub(crate) final_output_json_schema: Option<Value>,
 }
@@ -310,6 +516,7 @@ impl Session {
         tx_event: Sender<Event>,
         initial_history: InitialHistory,
         session_source: SessionSource,
+        mailbox_tx: MailboxSender,
     ) -> anyhow::Result<(Arc<Self>, TurnContext)> {
         let ConfigureSession {
             provider,
@@ -360,6 +567,7 @@ impl Session {
         let mcp_fut = McpConnectionManager::new(
             config.mcp_servers.clone(),
             config.use_experimental_use_rmcp_client,
+            config.mcp_oauth_credentials_store_mode,
         );
         let default_shell_fut = shell::default_user_shell();
         let history_meta_fut = crate::message_history::history_metadata(&config);
@@ -436,6 +644,24 @@ impl Session {
             model_reasoning_summary,
             conversation_id,
         );
+        let vm_pty_client = if config.include_vm_pty_tool {
+            if let Some(endpoint) = &config.vm_pty_socket {
+                Some(Arc::new(VmPtyClient::new(
+                    endpoint.clone(),
+                    config.vm_pty_connect_timeout,
+                    config.vm_pty_request_timeout,
+                )))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let include_vm_pty_tool = config.include_vm_pty_tool && vm_pty_client.is_some();
+        let include_vm_pty_open_tool = config.include_vm_pty_open_tool && include_vm_pty_tool;
+        let route_shell_via_pty = include_vm_pty_tool
+            && matches!(config.active_profile.as_deref(), Some("worker-pty-sandbox"));
+
         let turn_context = TurnContext {
             client,
             tools_config: ToolsConfig::new(&ToolsConfigParams {
@@ -444,8 +670,13 @@ impl Session {
                 include_apply_patch_tool: config.include_apply_patch_tool,
                 include_web_search_request: config.tools_web_search_request,
                 use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+                include_shell_tool: config.include_shell_tool,
                 include_view_image_tool: config.include_view_image_tool,
+                include_vm_pty_tool,
+                include_vm_pty_open_tool,
+                route_shell_via_pty,
                 experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                debug_tools: config.debug_tools,
             }),
             user_instructions,
             base_instructions,
@@ -453,6 +684,10 @@ impl Session {
             sandbox_policy,
             shell_environment_policy: config.shell_environment_policy.clone(),
             cwd,
+            vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+            vm_pty_open_timeout: config.vm_pty_open_timeout,
+            vm_pty_open_blocking: config.vm_pty_open_blocking,
+            vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
             is_review_mode: false,
             final_output_json_schema: None,
         };
@@ -468,7 +703,28 @@ impl Session {
                 turn_context.sandbox_policy.clone(),
                 turn_context.cwd.clone(),
                 config.codex_linux_sandbox_exe.clone(),
+                matches!(config.active_profile.as_deref(), Some("management")),
             )),
+            summaries: Mutex::new(None),
+            vm_pty_client: vm_pty_client.clone(),
+            pty_sessions: Mutex::new(Default::default()),
+        };
+
+        let mailbox_liveness = if config.mailbox_liveness.enabled {
+            Some(Mutex::new(MailboxLivenessTelemetry::new(
+                config.mailbox_liveness.clone(),
+            )))
+        } else {
+            None
+        };
+
+        // Read any existing summary checkpoint for this conversation to seed the summaries state.
+        let initial_summary = match summaries::read_summary_checkpoint(&conversation_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("failed to read summary checkpoint: {e}");
+                None
+            }
         };
 
         let sess = Arc::new(Session {
@@ -478,7 +734,28 @@ impl Session {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            mailbox_tx,
+            #[cfg(test)]
+            wait_trigger_mailbox_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
+            wait_triggers: Mutex::new(HashMap::new()),
+            mailbox_waiters: Mutex::new(HashMap::new()),
+            mailbox_predicate_waiters: Mutex::new(Vec::new()),
+            session_source,
+            mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
+            mailbox_liveness,
         });
+
+        // Spawn background continuous summaries if enabled and install the handle.
+        if let Some(svc) = crate::summaries::SummariesService::spawn(
+            Arc::clone(&sess),
+            config.summaries.clone(),
+            initial_summary,
+        ) {
+            let mut slot = sess.services.summaries.lock().await;
+            *slot = Some(svc);
+        }
 
         // Dispatch the SessionConfiguredEvent first and then report any errors.
         // If resuming, include converted initial messages in the payload so UIs can render them immediately.
@@ -504,6 +781,10 @@ impl Session {
         }
 
         Ok((sess, turn_context))
+    }
+
+    pub(crate) fn get_conversation_id(&self) -> ConversationId {
+        self.conversation_id
     }
 
     pub(crate) fn get_tx_event(&self) -> Sender<Event> {
@@ -550,10 +831,226 @@ impl Session {
     /// Persist the event to rollout and send it to clients.
     pub(crate) async fn send_event(&self, event: Event) {
         // Persist the event into rollout (recorder filters as needed)
-        let rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+        let mut rollout_items = vec![RolloutItem::EventMsg(event.msg.clone())];
+
+        // For background summary updates, also persist a durable snapshot and write a checkpoint.
+        if let EventMsg::SummaryUpdated(crate::protocol::SummaryUpdatedEvent { summary }) =
+            &event.msg
+        {
+            rollout_items.push(RolloutItem::SummarySnapshot(
+                crate::protocol::SummarySnapshotItem {
+                    summary: summary.clone(),
+                },
+            ));
+
+            // Fire-and-forget checkpoint write to avoid blocking the event loop.
+            let cid = self.conversation_id;
+            let summary_for_write = summary.clone();
+            tokio::spawn(async move {
+                if let Err(e) = summaries::write_summary_checkpoint(&cid, &summary_for_write).await
+                {
+                    tracing::warn!("failed to write summary checkpoint: {e}");
+                }
+            });
+        }
+
         self.persist_rollout_items(&rollout_items).await;
         if let Err(e) = self.tx_event.send(event).await {
             error!("failed to send tool call event: {e}");
+        }
+    }
+
+    pub(crate) async fn enqueue_mailbox_envelope(
+        &self,
+        submission_id: String,
+        message: MailboxMessage,
+        mailbox_enabled: bool,
+    ) -> Result<MailboxDeliveryEvent, MailboxEnqueueError> {
+        if !mailbox_enabled {
+            let event = Event {
+                id: submission_id,
+                msg: EventMsg::BackgroundEvent(BackgroundEventEvent {
+                    message: "Mailbox dispatcher disabled (set CODEX_MAILBOX_OOB=1 to enable)"
+                        .to_string(),
+                }),
+            };
+            self.send_event(event).await;
+            return Err(MailboxEnqueueError::Disabled);
+        }
+
+        let observed_at = OffsetDateTime::now_utc();
+        let pending = MailboxEnvelope::new(submission_id.clone(), message.clone());
+        match self.mailbox_tx.try_enqueue(pending.clone()) {
+            Ok(queue_depth) => {
+                let expires_at = pending
+                    .message
+                    .expires_at
+                    .map(|ts| ts.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()));
+                let ack_deadline = pending
+                    .message
+                    .ack_policy
+                    .deadline
+                    .map(|ts| ts.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()));
+                let rate_scope = pending
+                    .message
+                    .rate_limit
+                    .as_ref()
+                    .map(|r| format!("{:?}", r.scope).to_lowercase());
+                let rate_capacity = pending.message.rate_limit.as_ref().and_then(|r| r.capacity);
+                let rate_interval = pending
+                    .message
+                    .rate_limit
+                    .as_ref()
+                    .and_then(|r| r.interval_seconds);
+
+                info!(
+                    target: "codex::mailbox",
+                    event = "enqueued",
+                    submission_id = %pending.submission_id,
+                    conversation_id = %self.conversation_id,
+                    message_id = %pending.message.message_id,
+                    sender_id = %pending.message.sender.id,
+                    sender_role = ?pending.message.sender.role,
+                    priority = ?pending.message.priority,
+                    request_id = pending.message.audit.request_id.as_deref().unwrap_or(""),
+                    ack_mode = ?pending.message.ack_policy.mode,
+                    ack_deadline = ack_deadline.as_deref(),
+                    expires_at = expires_at.as_deref(),
+                    rate_scope = rate_scope.as_deref(),
+                    rate_capacity,
+                    rate_interval,
+                    queue_depth,
+                );
+
+                let ingress = self.mailbox_ingress(&pending.message);
+                let enqueued_event = MailboxDeliveryEvent {
+                    message,
+                    state: MailboxDeliveryState::Enqueued,
+                    queue_depth: Some(queue_depth),
+                    observed_at: Some(observed_at),
+                    correlation_id: Some(submission_id.clone()),
+                    ingress: Some(ingress.clone()),
+                    delivery_latency_ms: None,
+                };
+
+                {
+                    let labels = MailboxTelemetryLabels::new(ingress, &enqueued_event.message);
+                    let mut telemetry = self.mailbox_metrics.lock().await;
+                    telemetry.record_enqueued(&enqueued_event, &labels);
+                }
+
+                let event = Event {
+                    id: submission_id,
+                    msg: EventMsg::MailboxDelivery(enqueued_event.clone()),
+                };
+                self.send_event(event).await;
+                self.notify_mailbox_predicate_waiters(&enqueued_event).await;
+                Ok(enqueued_event)
+            }
+            Err(TryEnqueueError::Full { capacity, .. }) => {
+                let error_msg = format!(
+                    "Mailbox queue is full (capacity = {capacity}); dropping message {}",
+                    pending.message.message_id
+                );
+                warn!(
+                    target: "codex::mailbox",
+                    event = "dropped_full",
+                    message_id = %pending.message.message_id,
+                    submission_id = %pending.submission_id,
+                    conversation_id = %self.conversation_id,
+                    sender_id = %pending.message.sender.id,
+                    priority = ?pending.message.priority,
+                    request_id = pending.message.audit.request_id.as_deref().unwrap_or(""),
+                    capacity
+                );
+                let event = Event {
+                    id: submission_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: error_msg.clone(),
+                    }),
+                };
+                self.send_event(event).await;
+                Err(MailboxEnqueueError::Full { capacity })
+            }
+            Err(TryEnqueueError::Closed(_)) => {
+                warn!(
+                    target: "codex::mailbox",
+                    event = "dispatcher_closed",
+                    submission_id = %pending.submission_id,
+                    conversation_id = %self.conversation_id,
+                    message_id = %pending.message.message_id,
+                    sender_id = %pending.message.sender.id,
+                    request_id = pending.message.audit.request_id.as_deref().unwrap_or("")
+                );
+                let event = Event {
+                    id: submission_id,
+                    msg: EventMsg::Error(ErrorEvent {
+                        message: "Mailbox dispatcher unavailable".to_string(),
+                    }),
+                };
+                self.send_event(event).await;
+                Err(MailboxEnqueueError::Closed)
+            }
+        }
+    }
+
+    pub(crate) async fn register_mailbox_delivery_listener(
+        &self,
+        message_id: Uuid,
+    ) -> oneshot::Receiver<MailboxDeliveryEvent> {
+        let (tx, rx) = oneshot::channel();
+        let mut waiters = self.mailbox_waiters.lock().await;
+        waiters.entry(message_id).or_default().push(tx);
+        rx
+    }
+
+    pub(crate) async fn cancel_mailbox_delivery_listener(&self, message_id: Uuid) {
+        let mut waiters = self.mailbox_waiters.lock().await;
+        waiters.remove(&message_id);
+    }
+
+    pub(crate) async fn register_mailbox_predicate_waiter(
+        &self,
+        filter: MailboxWaitFilter,
+    ) -> (Uuid, oneshot::Receiver<MailboxDeliveryEvent>) {
+        let id = Uuid::now_v7();
+        let (tx, rx) = oneshot::channel();
+        let mut waiters = self.mailbox_predicate_waiters.lock().await;
+        waiters.retain(|waiter| !waiter.tx.is_closed());
+        waiters.push(MailboxPredicateWaiter { id, filter, tx });
+        (id, rx)
+    }
+
+    pub(crate) async fn cancel_mailbox_predicate_waiter(&self, waiter_id: Uuid) {
+        let mut waiters = self.mailbox_predicate_waiters.lock().await;
+        waiters.retain(|waiter| waiter.id != waiter_id && !waiter.tx.is_closed());
+    }
+
+    pub(crate) async fn notify_mailbox_predicate_waiters(&self, event: &MailboxDeliveryEvent) {
+        let mut waiters = self.mailbox_predicate_waiters.lock().await;
+        let mut idx = 0;
+        while idx < waiters.len() {
+            if waiters[idx].tx.is_closed() {
+                waiters.swap_remove(idx);
+                continue;
+            }
+
+            if waiters[idx].filter.matches(event) {
+                let waiter = waiters.swap_remove(idx);
+                let _ = waiter.tx.send(event.clone());
+                continue;
+            }
+
+            idx += 1;
+        }
+    }
+
+    async fn notify_mailbox_delivery_listeners(&self, delivery: &MailboxDeliveryEvent) {
+        let mut waiters = self.mailbox_waiters.lock().await;
+        if let Some(listeners) = waiters.remove(&delivery.message.message_id) {
+            for tx in listeners {
+                let _ = tx.send(delivery.clone());
+            }
         }
     }
 
@@ -782,6 +1279,17 @@ impl Session {
         self.send_event(event).await;
     }
 
+    async fn set_total_tokens_full(&self, sub_id: &str, turn_context: &TurnContext) {
+        let context_window = turn_context.client.get_model_context_window();
+        if let Some(context_window) = context_window {
+            {
+                let mut state = self.state.lock().await;
+                state.set_token_usage_full(context_window);
+            }
+            self.send_token_count_event(sub_id).await;
+        }
+    }
+
     /// Record a user input item to conversation history and also persist a
     /// corresponding UserMessage EventMsg to rollout.
     async fn record_input_and_rollout_usermsg(&self, response_input: &ResponseInputItem) {
@@ -807,7 +1315,7 @@ impl Session {
 
     async fn on_exec_command_begin(
         &self,
-        turn_diff_tracker: &mut TurnDiffTracker,
+        turn_diff_tracker: SharedTurnDiffTracker,
         exec_command_context: ExecCommandContext,
     ) {
         let ExecCommandContext {
@@ -823,7 +1331,10 @@ impl Session {
                 user_explicitly_approved_this_action,
                 changes,
             }) => {
-                turn_diff_tracker.on_patch_begin(&changes);
+                {
+                    let mut tracker = turn_diff_tracker.lock().await;
+                    tracker.on_patch_begin(&changes);
+                }
 
                 EventMsg::PatchApplyBegin(PatchApplyBeginEvent {
                     call_id,
@@ -850,7 +1361,7 @@ impl Session {
 
     async fn on_exec_command_end(
         &self,
-        turn_diff_tracker: &mut TurnDiffTracker,
+        turn_diff_tracker: SharedTurnDiffTracker,
         sub_id: &str,
         call_id: &str,
         output: &ExecToolCallOutput,
@@ -898,7 +1409,10 @@ impl Session {
         // If this is an apply_patch, after we emit the end patch, emit a second event
         // with the full turn diff if there is one.
         if is_apply_patch {
-            let unified_diff = turn_diff_tracker.get_unified_diff();
+            let unified_diff = {
+                let mut tracker = turn_diff_tracker.lock().await;
+                tracker.get_unified_diff()
+            };
             if let Ok(Some(unified_diff)) = unified_diff {
                 let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
                 let event = Event {
@@ -915,7 +1429,7 @@ impl Session {
     /// Returns the output of the exec tool call.
     pub(crate) async fn run_exec_with_events(
         &self,
-        turn_diff_tracker: &mut TurnDiffTracker,
+        turn_diff_tracker: SharedTurnDiffTracker,
         prepared: PreparedExec,
         approval_policy: AskForApproval,
     ) -> Result<ExecToolCallOutput, ExecError> {
@@ -924,7 +1438,7 @@ impl Session {
         let sub_id = context.sub_id.clone();
         let call_id = context.call_id.clone();
 
-        self.on_exec_command_begin(turn_diff_tracker, context.clone())
+        self.on_exec_command_begin(turn_diff_tracker.clone(), context.clone())
             .await;
 
         let result = self
@@ -996,6 +1510,28 @@ impl Session {
         }
     }
 
+    pub async fn inject_response_items(
+        &self,
+        items: Vec<ResponseInputItem>,
+    ) -> Result<(), Vec<ResponseInputItem>> {
+        if items.is_empty() {
+            return Ok(());
+        }
+
+        let mut active = self.active_turn.lock().await;
+        match active.as_mut() {
+            Some(at) => {
+                let mut ts = at.turn_state.lock().await;
+                let mut pending = items;
+                for item in pending.drain(..) {
+                    ts.push_pending_input(item);
+                }
+                Ok(())
+            }
+            None => Err(items),
+        }
+    }
+
     pub async fn get_pending_input(&self) -> Vec<ResponseInputItem> {
         let mut active = self.active_turn.lock().await;
         match active.as_mut() {
@@ -1023,6 +1559,225 @@ impl Session {
         self.services
             .mcp_connection_manager
             .parse_tool_name(tool_name)
+    }
+
+    pub(crate) async fn schedule_wait_trigger(
+        self: &Arc<Self>,
+        sub_id: &str,
+        call_id: &str,
+        spec: WaitTriggerSpec,
+    ) -> Result<WaitTriggerHandle, WaitTriggerError> {
+        let WaitTriggerSpec {
+            predicate_id,
+            wake_deadline,
+            fire_quota,
+            request_id,
+        } = spec;
+
+        let quota = fire_quota.max(1);
+        let (trigger_id, effective_request_id) = {
+            let mut active = self.active_turn.lock().await;
+            let Some(active_turn) = active.as_mut() else {
+                return Err(WaitTriggerError::InactiveTurn);
+            };
+            let mut ts = active_turn.turn_state.lock().await;
+            if ts.trigger_count() >= MAX_WAIT_TRIGGERS_PER_TURN {
+                return Err(WaitTriggerError::QuotaExceeded {
+                    limit: MAX_WAIT_TRIGGERS_PER_TURN,
+                });
+            }
+            ts.create_trigger(
+                predicate_id.clone(),
+                sub_id.to_string(),
+                call_id.to_string(),
+                wake_deadline,
+                quota,
+                request_id.clone(),
+            )
+        };
+
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let session = Arc::clone(self);
+        let trigger_for_task = trigger_id;
+        let task_handle = tokio::spawn(async move {
+            match completion_rx.await {
+                Ok(completion) => {
+                    session
+                        .finalize_wait_trigger(trigger_for_task, Some(completion))
+                        .await;
+                }
+                Err(_) => {
+                    session.finalize_wait_trigger(trigger_for_task, None).await;
+                }
+            }
+        });
+        let abort_handle = task_handle.abort_handle();
+
+        let state = WaitTriggerState::new(
+            sub_id.to_string(),
+            call_id.to_string(),
+            predicate_id,
+            wake_deadline,
+            effective_request_id,
+            quota,
+            abort_handle,
+        );
+
+        {
+            let mut guard = self.wait_triggers.lock().await;
+            if guard.contains_key(&trigger_id) {
+                state.abort_handle.clone().abort();
+                return Err(WaitTriggerError::TriggerClosed);
+            }
+            guard.insert(trigger_id, state);
+        }
+
+        Ok(WaitTriggerHandle::new(self, trigger_id, completion_tx))
+    }
+
+    pub(crate) async fn cancel_wait_trigger(
+        self: &Arc<Self>,
+        trigger_id: Uuid,
+        reason: WaitTriggerCancelReason,
+    ) -> Result<(), WaitTriggerError> {
+        if self
+            .cancel_wait_trigger_internal(trigger_id, reason)
+            .await
+            .is_some()
+        {
+            Ok(())
+        } else {
+            Err(WaitTriggerError::NotFound)
+        }
+    }
+
+    pub(crate) async fn cancel_wait_trigger_internal(
+        &self,
+        trigger_id: Uuid,
+        reason: WaitTriggerCancelReason,
+    ) -> Option<()> {
+        let state = {
+            let mut guard = self.wait_triggers.lock().await;
+            guard.remove(&trigger_id)
+        };
+
+        if let Some(state) = state {
+            state.abort_handle.abort();
+            self.remove_trigger_from_turn(&trigger_id).await;
+            self.handle_wait_trigger_cancellation(state, reason).await;
+            Some(())
+        } else {
+            None
+        }
+    }
+
+    async fn finalize_wait_trigger(
+        self: &Arc<Self>,
+        trigger_id: Uuid,
+        completion: Option<WaitTriggerCompletion>,
+    ) {
+        let state = {
+            let mut guard = self.wait_triggers.lock().await;
+            guard.remove(&trigger_id)
+        };
+        let _ = self.remove_trigger_from_turn(&trigger_id).await;
+
+        match (state, completion) {
+            (Some(mut state), Some(completion)) => {
+                state.record_fire();
+                self.handle_wait_trigger_success(state, completion).await;
+            }
+            (Some(state), None) => {
+                self.handle_wait_trigger_cancellation(state, WaitTriggerCancelReason::Dropped)
+                    .await;
+            }
+            _ => {}
+        }
+    }
+
+    async fn handle_wait_trigger_success(
+        &self,
+        state: WaitTriggerState,
+        completion: WaitTriggerCompletion,
+    ) {
+        let summary = state.completion_summary(&completion);
+        self.notify_background_event(&state.sub_id, summary.clone())
+            .await;
+
+        if !completion.inputs.is_empty() {
+            if let Err(unconsumed) = self.inject_response_items(completion.inputs.clone()).await {
+                warn!(
+                    predicate = %state.predicate_id,
+                    remaining = unconsumed.len(),
+                    "failed to inject wait trigger completion because the turn is no longer active"
+                );
+            }
+        }
+
+        if mailbox_feature_enabled() {
+            let mut message = completion
+                .mailbox_message
+                .unwrap_or_else(|| state.default_mailbox_message(&summary));
+            if message.audit.request_id.is_none() {
+                message.audit.request_id = Some(state.request_id.clone());
+            }
+            apply_mailbox_defaults(&mut message);
+            if let Err(err) = validate_mailbox_message(&message) {
+                warn!(
+                    predicate = %state.predicate_id,
+                    ?err,
+                    "wait trigger completion produced invalid mailbox message"
+                );
+            } else {
+                match self
+                    .enqueue_mailbox_envelope(state.sub_id.clone(), message, true)
+                    .await
+                {
+                    Ok(enqueued) => {
+                        #[cfg(test)]
+                        {
+                            let mut guard = self.wait_trigger_mailbox_events.lock().await;
+                            guard.push(enqueued.clone());
+                        }
+                        #[cfg(not(test))]
+                        {
+                            let _ = enqueued;
+                        }
+                    }
+                    Err(err) => {
+                        warn!(
+                            predicate = %state.predicate_id,
+                            ?err,
+                            "failed to enqueue wait trigger mailbox notification"
+                        );
+                        #[cfg(test)]
+                        {
+                            let mut guard = self.wait_trigger_mailbox_failures.lock().await;
+                            guard.push(err);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_wait_trigger_cancellation(
+        &self,
+        state: WaitTriggerState,
+        reason: WaitTriggerCancelReason,
+    ) {
+        let message = state.cancellation_summary(reason);
+        self.notify_background_event(&state.sub_id, message).await;
+    }
+
+    async fn remove_trigger_from_turn(&self, trigger_id: &Uuid) -> bool {
+        let mut active = self.active_turn.lock().await;
+        if let Some(active_turn) = active.as_mut() {
+            let mut ts = active_turn.turn_state.lock().await;
+            ts.remove_trigger(trigger_id).is_some()
+        } else {
+            false
+        }
     }
 
     pub(crate) async fn handle_exec_command_tool(
@@ -1071,9 +1826,16 @@ impl Session {
         if let Ok(mut active) = self.active_turn.try_lock()
             && let Some(at) = active.as_mut()
         {
-            at.try_clear_pending_sync();
+            let trigger_ids = at.try_clear_pending_sync();
             let tasks = at.drain_tasks();
             *active = None;
+            if let Ok(mut guard) = self.wait_triggers.try_lock() {
+                for trigger_id in trigger_ids {
+                    if let Some(state) = guard.remove(&trigger_id) {
+                        state.abort_handle.abort();
+                    }
+                }
+            }
             for (_sub_id, task) in tasks {
                 task.handle.abort();
             }
@@ -1091,6 +1853,48 @@ impl Session {
     fn show_raw_agent_reasoning(&self) -> bool {
         self.services.show_raw_agent_reasoning
     }
+
+    fn mailbox_ingress(&self, message: &MailboxMessage) -> MailboxDeliveryIngress {
+        if let Some(value) = message
+            .metadata
+            .get("ingress")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_ascii_lowercase())
+        {
+            match value.as_str() {
+                "script" => return MailboxDeliveryIngress::Script,
+                "cli" => return MailboxDeliveryIngress::Cli,
+                "mcp" => return MailboxDeliveryIngress::Mcp,
+                "vscode" => return MailboxDeliveryIngress::Vscode,
+                "api" => return MailboxDeliveryIngress::Api,
+                _ => {}
+            }
+        }
+
+        match self.session_source {
+            SessionSource::Cli | SessionSource::Exec => MailboxDeliveryIngress::Cli,
+            SessionSource::VSCode => MailboxDeliveryIngress::Vscode,
+            SessionSource::Mcp => MailboxDeliveryIngress::Mcp,
+            SessionSource::Unknown => MailboxDeliveryIngress::Unknown,
+        }
+    }
+
+    async fn record_mailbox_liveness(
+        &self,
+        transport_lag: Duration,
+    ) -> Option<MailboxLivenessSnapshot> {
+        let telemetry = self.mailbox_liveness.as_ref()?;
+
+        if !mailbox_feature_enabled() {
+            return None;
+        }
+
+        let queue_depth = self.mailbox_tx.len();
+        let now = Instant::now();
+        let observed_at = OffsetDateTime::now_utc();
+        let mut guard = telemetry.lock().await;
+        guard.record(now, observed_at, transport_lag, queue_depth)
+    }
 }
 
 impl Drop for Session {
@@ -1104,11 +1908,51 @@ async fn submission_loop(
     turn_context: TurnContext,
     config: Arc<Config>,
     rx_sub: Receiver<Submission>,
+    mailbox_tx: MailboxSender,
+    mailbox_rx: MailboxReceiver,
+    dispatcher: Option<Arc<MailboxDispatcherClient>>,
 ) {
     // Wrap once to avoid cloning TurnContext for each task.
     let mut turn_context = Arc::new(turn_context);
     // To break out of this loop, send Op::Shutdown.
-    while let Ok(sub) = rx_sub.recv().await {
+    let submission_rx = rx_sub;
+    'outer: while let Some((sub, mailbox_enabled)) = {
+        let mailbox_enabled = mailbox_feature_enabled();
+        #[allow(clippy::let_unit_value)]
+        let next = tokio::select! {
+            biased;
+            envelope = mailbox_rx.recv(), if mailbox_enabled => {
+                match envelope {
+                    Ok(envelope) => {
+                        if let Some(client) = dispatcher.as_ref() {
+                            let client = Arc::clone(client);
+                            let sess_clone = Arc::clone(&sess);
+                            let mailbox_tx_clone = mailbox_tx.clone();
+                            tokio::spawn(async move {
+                                dispatch_mailbox_envelope(client, sess_clone, mailbox_tx_clone, envelope).await;
+                            });
+                        } else {
+                            handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+                        }
+                        continue 'outer;
+                    }
+                    Err(_) => {
+                        if submission_rx.is_closed() {
+                            break 'outer;
+                        }
+                        continue 'outer;
+                    }
+                }
+            }
+            sub = submission_rx.recv() => {
+                match sub {
+                    Ok(sub) => (sub, mailbox_enabled),
+                    Err(_) => break 'outer,
+                }
+            }
+        };
+        Some(next)
+    } {
         debug!(?sub, "Submission");
         match sub.op {
             Op::Interrupt => {
@@ -1170,14 +2014,25 @@ async fn submission_loop(
                     .unwrap_or(prev.sandbox_policy.clone());
                 let new_cwd = cwd.clone().unwrap_or_else(|| prev.cwd.clone());
 
+                let include_vm_pty_tool =
+                    config.include_vm_pty_tool && sess.services.vm_pty_client.is_some();
+                let include_vm_pty_open_tool =
+                    config.include_vm_pty_open_tool && include_vm_pty_tool;
+                let route_shell_via_pty = include_vm_pty_tool
+                    && matches!(config.active_profile.as_deref(), Some("worker-pty-sandbox"));
                 let tools_config = ToolsConfig::new(&ToolsConfigParams {
                     model_family: &effective_family,
                     include_plan_tool: config.include_plan_tool,
                     include_apply_patch_tool: config.include_apply_patch_tool,
                     include_web_search_request: config.tools_web_search_request,
                     use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+                    include_shell_tool: config.include_shell_tool,
                     include_view_image_tool: config.include_view_image_tool,
+                    include_vm_pty_tool,
+                    include_vm_pty_open_tool,
+                    route_shell_via_pty,
                     experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+                    debug_tools: config.debug_tools,
                 });
 
                 let new_turn_context = TurnContext {
@@ -1189,6 +2044,10 @@ async fn submission_loop(
                     sandbox_policy: new_sandbox_policy.clone(),
                     shell_environment_policy: prev.shell_environment_policy.clone(),
                     cwd: new_cwd.clone(),
+                    vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+                    vm_pty_open_timeout: config.vm_pty_open_timeout,
+                    vm_pty_open_blocking: config.vm_pty_open_blocking,
+                    vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
                     is_review_mode: false,
                     final_output_json_schema: None,
                 };
@@ -1272,23 +2131,40 @@ async fn submission_loop(
 
                     let fresh_turn_context = TurnContext {
                         client,
-                        tools_config: ToolsConfig::new(&ToolsConfigParams {
-                            model_family: &model_family,
-                            include_plan_tool: config.include_plan_tool,
-                            include_apply_patch_tool: config.include_apply_patch_tool,
-                            include_web_search_request: config.tools_web_search_request,
-                            use_streamable_shell_tool: config
-                                .use_experimental_streamable_shell_tool,
-                            include_view_image_tool: config.include_view_image_tool,
-                            experimental_unified_exec_tool: config
-                                .use_experimental_unified_exec_tool,
-                        }),
+                        tools_config: {
+                            let include_vm_pty_tool = config.include_vm_pty_tool
+                                && sess.services.vm_pty_client.is_some();
+                            let include_vm_pty_open_tool =
+                                config.include_vm_pty_open_tool && include_vm_pty_tool;
+                            let route_shell_via_pty = include_vm_pty_tool
+                                && matches!(config.active_profile.as_deref(), Some("worker-pty-sandbox"));
+                            ToolsConfig::new(&ToolsConfigParams {
+                                model_family: &model_family,
+                                include_plan_tool: config.include_plan_tool,
+                                include_apply_patch_tool: config.include_apply_patch_tool,
+                                include_web_search_request: config.tools_web_search_request,
+                                use_streamable_shell_tool: config
+                                    .use_experimental_streamable_shell_tool,
+                                include_shell_tool: config.include_shell_tool,
+                                include_view_image_tool: config.include_view_image_tool,
+                                include_vm_pty_tool,
+                                include_vm_pty_open_tool,
+                                route_shell_via_pty,
+                                experimental_unified_exec_tool: config
+                                    .use_experimental_unified_exec_tool,
+                                debug_tools: config.debug_tools,
+                            })
+                        },
                         user_instructions: turn_context.user_instructions.clone(),
                         base_instructions: turn_context.base_instructions.clone(),
                         approval_policy,
                         sandbox_policy,
                         shell_environment_policy: turn_context.shell_environment_policy.clone(),
                         cwd,
+                        vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+                        vm_pty_open_timeout: config.vm_pty_open_timeout,
+                        vm_pty_open_blocking: config.vm_pty_open_blocking,
+                        vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
                         is_review_mode: false,
                         final_output_json_schema,
                     };
@@ -1381,13 +2257,26 @@ async fn submission_loop(
 
                 // This is a cheap lookup from the connection manager's cache.
                 let tools = sess.services.mcp_connection_manager.list_all_tools();
+                let auth_statuses = compute_auth_statuses(
+                    config.mcp_servers.iter(),
+                    config.mcp_oauth_credentials_store_mode,
+                )
+                .await;
                 let event = Event {
                     id: sub_id,
                     msg: EventMsg::McpListToolsResponse(
-                        crate::protocol::McpListToolsResponseEvent { tools },
+                        crate::protocol::McpListToolsResponseEvent {
+                            tools,
+                            auth_statuses,
+                        },
                     ),
                 };
                 sess.send_event(event).await;
+            }
+            Op::MailboxEnvelope { envelope } => {
+                let _ = sess
+                    .enqueue_mailbox_envelope(sub.id.clone(), envelope.clone(), mailbox_enabled)
+                    .await;
             }
             Op::ListCustomPrompts => {
                 let sub_id = sub.id.clone();
@@ -1494,6 +2383,295 @@ async fn submission_loop(
     debug!("Agent loop exited");
 }
 
+async fn handle_mailbox_delivery(
+    sess: &Arc<Session>,
+    mailbox_tx: &MailboxSender,
+    envelope: MailboxEnvelope,
+) {
+    let routing_mode = envelope
+        .message
+        .metadata
+        .get(ROUTING_MODE_METADATA_KEY)
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| {
+            if envelope
+                .message
+                .audience
+                .as_ref()
+                .and_then(|audience| audience.conversation_id)
+                .is_some()
+            {
+                "conversation_id"
+            } else {
+                "unknown"
+            }
+        });
+    let remaining = mailbox_tx.len();
+    let observed_at = OffsetDateTime::now_utc();
+    let expires_at = envelope
+        .message
+        .expires_at
+        .map(|ts| ts.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()));
+    let ack_deadline = envelope
+        .message
+        .ack_policy
+        .deadline
+        .map(|ts| ts.format(&Rfc3339).unwrap_or_else(|_| "<invalid>".into()));
+    let rate_scope = envelope
+        .message
+        .rate_limit
+        .as_ref()
+        .map(|r| format!("{:?}", r.scope).to_lowercase());
+    let rate_capacity = envelope
+        .message
+        .rate_limit
+        .as_ref()
+        .and_then(|r| r.capacity);
+    let rate_interval = envelope
+        .message
+        .rate_limit
+        .as_ref()
+        .and_then(|r| r.interval_seconds);
+
+    info!(
+        target: "codex::mailbox",
+        event = "delivered",
+        submission_id = %envelope.submission_id,
+        conversation_id = %sess.conversation_id,
+        message_id = %envelope.message.message_id,
+        routing_mode,
+        sender_id = %envelope.message.sender.id,
+        sender_role = ?envelope.message.sender.role,
+        priority = ?envelope.message.priority,
+        request_id = envelope.message.audit.request_id.as_deref().unwrap_or(""),
+        ack_mode = ?envelope.message.ack_policy.mode,
+        ack_deadline = ack_deadline.as_deref(),
+        expires_at = expires_at.as_deref(),
+        rate_scope = rate_scope.as_deref(),
+        rate_capacity,
+        rate_interval,
+        queue_depth = remaining,
+    );
+
+    let ingress = sess.mailbox_ingress(&envelope.message);
+    let mut delivery_event = MailboxDeliveryEvent {
+        message: envelope.message.clone(),
+        state: MailboxDeliveryState::Delivered,
+        queue_depth: Some(remaining),
+        observed_at: Some(observed_at),
+        correlation_id: Some(envelope.submission_id.clone()),
+        ingress: Some(ingress.clone()),
+        delivery_latency_ms: None,
+    };
+
+    {
+        let labels = MailboxTelemetryLabels::new(ingress, &delivery_event.message);
+        let mut telemetry = sess.mailbox_metrics.lock().await;
+        telemetry.record_delivered(&mut delivery_event, &labels);
+    }
+
+    let event = Event {
+        id: envelope.submission_id.clone(),
+        msg: EventMsg::MailboxDelivery(delivery_event.clone()),
+    };
+    sess.send_event(event).await;
+    sess.notify_mailbox_delivery_listeners(&delivery_event)
+        .await;
+    sess.notify_mailbox_predicate_waiters(&delivery_event).await;
+}
+
+async fn dispatch_mailbox_envelope(
+    client: Arc<MailboxDispatcherClient>,
+    sess: Arc<Session>,
+    mailbox_tx: MailboxSender,
+    envelope: MailboxEnvelope,
+) {
+    let routing_mode = envelope
+        .message
+        .metadata
+        .get(ROUTING_MODE_METADATA_KEY)
+        .and_then(|value| value.as_str())
+        .unwrap_or_else(|| {
+            if envelope
+                .message
+                .audience
+                .as_ref()
+                .and_then(|audience| audience.conversation_id)
+                .is_some()
+            {
+                "conversation_id"
+            } else {
+                "unknown"
+            }
+        });
+    let target_id = envelope
+        .message
+        .audience
+        .as_ref()
+        .and_then(|aud| aud.conversation_id);
+
+    let Some(target_conversation_id) = target_id else {
+        warn!(
+            target: "codex::mailbox",
+            event = "mailbox.dispatch.invalid_target",
+            submission_id = %envelope.submission_id,
+            message_id = %envelope.message.message_id,
+            "mailbox envelope missing conversation_id audience"
+        );
+        emit_mailbox_dispatch_error(
+            &sess,
+            &envelope,
+            "Mailbox dispatcher unavailable (missing conversation target)".to_string(),
+        )
+        .await;
+        return;
+    };
+
+    let source_conversation_uuid = match Uuid::parse_str(&sess.get_conversation_id().to_string()) {
+        Ok(uuid) => uuid,
+        Err(err) => {
+            warn!(
+                target: "codex::mailbox",
+                event = "mailbox.dispatch.invalid_source",
+                conversation = %sess.get_conversation_id(),
+                ?err,
+                "failed to parse source conversation id"
+            );
+            Uuid::nil()
+        }
+    };
+
+    let request_id = envelope
+        .message
+        .audit
+        .request_id
+        .clone()
+        .unwrap_or_default();
+
+    info!(
+        target: "codex::mailbox",
+        event = "mailbox.dispatch.request",
+        submission_id = %envelope.submission_id,
+        message_id = %envelope.message.message_id,
+        source_conversation = %source_conversation_uuid,
+        target_conversation = %target_conversation_id,
+        routing_mode,
+        request_id = %request_id,
+        endpoint = %client.endpoint().display(),
+        "dispatching mailbox envelope via dispatcher"
+    );
+
+    match client
+        .dispatch(
+            &envelope.submission_id,
+            source_conversation_uuid,
+            target_conversation_id,
+            &envelope.message,
+        )
+        .await
+    {
+        Ok(outcome) => match outcome.status {
+            DispatchStatus::Delivered => {
+                info!(
+                    target: "codex::mailbox",
+                    event = "mailbox.dispatch.delivered",
+                    submission_id = %envelope.submission_id,
+                    message_id = %envelope.message.message_id,
+                    routing_mode,
+                    queue_depth = outcome.queue_depth,
+                    "dispatcher reported delivery; forwarding to local handlers"
+                );
+                handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+                return;
+            }
+            DispatchStatus::QueueFull => {
+                let capacity = outcome.capacity.unwrap_or(0);
+                let message = format!("Mailbox queue is full (capacity = {capacity})");
+                emit_mailbox_dispatch_error(&sess, &envelope, message).await;
+                return;
+            }
+            DispatchStatus::InvalidRequest => {
+                let mut message = "Mailbox dispatcher unavailable".to_string();
+                if let Some(detail) = outcome.detail {
+                    if !detail.is_empty() {
+                        message.push_str(": ");
+                        message.push_str(&detail);
+                    }
+                }
+                emit_mailbox_dispatch_error(&sess, &envelope, message).await;
+                return;
+            }
+            DispatchStatus::Disabled
+            | DispatchStatus::Timeout
+            | DispatchStatus::UnknownSession
+            | DispatchStatus::TransportError
+            | DispatchStatus::DispatcherClosed => {
+                warn!(
+                    target: "codex::mailbox",
+                    event = "mailbox.dispatch.fallback",
+                    submission_id = %envelope.submission_id,
+                    message_id = %envelope.message.message_id,
+                    routing_mode,
+                    status = ?outcome.status,
+                    "dispatcher unavailable; falling back to local delivery"
+                );
+                handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+                return;
+            }
+        },
+        Err(err) => {
+            error!(
+                target: "codex::mailbox",
+                event = "mailbox.dispatch.error",
+                source_conversation = %source_conversation_uuid,
+                %target_conversation_id,
+                %request_id,
+                submission_id = %envelope.submission_id,
+                message_id = %envelope.message.message_id,
+                routing_mode,
+                ?err,
+                "failed to forward mailbox envelope via dispatcher"
+            );
+
+            warn!(
+                target: "codex::mailbox",
+                event = "mailbox.dispatch.fallback",
+                submission_id = %envelope.submission_id,
+                message_id = %envelope.message.message_id,
+                routing_mode,
+                "dispatcher error; falling back to local delivery"
+            );
+
+            handle_mailbox_delivery(&sess, &mailbox_tx, envelope).await;
+            return;
+        }
+    }
+}
+
+async fn emit_mailbox_dispatch_error(
+    sess: &Arc<Session>,
+    envelope: &MailboxEnvelope,
+    message: String,
+) {
+    warn!(
+        target: "codex::mailbox",
+        event = "mailbox.dispatch.failed",
+        submission_id = %envelope.submission_id,
+        message_id = %envelope.message.message_id,
+        sender_id = %envelope.message.sender.id,
+        detail = %message,
+        "dispatcher delivery failed"
+    );
+
+    let event = Event {
+        id: envelope.submission_id.clone(),
+        msg: EventMsg::Error(ErrorEvent { message }),
+    };
+    sess.send_event(event).await;
+    sess.cancel_mailbox_delivery_listener(envelope.message.message_id)
+        .await;
+}
+
 /// Spawn a review thread using the given prompt.
 async fn spawn_review_thread(
     sess: Arc<Session>,
@@ -1511,8 +2689,13 @@ async fn spawn_review_thread(
         include_apply_patch_tool: config.include_apply_patch_tool,
         include_web_search_request: false,
         use_streamable_shell_tool: false,
+        include_shell_tool: false,
         include_view_image_tool: false,
+        include_vm_pty_tool: false,
+        include_vm_pty_open_tool: false,
+        route_shell_via_pty: false,
         experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+        debug_tools: config.debug_tools,
     });
 
     let base_instructions = REVIEW_PROMPT.to_string();
@@ -1559,13 +2742,17 @@ async fn spawn_review_thread(
         sandbox_policy: parent_turn_context.sandbox_policy.clone(),
         shell_environment_policy: parent_turn_context.shell_environment_policy.clone(),
         cwd: parent_turn_context.cwd.clone(),
+        vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+        vm_pty_open_timeout: config.vm_pty_open_timeout,
+        vm_pty_open_blocking: config.vm_pty_open_blocking,
+        vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
         is_review_mode: true,
         final_output_json_schema: None,
     };
 
     // Seed the child task with the review prompt as the initial user message.
     let input: Vec<InputItem> = vec![InputItem::Text {
-        text: format!("{base_instructions}\n\n---\n\nNow, here's your task: {review_prompt}"),
+        text: review_prompt,
     }];
     let tc = Arc::new(review_turn_context);
 
@@ -1633,7 +2820,7 @@ pub(crate) async fn run_task(
     let mut last_agent_message: Option<String> = None;
     // Although from the perspective of codex.rs, TurnDiffTracker has the lifecycle of a Task which contains
     // many turns, from the perspective of the user, it is a single turn.
-    let mut turn_diff_tracker = TurnDiffTracker::new();
+    let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
     let mut auto_compact_recently_attempted = false;
 
     loop {
@@ -1663,8 +2850,32 @@ pub(crate) async fn run_task(
             }
             review_thread_history.clone()
         } else {
+            // Preserve existing behavior: record pending items to history and rollout.
             sess.record_conversation_items(&pending_input).await;
-            sess.turn_input_with_history(pending_input).await
+
+            // Route prompt assembly through the sliding window prompt builder.
+            // If summaries are unavailable, the builder returns `history + pending` unchanged.
+            let history = sess.history_snapshot().await;
+
+            // Snapshot summaries state if the background service is enabled.
+            let summaries_state_snapshot: SlidingSummariesState = {
+                let svc_opt = {
+                    let guard = sess.services.summaries.lock().await;
+                    guard.as_ref().map(|svc| svc.state_arc())
+                };
+                if let Some(state_arc) = svc_opt {
+                    let s = state_arc.lock().await;
+                    s.clone()
+                } else {
+                    SlidingSummariesState::default()
+                }
+            };
+
+            // Budget is currently measured in item count; pass the full length
+            // so default behavior (no trimming) is preserved unless a future
+            // change opts into a smaller budget.
+            let budget = history.len().saturating_add(pending_input.len());
+            build_sliding_window_prompt(&summaries_state_snapshot, &history, &pending_input, budget)
         };
 
         let turn_input_messages: Vec<String> = turn_input
@@ -1681,9 +2892,9 @@ pub(crate) async fn run_task(
             })
             .collect();
         match run_turn(
-            &sess,
-            turn_context.as_ref(),
-            &mut turn_diff_tracker,
+            Arc::clone(&sess),
+            Arc::clone(&turn_context),
+            Arc::clone(&turn_diff_tracker),
             sub_id.clone(),
             turn_input,
         )
@@ -1906,18 +3117,27 @@ fn parse_review_output_event(text: &str) -> ReviewOutputEvent {
 }
 
 async fn run_turn(
-    sess: &Session,
-    turn_context: &TurnContext,
-    turn_diff_tracker: &mut TurnDiffTracker,
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    turn_diff_tracker: SharedTurnDiffTracker,
     sub_id: String,
     input: Vec<ResponseItem>,
 ) -> CodexResult<TurnRunResult> {
     let mcp_tools = sess.services.mcp_connection_manager.list_all_tools();
-    let router = ToolRouter::from_config(&turn_context.tools_config, Some(mcp_tools));
+    let router = Arc::new(ToolRouter::from_config(
+        &turn_context.tools_config,
+        Some(mcp_tools),
+    ));
 
+    let model_supports_parallel = turn_context
+        .client
+        .get_model_family()
+        .supports_parallel_tool_calls;
+    let parallel_tool_calls = model_supports_parallel;
     let prompt = Prompt {
         input,
-        tools: router.specs().to_vec(),
+        tools: router.specs(),
+        parallel_tool_calls,
         base_instructions_override: turn_context.base_instructions.clone(),
         output_schema: turn_context.final_output_json_schema.clone(),
     };
@@ -1925,10 +3145,10 @@ async fn run_turn(
     let mut retries = 0;
     loop {
         match try_run_turn(
-            &router,
-            sess,
-            turn_context,
-            turn_diff_tracker,
+            Arc::clone(&router),
+            Arc::clone(&sess),
+            Arc::clone(&turn_context),
+            Arc::clone(&turn_diff_tracker),
             &sub_id,
             &prompt,
         )
@@ -1938,6 +3158,10 @@ async fn run_turn(
             Err(CodexErr::Interrupted) => return Err(CodexErr::Interrupted),
             Err(CodexErr::EnvVar(var)) => return Err(CodexErr::EnvVar(var)),
             Err(e @ CodexErr::Fatal(_)) => return Err(e),
+            Err(e @ CodexErr::ContextWindowExceeded) => {
+                sess.set_total_tokens_full(&sub_id, &turn_context).await;
+                return Err(e);
+            }
             Err(CodexErr::UsageLimitReached(e)) => {
                 let rate_limits = e.rate_limits.clone();
                 if let Some(rate_limits) = rate_limits {
@@ -1964,9 +3188,7 @@ async fn run_turn(
                     // at a seemingly frozen screen.
                     sess.notify_stream_error(
                         &sub_id,
-                        format!(
-                            "stream error: {e}; retrying {retries}/{max_retries} in {delay:?}…"
-                        ),
+                        format!("Re-connecting... {retries}/{max_retries}"),
                     )
                     .await;
 
@@ -1984,9 +3206,9 @@ async fn run_turn(
 /// "handled" such that it produces a `ResponseInputItem` that needs to be
 /// sent back to the model on the next turn.
 #[derive(Debug)]
-struct ProcessedResponseItem {
-    item: ResponseItem,
-    response: Option<ResponseInputItem>,
+pub(crate) struct ProcessedResponseItem {
+    pub(crate) item: ResponseItem,
+    pub(crate) response: Option<ResponseInputItem>,
 }
 
 #[derive(Debug)]
@@ -1996,10 +3218,10 @@ struct TurnRunResult {
 }
 
 async fn try_run_turn(
-    router: &crate::tools::ToolRouter,
-    sess: &Session,
-    turn_context: &TurnContext,
-    turn_diff_tracker: &mut TurnDiffTracker,
+    router: Arc<ToolRouter>,
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
+    turn_diff_tracker: SharedTurnDiffTracker,
     sub_id: &str,
     prompt: &Prompt,
 ) -> CodexResult<TurnRunResult> {
@@ -2069,44 +3291,102 @@ async fn try_run_turn(
     sess.persist_rollout_items(&[rollout_item]).await;
     let mut stream = turn_context.client.clone().stream(&prompt).await?;
 
-    let mut output = Vec::new();
+    let tool_runtime = ToolCallRuntime::new(
+        Arc::clone(&router),
+        Arc::clone(&sess),
+        Arc::clone(&turn_context),
+        Arc::clone(&turn_diff_tracker),
+        sub_id.to_string(),
+    );
+    let mut output: FuturesOrdered<BoxFuture<CodexResult<ProcessedResponseItem>>> =
+        FuturesOrdered::new();
 
     loop {
         // Poll the next item from the model stream. We must inspect *both* Ok and Err
         // cases so that transient stream failures (e.g., dropped SSE connection before
         // `response.completed`) bubble up and trigger the caller's retry logic.
         let event = stream.next().await;
-        let Some(event) = event else {
-            // Channel closed without yielding a final Completed event or explicit error.
-            // Treat as a disconnected stream so the caller can retry.
-            return Err(CodexErr::Stream(
-                "stream closed before response.completed".into(),
-                None,
-            ));
+        let event = match event {
+            Some(res) => res?,
+            None => {
+                return Err(CodexErr::Stream(
+                    "stream closed before response.completed".into(),
+                    None,
+                ));
+            }
         };
 
-        let event = match event {
-            Ok(ev) => ev,
-            Err(e) => {
-                // Propagate the underlying stream error to the caller (run_turn), which
-                // will apply the configured `stream_max_retries` policy.
-                return Err(e);
-            }
+        let add_completed = &mut |response_item: ProcessedResponseItem| {
+            output.push_back(future::ready(Ok(response_item)).boxed());
         };
 
         match event {
             ResponseEvent::Created => {}
             ResponseEvent::OutputItemDone(item) => {
-                let response = handle_response_item(
-                    router,
-                    sess,
-                    turn_context,
-                    turn_diff_tracker,
-                    sub_id,
-                    item.clone(),
-                )
-                .await?;
-                output.push(ProcessedResponseItem { item, response });
+                match ToolRouter::build_tool_call(sess.as_ref(), item.clone()) {
+                    Ok(Some(call)) => {
+                        let payload_preview = call.payload.log_payload().into_owned();
+                        tracing::info!("ToolCall: {} {}", call.tool_name, payload_preview);
+
+                        let response = tool_runtime.handle_tool_call(call);
+
+                        output.push_back(
+                            async move {
+                                Ok(ProcessedResponseItem {
+                                    item,
+                                    response: Some(response.await?),
+                                })
+                            }
+                            .boxed(),
+                        );
+                    }
+                    Ok(None) => {
+                        let response = handle_non_tool_response_item(
+                            Arc::clone(&sess),
+                            Arc::clone(&turn_context),
+                            sub_id,
+                            item.clone(),
+                        )
+                        .await?;
+                        add_completed(ProcessedResponseItem { item, response });
+                    }
+                    Err(FunctionCallError::MissingLocalShellCallId) => {
+                        let msg = "LocalShellCall without call_id or id";
+                        turn_context
+                            .client
+                            .get_otel_event_manager()
+                            .log_tool_failed("local_shell", msg);
+                        error!(msg);
+
+                        let response = ResponseInputItem::FunctionCallOutput {
+                            call_id: String::new(),
+                            output: FunctionCallOutputPayload {
+                                content: msg.to_string(),
+                                success: None,
+                            },
+                        };
+                        add_completed(ProcessedResponseItem {
+                            item,
+                            response: Some(response),
+                        });
+                    }
+                    Err(FunctionCallError::RespondToModel(message)) => {
+                        let response = ResponseInputItem::FunctionCallOutput {
+                            call_id: String::new(),
+                            output: FunctionCallOutputPayload {
+                                content: message,
+                                success: None,
+                            },
+                        };
+                        add_completed(ProcessedResponseItem {
+                            item,
+                            response: Some(response),
+                        });
+                    }
+                    Err(FunctionCallError::Fatal(message)) => {
+                        return Err(CodexErr::Fatal(message));
+                    }
+                }
             }
             ResponseEvent::WebSearchCallBegin { call_id } => {
                 let _ = sess
@@ -2126,10 +3406,15 @@ async fn try_run_turn(
                 response_id: _,
                 token_usage,
             } => {
-                sess.update_token_usage_info(sub_id, turn_context, token_usage.as_ref())
+                sess.update_token_usage_info(sub_id, turn_context.as_ref(), token_usage.as_ref())
                     .await;
 
-                let unified_diff = turn_diff_tracker.get_unified_diff();
+                let processed_items: Vec<ProcessedResponseItem> = output.try_collect().await?;
+
+                let unified_diff = {
+                    let mut tracker = turn_diff_tracker.lock().await;
+                    tracker.get_unified_diff()
+                };
                 if let Ok(Some(unified_diff)) = unified_diff {
                     let msg = EventMsg::TurnDiff(TurnDiffEvent { unified_diff });
                     let event = Event {
@@ -2140,7 +3425,7 @@ async fn try_run_turn(
                 }
 
                 let result = TurnRunResult {
-                    processed_items: output,
+                    processed_items,
                     total_token_usage: token_usage.clone(),
                 };
 
@@ -2173,6 +3458,24 @@ async fn try_run_turn(
                 };
                 sess.send_event(event).await;
             }
+            ResponseEvent::Heartbeat(liveness) => {
+                if let Some(snapshot) = sess.record_mailbox_liveness(liveness.transport_lag).await {
+                    let transport_lag_ms =
+                        snapshot.transport_lag.as_millis().min(u128::from(u64::MAX)) as u64;
+                    let queue_depth = snapshot.queue_depth.min(u32::MAX as usize) as u32;
+
+                    let event = Event {
+                        id: sub_id.to_string(),
+                        msg: EventMsg::Heartbeat(HeartbeatEvent {
+                            observed_at: snapshot.observed_at,
+                            transport_lag_ms: Some(transport_lag_ms),
+                            queue_depth: Some(queue_depth),
+                            liveness: Some(snapshot.state),
+                        }),
+                    };
+                    sess.send_event(event).await;
+                }
+            }
             ResponseEvent::ReasoningContentDelta(delta) => {
                 if sess.show_raw_agent_reasoning() {
                     let event = Event {
@@ -2188,88 +3491,40 @@ async fn try_run_turn(
     }
 }
 
-async fn handle_response_item(
-    router: &crate::tools::ToolRouter,
-    sess: &Session,
-    turn_context: &TurnContext,
-    turn_diff_tracker: &mut TurnDiffTracker,
+async fn handle_non_tool_response_item(
+    sess: Arc<Session>,
+    turn_context: Arc<TurnContext>,
     sub_id: &str,
     item: ResponseItem,
 ) -> CodexResult<Option<ResponseInputItem>> {
     debug!(?item, "Output item");
 
-    match ToolRouter::build_tool_call(sess, item.clone()) {
-        Ok(Some(call)) => {
-            let payload_preview = call.payload.log_payload().into_owned();
-            tracing::info!("ToolCall: {} {}", call.tool_name, payload_preview);
-            match router
-                .dispatch_tool_call(sess, turn_context, turn_diff_tracker, sub_id, call)
-                .await
-            {
-                Ok(response) => Ok(Some(response)),
-                Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
-                Err(other) => unreachable!("non-fatal tool error returned: {other:?}"),
+    match &item {
+        ResponseItem::Message { .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::WebSearchCall { .. } => {
+            let msgs = match &item {
+                ResponseItem::Message { .. } if turn_context.is_review_mode => {
+                    trace!("suppressing assistant Message in review mode");
+                    Vec::new()
+                }
+                _ => map_response_item_to_event_messages(&item, sess.show_raw_agent_reasoning()),
+            };
+            for msg in msgs {
+                let event = Event {
+                    id: sub_id.to_string(),
+                    msg,
+                };
+                sess.send_event(event).await;
             }
         }
-        Ok(None) => {
-            match &item {
-                ResponseItem::Message { .. }
-                | ResponseItem::Reasoning { .. }
-                | ResponseItem::WebSearchCall { .. } => {
-                    let msgs = match &item {
-                        ResponseItem::Message { .. } if turn_context.is_review_mode => {
-                            trace!("suppressing assistant Message in review mode");
-                            Vec::new()
-                        }
-                        _ => map_response_item_to_event_messages(
-                            &item,
-                            sess.show_raw_agent_reasoning(),
-                        ),
-                    };
-                    for msg in msgs {
-                        let event = Event {
-                            id: sub_id.to_string(),
-                            msg,
-                        };
-                        sess.send_event(event).await;
-                    }
-                }
-                ResponseItem::FunctionCallOutput { .. }
-                | ResponseItem::CustomToolCallOutput { .. } => {
-                    debug!("unexpected tool output from stream");
-                }
-                _ => {}
-            }
-
-            Ok(None)
+        ResponseItem::FunctionCallOutput { .. } | ResponseItem::CustomToolCallOutput { .. } => {
+            debug!("unexpected tool output from stream");
         }
-        Err(FunctionCallError::MissingLocalShellCallId) => {
-            let msg = "LocalShellCall without call_id or id";
-            turn_context
-                .client
-                .get_otel_event_manager()
-                .log_tool_failed("local_shell", msg);
-            error!(msg);
-
-            Ok(Some(ResponseInputItem::FunctionCallOutput {
-                call_id: String::new(),
-                output: FunctionCallOutputPayload {
-                    content: msg.to_string(),
-                    success: None,
-                },
-            }))
-        }
-        Err(FunctionCallError::RespondToModel(msg)) => {
-            Ok(Some(ResponseInputItem::FunctionCallOutput {
-                call_id: String::new(),
-                output: FunctionCallOutputPayload {
-                    content: msg,
-                    success: None,
-                },
-            }))
-        }
-        Err(FunctionCallError::Fatal(message)) => Err(CodexErr::Fatal(message)),
+        _ => {}
     }
+
+    Ok(None)
 }
 
 pub(super) fn get_last_assistant_message_from_turn(responses: &[ResponseItem]) -> Option<String> {
@@ -2389,7 +3644,7 @@ use crate::tools::context::ExecCommandContext;
 pub(crate) use tests::make_session_and_context;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::ConfigOverrides;
     use crate::config::ConfigToml;
@@ -2411,16 +3666,234 @@ mod tests {
     use codex_protocol::models::ContentItem;
     use codex_protocol::models::ResponseItem;
 
+    use anyhow::Context as _;
     use mcp_types::ContentBlock;
     use mcp_types::TextContent;
     use pretty_assertions::assert_eq;
     use serde::Deserialize;
     use serde_json::json;
+    use tokio::task::JoinHandle;
+    use tokio::task::yield_now;
+
+    pub(crate) struct MailboxTestGuard {
+        _env_guard: MailboxEnvGuard,
+        _home: tempfile::TempDir,
+        _cwd: tempfile::TempDir,
+    }
+
+    struct MailboxEnvGuard {
+        keys: [&'static str; 2],
+    }
+
+    impl MailboxEnvGuard {
+        fn new() -> Self {
+            // SAFETY: test harness serializes access to this env var.
+            unsafe {
+                std::env::set_var("CODEX_MAILBOX_OOB_FORCE", "1");
+                std::env::set_var("CODEX_MAILBOX_OOB", "1");
+            }
+            Self {
+                keys: ["CODEX_MAILBOX_OOB_FORCE", "CODEX_MAILBOX_OOB"],
+            }
+        }
+    }
+
+    impl Drop for MailboxEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: test harness serializes access to this env var.
+            unsafe {
+                for key in self.keys {
+                    std::env::remove_var(key);
+                }
+            }
+        }
+    }
+
+    struct EnvVarOverride {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarOverride {
+        fn set(key: &'static str, value: impl AsRef<str>) -> Self {
+            let previous = std::env::var(key).ok();
+            // SAFETY: tests serialize access to these vars.
+            unsafe {
+                std::env::set_var(key, value.as_ref());
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarOverride {
+        fn drop(&mut self) {
+            // SAFETY: tests serialize access to these vars.
+            unsafe {
+                if let Some(prev) = &self.previous {
+                    std::env::set_var(self.key, prev);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn spawn_test_mailbox_session() -> anyhow::Result<(
+        MailboxTestGuard,
+        Arc<Session>,
+        Arc<TurnContext>,
+        JoinHandle<()>,
+    )> {
+        let env_guard = MailboxEnvGuard::new();
+        let home = tempfile::tempdir().context("create codex home")?;
+        let cwd = tempfile::tempdir().context("create cwd")?;
+
+        let mut config = Config::load_from_base_config_with_overrides(
+            ConfigToml::default(),
+            ConfigOverrides::default(),
+            home.path().to_path_buf(),
+        )
+        .context("load default config")?;
+        config.cwd = cwd.path().to_path_buf();
+
+        let config_arc = Arc::new(config.clone());
+        let auth_manager = AuthManager::shared(config.codex_home.clone(), true);
+        let (tx_event, _rx_event) = async_channel::unbounded();
+        let (mailbox_tx, mailbox_rx) = mailbox_channel(MAILBOX_QUEUE_CAPACITY);
+
+        let configure_session = ConfigureSession {
+            provider: config.model_provider.clone(),
+            model: config.model.clone(),
+            model_reasoning_effort: config.model_reasoning_effort,
+            model_reasoning_summary: config.model_reasoning_summary,
+            user_instructions: config.user_instructions.clone(),
+            base_instructions: config.base_instructions.clone(),
+            approval_policy: config.approval_policy,
+            sandbox_policy: config.sandbox_policy.clone(),
+            notify: UserNotifier::default(),
+            cwd: config.cwd.clone(),
+        };
+
+        let (session, turn_context) = Session::new(
+            configure_session,
+            Arc::clone(&config_arc),
+            auth_manager,
+            tx_event,
+            InitialHistory::New,
+            SessionSource::Exec,
+            mailbox_tx.clone(),
+        )
+        .await
+        .context("failed to initialize session")?;
+
+        let include_vm_pty_tool =
+            config_arc.include_vm_pty_tool && session.services.vm_pty_client.is_some();
+        let include_vm_pty_open_tool =
+            config_arc.include_vm_pty_open_tool && include_vm_pty_tool;
+        let handler_turn_context = Arc::new(TurnContext {
+            client: turn_context.client.clone(),
+            cwd: turn_context.cwd.clone(),
+            base_instructions: turn_context.base_instructions.clone(),
+            user_instructions: turn_context.user_instructions.clone(),
+            approval_policy: turn_context.approval_policy,
+            sandbox_policy: turn_context.sandbox_policy.clone(),
+            shell_environment_policy: turn_context.shell_environment_policy.clone(),
+            tools_config: ToolsConfig::new(&ToolsConfigParams {
+                model_family: &config_arc.model_family,
+                include_plan_tool: config_arc.include_plan_tool,
+                include_apply_patch_tool: config_arc.include_apply_patch_tool,
+                include_web_search_request: config_arc.tools_web_search_request,
+                use_streamable_shell_tool: config_arc.use_experimental_streamable_shell_tool,
+                include_shell_tool: config_arc.include_shell_tool,
+                include_view_image_tool: config_arc.include_view_image_tool,
+                include_vm_pty_tool,
+                include_vm_pty_open_tool,
+                route_shell_via_pty: false,
+                experimental_unified_exec_tool: config_arc.use_experimental_unified_exec_tool,
+                debug_tools: config_arc.debug_tools,
+            }),
+            vm_pty_default_vm_id: config_arc.vm_pty_default_vm_id.clone(),
+            vm_pty_open_timeout: config_arc.vm_pty_open_timeout,
+            vm_pty_open_blocking: config_arc.vm_pty_open_blocking,
+            vm_pty_max_concurrent_per_worker: config_arc.vm_pty_max_concurrent_per_worker,
+            is_review_mode: false,
+            final_output_json_schema: None,
+        });
+
+        let (tx_sub, rx_sub) = async_channel::bounded(SUBMISSION_CHANNEL_CAPACITY);
+        drop(tx_sub);
+
+        let submission_task = tokio::spawn(submission_loop(
+            Arc::clone(&session),
+            turn_context,
+            Arc::clone(&config_arc),
+            rx_sub,
+            mailbox_tx,
+            mailbox_rx,
+            None,
+        ));
+
+        let guard = MailboxTestGuard {
+            _env_guard: env_guard,
+            _home: home,
+            _cwd: cwd,
+        };
+
+        Ok((guard, session, handler_turn_context, submission_task))
+    }
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration as StdDuration;
     use tokio::time::Duration;
     use tokio::time::sleep;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn dispatcher_falls_back_to_local_delivery_when_unavailable() -> anyhow::Result<()> {
+        let (_guard, session, _turn_context, submission_task) =
+            spawn_test_mailbox_session().await.expect("spawn session");
+
+        let temp_dir = tempfile::TempDir::new().context("temp dir")?;
+        let endpoint = temp_dir.path().join("dispatcher.sock");
+
+        let _force = EnvVarOverride::set("CODEX_MAIL_SERVER_FORCE", "1");
+        let _endpoint = EnvVarOverride::set(
+            "CODEX_MAIL_SERVER_ENDPOINT",
+            endpoint.to_string_lossy().to_string(),
+        );
+        let _disable = EnvVarOverride::set("CODEX_MAIL_SERVER_DISABLE", "0");
+
+        let client =
+            MailboxDispatcherClient::from_env().expect("dispatcher client should be constructed");
+        let client = Arc::new(client);
+
+        let target_id = Uuid::now_v7();
+        let message_id = Uuid::now_v7();
+        let message = serde_json::from_value::<MailboxMessage>(json!({
+            "message_id": message_id,
+            "priority": "normal",
+            "sender": { "id": "system.test", "role": "system" },
+            "body": { "subject": "Fallback check", "content": "hello", "content_type": "text/plain" },
+            "audit": { "request_id": "REQ-fallback" },
+            "audience": { "conversation_id": target_id }
+        }))
+        .expect("valid mailbox message");
+
+        let envelope = MailboxEnvelope::new("sub-fallback".to_string(), message.clone());
+
+        let receiver = session
+            .register_mailbox_delivery_listener(message.message_id)
+            .await;
+
+        let (mailbox_tx, _mailbox_rx) = mailbox_channel(MAILBOX_QUEUE_CAPACITY);
+
+        dispatch_mailbox_envelope(client, Arc::clone(&session), mailbox_tx, envelope).await;
+
+        let delivery = receiver.await.expect("delivery event");
+        assert_eq!(delivery.state, MailboxDeliveryState::Delivered);
+
+        submission_task.abort();
+        Ok(())
+    }
 
     #[test]
     fn reconstruct_history_matches_live_compactions() {
@@ -2505,13 +3978,19 @@ mod tests {
 
         let out = format_exec_output_str(&exec);
 
+        // Strip truncation header if present for subsequent assertions
+        let body = out
+            .strip_prefix("Total output lines: ")
+            .and_then(|rest| rest.split_once("\n\n").map(|x| x.1))
+            .unwrap_or(out.as_str());
+
         // Expect elision marker with correct counts
         let omitted = 400 - MODEL_FORMAT_MAX_LINES; // 144
         let marker = format!("\n[... omitted {omitted} of 400 lines ...]\n\n");
         assert!(out.contains(&marker), "missing marker: {out}");
 
         // Validate head and tail
-        let parts: Vec<&str> = out.split(&marker).collect();
+        let parts: Vec<&str> = body.split(&marker).collect();
         assert_eq!(parts.len(), 2, "expected one marker split");
         let head = parts[0];
         let tail = parts[1];
@@ -2547,14 +4026,19 @@ mod tests {
         };
 
         let out = format_exec_output_str(&exec);
-        assert!(out.len() <= MODEL_FORMAT_MAX_BYTES, "exceeds byte budget");
+        // Keep strict budget on the truncated body (excluding header)
+        let body = out
+            .strip_prefix("Total output lines: ")
+            .and_then(|rest| rest.split_once("\n\n").map(|x| x.1))
+            .unwrap_or(out.as_str());
+        assert!(body.len() <= MODEL_FORMAT_MAX_BYTES, "exceeds byte budget");
         assert!(out.contains("omitted"), "should contain elision marker");
 
         // Ensure head and tail are drawn from the original
-        assert!(full.starts_with(out.chars().take(8).collect::<String>().as_str()));
+        assert!(full.starts_with(body.chars().take(8).collect::<String>().as_str()));
         assert!(
             full.ends_with(
-                out.chars()
+                body.chars()
                     .rev()
                     .take(8)
                     .collect::<String>()
@@ -2637,6 +4121,177 @@ mod tests {
         assert_eq!(expected, got);
     }
 
+    #[tokio::test]
+    async fn wait_trigger_completion_injects_and_emits_mailbox() {
+        let _env_guard = MailboxEnvGuard::new();
+        assert!(crate::mailbox::mailbox_feature_enabled());
+        let (session, _tc, _rx) = make_session_and_context_with_rx();
+        {
+            let mut active = session.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+
+        let handle = session
+            .schedule_wait_trigger("sub-mail", "call-mail", WaitTriggerSpec::new("timer"))
+            .await
+            .expect("schedule wait trigger");
+
+        let completion = WaitTriggerCompletion::default().with_inputs(vec![
+            ResponseInputItem::FunctionCallOutput {
+                call_id: "call-mail".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "completed".to_string(),
+                    success: Some(true),
+                },
+            },
+        ]);
+
+        handle.complete(completion).await.expect("complete");
+
+        yield_now().await;
+        sleep(StdDuration::from_millis(20)).await;
+
+        #[cfg(test)]
+        {
+            let events = session.wait_trigger_mailbox_events.lock().await;
+            let failures = session.wait_trigger_mailbox_failures.lock().await;
+            assert!(events.len() + failures.len() <= 1);
+            if let Some(event) = events.first() {
+                assert_eq!(event.message.sender.role, MailboxSenderRole::Automation);
+            }
+            if let Some(err) = failures.first() {
+                assert!(matches!(
+                    err,
+                    MailboxEnqueueError::Closed
+                        | MailboxEnqueueError::Disabled
+                        | MailboxEnqueueError::Full { .. }
+                ));
+            }
+        }
+
+        let pending = session.get_pending_input().await;
+        assert_eq!(pending.len(), 1);
+        match &pending[0] {
+            ResponseInputItem::FunctionCallOutput { call_id, output } => {
+                assert_eq!(call_id, "call-mail");
+                assert_eq!(output.content, "completed");
+            }
+            other => panic!("unexpected pending input: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_trigger_cancellation_clears_state() {
+        let (session, _tc, _rx) = make_session_and_context_with_rx();
+        {
+            let mut active = session.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+
+        let handle = session
+            .schedule_wait_trigger("sub-cancel", "call-cancel", WaitTriggerSpec::new("fs"))
+            .await
+            .expect("schedule wait trigger");
+
+        handle.cancel().await.expect("cancel wait trigger");
+        yield_now().await;
+
+        {
+            let guard = session.wait_triggers.lock().await;
+            assert!(guard.is_empty());
+        }
+
+        let active = session.active_turn.lock().await;
+        if let Some(at) = active.as_ref() {
+            let ts = at.turn_state.lock().await;
+            assert_eq!(ts.trigger_count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_trigger_quota_is_enforced() {
+        let (session, _tc, _rx) = make_session_and_context_with_rx();
+        {
+            let mut active = session.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+
+        let mut handles = Vec::new();
+        for idx in 0..MAX_WAIT_TRIGGERS_PER_TURN {
+            let spec = WaitTriggerSpec::new(format!("timer-{idx}"));
+            let handle = session
+                .schedule_wait_trigger("sub-quota", &format!("call-{idx}"), spec)
+                .await
+                .expect("within quota");
+            handles.push(handle);
+        }
+
+        let result = session
+            .schedule_wait_trigger("sub-quota", "call-over", WaitTriggerSpec::new("overflow"))
+            .await;
+        let err = match result {
+            Err(err) => err,
+            Ok(handle) => {
+                let _ = handle.cancel().await;
+                panic!("quota should be exceeded");
+            }
+        };
+        match err {
+            WaitTriggerError::QuotaExceeded { limit } => {
+                assert_eq!(limit, MAX_WAIT_TRIGGERS_PER_TURN);
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+
+        for handle in handles {
+            let _ = handle.cancel().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn wait_trigger_persists_until_completion() {
+        let (session, _tc, _rx) = make_session_and_context_with_rx();
+        {
+            let mut active = session.active_turn.lock().await;
+            *active = Some(ActiveTurn::default());
+        }
+
+        let handle = session
+            .schedule_wait_trigger("sub-persist", "call-persist", WaitTriggerSpec::new("shell"))
+            .await
+            .expect("schedule wait trigger");
+
+        let pending = session.get_pending_input().await;
+        assert!(pending.is_empty());
+
+        {
+            let active = session.active_turn.lock().await;
+            let at = active.as_ref().expect("active turn");
+            let ts = at.turn_state.lock().await;
+            assert_eq!(ts.trigger_count(), 1);
+        }
+
+        let completion = WaitTriggerCompletion::default().with_inputs(vec![
+            ResponseInputItem::FunctionCallOutput {
+                call_id: "call-persist".to_string(),
+                output: FunctionCallOutputPayload {
+                    content: "persist".to_string(),
+                    success: Some(true),
+                },
+            },
+        ]);
+
+        handle.complete(completion).await.expect("complete");
+        yield_now().await;
+
+        {
+            let active = session.active_turn.lock().await;
+            let at = active.as_ref().expect("active turn");
+            let ts = at.turn_state.lock().await;
+            assert_eq!(ts.trigger_count(), 0);
+        }
+    }
+
     fn text_block(s: &str) -> ContentBlock {
         ContentBlock::TextContent(TextContent {
             annotations: None,
@@ -2684,8 +4339,13 @@ mod tests {
             include_apply_patch_tool: config.include_apply_patch_tool,
             include_web_search_request: config.tools_web_search_request,
             use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+            include_shell_tool: config.include_shell_tool,
             include_view_image_tool: config.include_view_image_tool,
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+            include_vm_pty_tool: config.include_vm_pty_tool,
+            include_vm_pty_open_tool: config.include_vm_pty_open_tool,
+            route_shell_via_pty: false,
+            debug_tools: config.debug_tools,
         });
         let turn_context = TurnContext {
             client,
@@ -2696,6 +4356,10 @@ mod tests {
             sandbox_policy: config.sandbox_policy.clone(),
             shell_environment_policy: config.shell_environment_policy.clone(),
             tools_config,
+            vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+            vm_pty_open_timeout: config.vm_pty_open_timeout,
+            vm_pty_open_blocking: config.vm_pty_open_blocking,
+            vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
             is_review_mode: false,
             final_output_json_schema: None,
         };
@@ -2711,8 +4375,13 @@ mod tests {
                 turn_context.sandbox_policy.clone(),
                 turn_context.cwd.clone(),
                 None,
+                false,
             )),
+            summaries: Mutex::new(None),
+            vm_pty_client: None,
+            pty_sessions: Mutex::new(Default::default()),
         };
+        let (mailbox_tx, _) = mailbox_channel(1);
         let session = Session {
             conversation_id,
             tx_event,
@@ -2720,6 +4389,17 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            mailbox_tx,
+            #[cfg(test)]
+            wait_trigger_mailbox_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
+            wait_triggers: Mutex::new(HashMap::new()),
+            mailbox_waiters: Mutex::new(HashMap::new()),
+            mailbox_predicate_waiters: Mutex::new(Vec::new()),
+            session_source: SessionSource::Cli,
+            mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
+            mailbox_liveness: None,
         };
         (session, turn_context)
     }
@@ -2757,8 +4437,13 @@ mod tests {
             include_apply_patch_tool: config.include_apply_patch_tool,
             include_web_search_request: config.tools_web_search_request,
             use_streamable_shell_tool: config.use_experimental_streamable_shell_tool,
+            include_shell_tool: config.include_shell_tool,
             include_view_image_tool: config.include_view_image_tool,
             experimental_unified_exec_tool: config.use_experimental_unified_exec_tool,
+            include_vm_pty_tool: config.include_vm_pty_tool,
+            include_vm_pty_open_tool: config.include_vm_pty_open_tool,
+            route_shell_via_pty: false,
+            debug_tools: config.debug_tools,
         });
         let turn_context = Arc::new(TurnContext {
             client,
@@ -2769,6 +4454,10 @@ mod tests {
             sandbox_policy: config.sandbox_policy.clone(),
             shell_environment_policy: config.shell_environment_policy.clone(),
             tools_config,
+            vm_pty_default_vm_id: config.vm_pty_default_vm_id.clone(),
+            vm_pty_open_timeout: config.vm_pty_open_timeout,
+            vm_pty_open_blocking: config.vm_pty_open_blocking,
+            vm_pty_max_concurrent_per_worker: config.vm_pty_max_concurrent_per_worker,
             is_review_mode: false,
             final_output_json_schema: None,
         });
@@ -2784,8 +4473,13 @@ mod tests {
                 config.sandbox_policy.clone(),
                 config.cwd.clone(),
                 None,
+                false,
             )),
+            summaries: Mutex::new(None),
+            vm_pty_client: None,
+            pty_sessions: Mutex::new(Default::default()),
         };
+        let (mailbox_tx, _) = mailbox_channel(1);
         let session = Arc::new(Session {
             conversation_id,
             tx_event,
@@ -2793,6 +4487,17 @@ mod tests {
             active_turn: Mutex::new(None),
             services,
             next_internal_sub_id: AtomicU64::new(0),
+            mailbox_tx,
+            #[cfg(test)]
+            wait_trigger_mailbox_events: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            wait_trigger_mailbox_failures: Mutex::new(Vec::new()),
+            wait_triggers: Mutex::new(HashMap::new()),
+            mailbox_waiters: Mutex::new(HashMap::new()),
+            mailbox_predicate_waiters: Mutex::new(Vec::new()),
+            session_source: SessionSource::Cli,
+            mailbox_metrics: Mutex::new(MailboxDeliveryTelemetry::new()),
+            mailbox_liveness: None,
         });
         (session, turn_context, rx_event)
     }
@@ -2901,13 +4606,10 @@ mod tests {
     #[tokio::test]
     async fn fatal_tool_error_stops_turn_and_reports_error() {
         let (session, turn_context, _rx) = make_session_and_context_with_rx();
-        let session_ref = session.as_ref();
-        let turn_context_ref = turn_context.as_ref();
         let router = ToolRouter::from_config(
-            &turn_context_ref.tools_config,
-            Some(session_ref.services.mcp_connection_manager.list_all_tools()),
+            &turn_context.tools_config,
+            Some(session.services.mcp_connection_manager.list_all_tools()),
         );
-        let mut tracker = TurnDiffTracker::new();
         let item = ResponseItem::CustomToolCall {
             id: None,
             status: None,
@@ -2916,22 +4618,26 @@ mod tests {
             input: "{}".to_string(),
         };
 
-        let err = handle_response_item(
-            &router,
-            session_ref,
-            turn_context_ref,
-            &mut tracker,
-            "sub-id",
-            item,
-        )
-        .await
-        .expect_err("expected fatal error");
+        let call = ToolRouter::build_tool_call(session.as_ref(), item.clone())
+            .expect("build tool call")
+            .expect("tool call present");
+        let tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
+        let err = router
+            .dispatch_tool_call(
+                Arc::clone(&session),
+                Arc::clone(&turn_context),
+                tracker,
+                "sub-id".to_string(),
+                call,
+            )
+            .await
+            .expect_err("expected fatal error");
 
         match err {
-            CodexErr::Fatal(message) => {
+            FunctionCallError::Fatal(message) => {
                 assert_eq!(message, "tool shell invoked with incompatible payload");
             }
-            other => panic!("expected CodexErr::Fatal, got {other:?}"),
+            other => panic!("expected FunctionCallError::Fatal, got {other:?}"),
         }
     }
 
@@ -3045,9 +4751,11 @@ mod tests {
         use crate::turn_diff_tracker::TurnDiffTracker;
         use std::collections::HashMap;
 
-        let (session, mut turn_context) = make_session_and_context();
+        let (session, mut turn_context_raw) = make_session_and_context();
         // Ensure policy is NOT OnRequest so the early rejection path triggers
-        turn_context.approval_policy = AskForApproval::OnFailure;
+        turn_context_raw.approval_policy = AskForApproval::OnFailure;
+        let session = Arc::new(session);
+        let mut turn_context = Arc::new(turn_context_raw);
 
         let params = ExecParams {
             command: if cfg!(windows) {
@@ -3075,7 +4783,7 @@ mod tests {
             ..params.clone()
         };
 
-        let mut turn_diff_tracker = TurnDiffTracker::new();
+        let turn_diff_tracker = Arc::new(tokio::sync::Mutex::new(TurnDiffTracker::new()));
 
         let tool_name = "shell";
         let sub_id = "test-sub".to_string();
@@ -3084,9 +4792,9 @@ mod tests {
         let resp = handle_container_exec_with_params(
             tool_name,
             params,
-            &session,
-            &turn_context,
-            &mut turn_diff_tracker,
+            Arc::clone(&session),
+            Arc::clone(&turn_context),
+            Arc::clone(&turn_diff_tracker),
             sub_id,
             call_id,
         )
@@ -3105,14 +4813,16 @@ mod tests {
 
         // Now retry the same command WITHOUT escalated permissions; should succeed.
         // Force DangerFullAccess to avoid platform sandbox dependencies in tests.
-        turn_context.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        Arc::get_mut(&mut turn_context)
+            .expect("unique turn context Arc")
+            .sandbox_policy = SandboxPolicy::DangerFullAccess;
 
         let resp2 = handle_container_exec_with_params(
             tool_name,
             params2,
-            &session,
-            &turn_context,
-            &mut turn_diff_tracker,
+            Arc::clone(&session),
+            Arc::clone(&turn_context),
+            Arc::clone(&turn_diff_tracker),
             "test-sub".to_string(),
             "test-call-2".to_string(),
         )
