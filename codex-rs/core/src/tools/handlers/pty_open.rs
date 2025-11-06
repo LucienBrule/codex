@@ -107,14 +107,16 @@ impl ToolHandler for PtyOpenHandler {
         request.vm_id = vm_id.clone();
 
         // Enforce per-worker concurrency cap when configured, before creating a new VM.
+        // At this point, attach-first (when vm_id was provided) has already been attempted
+        // and would have returned early on success. Any remaining path implies we are about
+        // to spawn a new VM (auto‑provision or failed attach), so enforce purely on count.
         if let Some(max_vms) = turn.vm_pty_max_concurrent_per_worker {
             if max_vms > 0 {
                 let current_sessions = {
                     let guard = session.services.pty_sessions.lock().await;
                     guard.sessions.len()
                 };
-                // Only enforce when opening a distinct VM (attach-first above would have returned).
-                if current_sessions >= max_vms && !vm_id.trim().is_empty() {
+                if current_sessions >= max_vms {
                     return Err(FunctionCallError::RespondToModel(format!(
                         "vm-pty policy exceeded: at most {max_vms} VMs per worker"
                     )));
