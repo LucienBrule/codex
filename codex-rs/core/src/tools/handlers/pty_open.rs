@@ -15,7 +15,7 @@ use crate::tools::registry::ToolKind;
 use crate::vm_pty::VmPtyOpenRequest;
 use tracing::info;
 
-use super::pty_common::map_vm_pty_error;
+use super::pty_common::{map_vm_pty_error, DEFAULT_SHELL};
 
 pub struct PtyOpenHandler;
 
@@ -195,17 +195,21 @@ impl ToolHandler for PtyOpenHandler {
 }
 
 fn build_open_request(params: &PtyOpenToolCallParams, turn: &TurnContext) -> VmPtyOpenRequest {
-    let workspace = params
-        .workspace
-        .as_deref()
-        .map(str::to_string)
+    fn normalize_opt(s: Option<String>) -> Option<String> {
+        s.and_then(|v| {
+            let t = v.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        })
+    }
+
+    let workspace = normalize_opt(params.workspace.clone())
         .unwrap_or_else(|| turn.cwd.to_string_lossy().into_owned());
 
-    let cwd = params
-        .cwd
-        .as_deref()
-        .map(str::to_string)
-        .unwrap_or_else(|| workspace.clone());
+    let cwd = normalize_opt(params.cwd.clone()).unwrap_or_else(|| workspace.clone());
 
     let env = params
         .env
@@ -213,11 +217,8 @@ fn build_open_request(params: &PtyOpenToolCallParams, turn: &TurnContext) -> VmP
         .map(|map| map.into_iter().collect())
         .unwrap_or_else(BTreeMap::new);
 
-    let shell = params
-        .shell
-        .as_deref()
-        .map(str::to_string)
-        .unwrap_or_else(|| "/bin/bash".to_string());
+    let shell = normalize_opt(params.shell.clone())
+        .unwrap_or_else(|| DEFAULT_SHELL.to_string());
 
     let cols = params.cols.unwrap_or(80);
     let rows = params.rows.unwrap_or(24);

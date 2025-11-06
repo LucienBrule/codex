@@ -199,6 +199,10 @@ impl VmPtyClient {
             initial_output: parsed.initial_output.unwrap_or_default(),
             cols: parsed.cols.unwrap_or(80),
             rows: parsed.rows.unwrap_or(24),
+            attached: parsed.attached,
+            nonblocking: parsed.nonblocking,
+            ready: parsed.ready,
+            ready_elapsed_ms: parsed.ready_elapsed_ms,
         })
     }
 
@@ -455,6 +459,14 @@ pub struct VmPtyOpenResponse {
     pub initial_output: String,
     pub cols: u16,
     pub rows: u16,
+    /// True when the server reused an existing session for the vm_id.
+    pub attached: Option<bool>,
+    /// Echo of the requested/effective nonblocking mode.
+    pub nonblocking: Option<bool>,
+    /// True when the server waited for readiness and the session is ready.
+    pub ready: Option<bool>,
+    /// Elapsed milliseconds from request receipt to readiness; present when `ready` is true.
+    pub ready_elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -529,6 +541,14 @@ struct VmPtyOpenResultInternal {
     cols: Option<u16>,
     #[serde(default)]
     rows: Option<u16>,
+    #[serde(default)]
+    attached: Option<bool>,
+    #[serde(default)]
+    nonblocking: Option<bool>,
+    #[serde(default)]
+    ready: Option<bool>,
+    #[serde(default)]
+    ready_elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -656,6 +676,10 @@ mod tests {
                 initial_output: "welcome\n".to_string(),
                 cols: 100,
                 rows: 40,
+                attached: None,
+                nonblocking: None,
+                ready: None,
+                ready_elapsed_ms: None,
             }
         );
 

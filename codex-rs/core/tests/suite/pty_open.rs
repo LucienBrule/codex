@@ -218,6 +218,91 @@ async fn pty_open_returns_session_details() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[serial]
+async fn pty_open_normalizes_empty_strings_to_defaults() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let socket_dir = tempfile::tempdir()?;
+    let socket_path = socket_dir.path().join("vm-pty.sock");
+    let captured = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+
+    let _server_task = spawn_vm_pty_server(
+        socket_path.clone(),
+        serde_json::json!({
+            "status": "ok",
+            "result": {
+                "session_id": "session-xyz",
+                "initial_output": "",
+                "cols": 80,
+                "rows": 24
+            }
+        }),
+        captured.clone(),
+    );
+
+    sleep(Duration::from_millis(50)).await;
+    wait_for_socket(&socket_path).await;
+
+    let mock_server = start_mock_server().await;
+
+    let call_id = "pty-open-empty-normalize";
+    let arguments = serde_json::json!({
+        "vmId": "",
+        "workspace": "",
+        "cwd": "",
+        "shell": ""
+    })
+    .to_string();
+
+    let first_response = sse(vec![
+        ev_response_created("resp-norm-1"),
+        ev_function_call(call_id, "pty_open", &arguments),
+        ev_completed("resp-norm-1"),
+    ]);
+    mount_sse_once_match(&mock_server, wiremock::matchers::any(), first_response).await;
+
+    let second_response = sse(vec![
+        ev_assistant_message("msg-norm", "opened"),
+        ev_completed("resp-norm-2"),
+    ]);
+    let _response_mock = mount_sse_once_match(&mock_server, wiremock::matchers::any(), second_response).await;
+
+    let mut builder = test_codex().with_config(move |config| {
+        config.include_vm_pty_tool = true;
+        config.include_vm_pty_open_tool = true;
+        config.vm_pty_socket = Some(socket_path.clone());
+    });
+    let test = builder.build(&mock_server).await?;
+
+    let turn_cwd_str = test.cwd.path().to_string_lossy().to_string();
+
+    test.codex
+        .submit(Op::UserTurn {
+            items: vec![InputItem::Text {
+                text: "open a vm session with empty params".into(),
+            }],
+            final_output_json_schema: None,
+            cwd: test.cwd.path().to_path_buf(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            model: test.session_configured.model.clone(),
+            effort: None,
+            summary: ReasoningSummary::Auto,
+        })
+        .await?;
+
+    wait_for_event(&test.codex, |event| matches!(event, EventMsg::TaskComplete(_))).await;
+
+    let recorded_request = captured.lock().await.clone().expect("captured request");
+    assert_eq!(recorded_request["action"], "pty_open");
+    assert_eq!(recorded_request["payload"]["shell"], "/bin/bash -i");
+    assert_eq!(recorded_request["payload"]["workspace"], turn_cwd_str);
+    assert_eq!(recorded_request["payload"]["cwd"], turn_cwd_str);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
 async fn pty_open_reports_invalid_vm_error() -> Result<()> {
     skip_if_no_network!(Ok(()));
 
