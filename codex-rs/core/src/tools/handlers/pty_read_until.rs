@@ -93,14 +93,24 @@ impl ToolHandler for PtyReadUntilHandler {
             "pty tool call"
         );
 
-        // Summarize result: matched flag and data length only.
+        // Summarize result: always include matched + data_len; include data content
+        // when ANSI is 'stripped' to aid QA harness checks that grep raw output.
         let matched = result.get("matched").cloned().unwrap_or(serde_json::json!(null));
-        let data_len = result
-            .get("data")
-            .and_then(|v| v.as_str())
-            .map(|s| s.len())
-            .unwrap_or(0);
-        let summary = serde_json::json!({ "matched": matched, "data_len": data_len });
+        let data_val = result.get("data").and_then(|v| v.as_str());
+        let data_len = data_val.map(|s| s.len()).unwrap_or(0);
+        let include_data = ansi.map(|s| s.eq_ignore_ascii_case("stripped")).unwrap_or(false);
+
+        let mut summary = serde_json::json!({ "matched": matched, "data_len": data_len });
+        if include_data {
+            if let Some(s) = data_val {
+                // Bound logged data to a reasonable size to avoid flooding logs
+                let max = 4096usize;
+                let slice = if s.len() > max { &s[..max] } else { s };
+                summary["data"] = serde_json::Value::String(slice.to_string());
+            } else {
+                summary["data"] = serde_json::Value::String(String::new());
+            }
+        }
         session
             .notify_background_event(
                 &invocation.sub_id,
