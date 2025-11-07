@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::time::Duration;
 
 use crate::function_tool::FunctionCallError;
 use crate::tools::context::ToolInvocation;
@@ -48,10 +49,38 @@ impl ToolHandler for PtyReadUntilHandler {
 
         let (client, session_id) = ensure_session(&session, &turn).await?;
 
-        let result = client
+        // First attempt
+        let mut result = client
             .pty_read_until(&session_id, pattern, timeout_ms, ansi)
             .await
             .map_err(map_vm_pty_error)?;
+
+        // Minimal, bounded retry on timeout/unmatched to reduce flakiness
+        let timed_out = result
+            .get("timed_out")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let matched = result
+            .get("matched")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if timed_out || !matched {
+            // Emit a concise retry message for QA visibility
+            session
+                .notify_background_event(
+                    &invocation.sub_id,
+                    format!(
+                        "[harness] pty_read_until: timeout/unmatched; retrying once in 500ms (pattern='{}')...",
+                        pattern
+                    ),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            result = client
+                .pty_read_until(&session_id, pattern, timeout_ms, ansi)
+                .await
+                .map_err(map_vm_pty_error)?;
+        }
 
         tracing::info!(
             target = "codex::vm_pty.tools",
